@@ -182,7 +182,9 @@ static void transfer_permuted_weight_chunk_fp16(__fp16 *vtcm_dst, const __fp16 *
   // NOTE(hzx): weight matrix is already transposed. n_cols actually turns into n_rows
   assert(n_cols % HMX_FP16_TILE_N_COLS == 0);
 
-  const bool use_dma = true;
+  // The message-channel path passes weights through fastrpc-mapped RPCMEM. The DMA load path currently produces zero
+  // F16 W16 outputs for this buffer source on device, while the vector copy path is correct.
+  const bool use_dma = false;
 
   if (use_dma) {
     size_t size = n_cols * k * sizeof(__fp16);

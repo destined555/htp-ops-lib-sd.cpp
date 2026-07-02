@@ -9,6 +9,8 @@ enum HtpOpsIndex {
   HTP_OPS_MAT_MUL_PERMUTED_W8D16A32,
   HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL,
   HTP_OPS_FLASH_ATTN_QO_F32_KV_F16,
+  HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16,
+  HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16,
   HTP_OPS_COUNT,
 };
 
@@ -44,4 +46,32 @@ struct FlashAttnParams {
   int32_t n_heads;
   int32_t n_kv_heads;
   int32_t head_dim;
+} __attribute__((packed));
+
+struct BlockSparseAttnParams {
+  struct RpcmemBufAddr o;
+  struct RpcmemBufAddr q;
+  struct RpcmemBufAddr k;
+  struct RpcmemBufAddr v;
+  struct RpcmemBufAddr block_mask;
+  int32_t qo_len;
+  int32_t kv_len;
+  int32_t n_heads;
+  int32_t n_kv_heads;
+  int32_t head_dim;
+  int32_t block_q;
+  int32_t block_k;
+  int32_t n_q_blocks;
+  int32_t n_k_blocks;
+  int32_t mask_format;
+  int32_t max_kept_blocks;
+} __attribute__((packed));
+
+struct BlockSparseScoreParams {
+  struct RpcmemBufAddr score;
+  struct RpcmemBufAddr q_mean;
+  struct RpcmemBufAddr k_mean;
+  int32_t head_dim;
+  int32_t n_q_blocks;
+  int32_t n_k_blocks;
 } __attribute__((packed));

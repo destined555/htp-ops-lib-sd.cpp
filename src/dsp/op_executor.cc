@@ -197,6 +197,61 @@ int execute_op_simple(struct OpComputeRequest *req) {
       }
       break;
 
+    case HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16:
+      {
+        auto params = reinterpret_cast<BlockSparseAttnParams *>(req->payload);
+
+        int qo_len     = params->qo_len;
+        int kv_len     = params->kv_len;
+        int n_heads    = params->n_heads;
+        int n_kv_heads = params->n_kv_heads;
+        int head_dim   = params->head_dim;
+        int mask_format = params->mask_format;
+        int max_kept_blocks = params->max_kept_blocks;
+
+        size_t qo_size        = qo_len * n_heads * head_dim * sizeof(float);
+        size_t kv_size        = kv_len * n_kv_heads * head_dim * sizeof(__fp16);
+        size_t block_mask_len =
+          mask_format == 1 ? params->n_q_blocks * max_kept_blocks : params->n_q_blocks * params->n_k_blocks;
+
+        add_buffer(out_bufs, params->o, qo_size);
+        add_buffer(in_bufs, params->q, qo_size);
+        add_buffer(in_bufs, params->k, kv_size);
+        add_buffer(in_bufs, params->v, kv_size);
+        add_buffer(in_bufs, params->block_mask, block_mask_len * sizeof(int32_t));
+
+        validate_in_bufs();
+        ret = block_sparse_flash_attn((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1),
+                                      (__fp16 *) IN_PTR(2), (const int32_t *) IN_PTR(3), qo_len, kv_len, n_heads,
+                                      n_kv_heads, head_dim, params->block_q, params->block_k, params->n_q_blocks,
+                                      params->n_k_blocks, mask_format, max_kept_blocks);
+        validate_out_bufs();
+      }
+      break;
+
+    case HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16:
+      {
+        auto params = reinterpret_cast<BlockSparseScoreParams *>(req->payload);
+
+        int head_dim   = params->head_dim;
+        int n_q_blocks = params->n_q_blocks;
+        int n_k_blocks = params->n_k_blocks;
+
+        size_t q_mean_size = n_q_blocks * head_dim * sizeof(__fp16);
+        size_t k_mean_size = n_k_blocks * head_dim * sizeof(__fp16);
+        size_t score_size = n_q_blocks * n_k_blocks * sizeof(__fp16);
+
+        add_buffer(out_bufs, params->score, score_size);
+        add_buffer(in_bufs, params->q_mean, q_mean_size);
+        add_buffer(in_bufs, params->k_mean, k_mean_size);
+
+        validate_in_bufs();
+        ret = block_sparse_score((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1),
+                                 head_dim, n_q_blocks, n_k_blocks);
+        validate_out_bufs();
+      }
+      break;
+
     default:
       break;
   }
