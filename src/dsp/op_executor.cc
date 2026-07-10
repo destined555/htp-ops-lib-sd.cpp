@@ -14,6 +14,10 @@
 
 namespace {
 
+size_t align_up_size(size_t v, size_t a) {
+  return ((v + a - 1) / a) * a;
+}
+
 size_t ggml_super_block_size(enum ggml_type type) {
   // TODO: more types
   switch (type) {
@@ -157,13 +161,15 @@ int execute_op_simple(struct OpComputeRequest *req) {
         int n_heads    = params->n_heads;
         int n_kv_heads = params->n_kv_heads;
         int head_dim   = params->head_dim;
+        bool with_lse  = params->with_lse != 0;
 
-        size_t qo_size   = qo_len * n_heads * head_dim * sizeof(float);
+        size_t q_size    = qo_len * n_heads * head_dim * sizeof(float);
+        size_t o_size    = qo_len * n_heads * (head_dim + (with_lse ? 1 : 0)) * sizeof(float);
         size_t kv_size   = kv_len * n_kv_heads * head_dim * sizeof(__fp16);
-        size_t mask_size = qo_len * kv_len * sizeof(__fp16);
+        size_t mask_size = qo_len * align_up_size(kv_len, 64) * sizeof(__fp16);
 
-        add_buffer(out_bufs, params->o, qo_size);
-        add_buffer(in_bufs, params->q, qo_size);
+        add_buffer(out_bufs, params->o, o_size);
+        add_buffer(in_bufs, params->q, q_size);
         add_buffer(in_bufs, params->k, kv_size);
         add_buffer(in_bufs, params->v, kv_size);
         add_buffer(in_bufs, params->mask, mask_size);
@@ -172,17 +178,17 @@ int execute_op_simple(struct OpComputeRequest *req) {
 
         if (check_accuracy) {
           float *ref_out;
-          posix_memalign((void **) &ref_out, 128, qo_size);
+          posix_memalign((void **) &ref_out, 128, o_size);
 
           validate_in_bufs();
           ret = simple_flash_attn((__fp16 *) ref_out, (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
-                                  (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+                                  (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim, with_lse);
 
           // check logic
           naive_flash_attn((float *) OUT_PTR(0), (float *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
                            (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
 
-          op_utils::compare_result((float *) OUT_PTR(0), ref_out, qo_size / 4);
+          op_utils::compare_result((float *) OUT_PTR(0), ref_out, o_size / 4);
 
           validate_out_bufs();
 
@@ -191,7 +197,7 @@ int execute_op_simple(struct OpComputeRequest *req) {
           validate_in_bufs();
           ret =
             simple_flash_attn((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
-                              (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+                              (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim, with_lse);
           validate_out_bufs();
         }
       }
@@ -208,14 +214,16 @@ int execute_op_simple(struct OpComputeRequest *req) {
         int head_dim   = params->head_dim;
         int mask_format = params->mask_format;
         int max_kept_blocks = params->max_kept_blocks;
+        bool with_lse = params->with_lse != 0;
 
-        size_t qo_size        = qo_len * n_heads * head_dim * sizeof(float);
+        size_t q_size         = qo_len * n_heads * head_dim * sizeof(float);
+        size_t o_size         = qo_len * n_heads * (head_dim + (with_lse ? 1 : 0)) * sizeof(float);
         size_t kv_size        = kv_len * n_kv_heads * head_dim * sizeof(__fp16);
         size_t block_mask_len =
           mask_format == 1 ? params->n_q_blocks * max_kept_blocks : params->n_q_blocks * params->n_k_blocks;
 
-        add_buffer(out_bufs, params->o, qo_size);
-        add_buffer(in_bufs, params->q, qo_size);
+        add_buffer(out_bufs, params->o, o_size);
+        add_buffer(in_bufs, params->q, q_size);
         add_buffer(in_bufs, params->k, kv_size);
         add_buffer(in_bufs, params->v, kv_size);
         add_buffer(in_bufs, params->block_mask, block_mask_len * sizeof(int32_t));
@@ -224,7 +232,7 @@ int execute_op_simple(struct OpComputeRequest *req) {
         ret = block_sparse_flash_attn((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1),
                                       (__fp16 *) IN_PTR(2), (const int32_t *) IN_PTR(3), qo_len, kv_len, n_heads,
                                       n_kv_heads, head_dim, params->block_q, params->block_k, params->n_q_blocks,
-                                      params->n_k_blocks, mask_format, max_kept_blocks);
+                                      params->n_k_blocks, mask_format, max_kept_blocks, with_lse);
         validate_out_bufs();
       }
       break;

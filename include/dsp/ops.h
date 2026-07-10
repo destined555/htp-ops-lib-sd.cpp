@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "dsp/quants.h"
@@ -20,12 +21,13 @@ int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *activatio
                                      int m, int k, int n, enum ggml_type weight_type);
 
 int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
-                      const __fp16 *restrict mask, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim);
+                      const __fp16 *restrict mask, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
+                      bool with_lse);
 
 int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K,
                             const __fp16 *restrict V, const int32_t *restrict block_mask, int qo_len, int kv_len,
                             int n_heads, int n_kv_heads, int head_dim, int block_q, int block_k, int n_q_blocks,
-                            int n_k_blocks, int mask_format, int max_kept_blocks);
+                            int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse);
 
 int block_sparse_score(__fp16 *restrict score, const __fp16 *restrict q_mean, const __fp16 *restrict k_mean,
                        int head_dim, int n_q_blocks, int n_k_blocks);
