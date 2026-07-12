@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "dsp/quants.h"
@@ -28,6 +29,21 @@ int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const 
                             const __fp16 *restrict V, const int32_t *restrict block_mask, int qo_len, int kv_len,
                             int n_heads, int n_kv_heads, int head_dim, int block_q, int block_k, int n_q_blocks,
                             int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse);
+
+enum block_sparse_fa_mode {
+  BLOCK_SPARSE_FA_FULL_KV,
+  BLOCK_SPARSE_FA_FULL_K,
+  BLOCK_SPARSE_FA_CHUNKED,
+};
+
+typedef struct {
+  enum block_sparse_fa_mode mode;
+  size_t                    blk_sz_c;
+  size_t                    required_bytes;
+} block_sparse_fa_plan_t;
+
+int block_sparse_fa_select_plan(block_sparse_fa_plan_t *plan, bool fast_path, int gqa_factor, int head_dim,
+                                int kv_len, size_t available_bytes);
 
 int block_sparse_score(__fp16 *restrict score, const __fp16 *restrict q_mean, const __fp16 *restrict k_mean,
                        int head_dim, int n_q_blocks, int n_k_blocks);

@@ -23,6 +23,19 @@
 
 static int dummy_handle;  // served as the global handle
 
+// The host owns one global session handle and serializes open/init/create/close calls.
+// These lifecycle flags are not intended for concurrent lifecycle RPCs.
+static bool backend_opened;
+static bool backend_initialized;
+
+static AEEResult require_backend_initialized(const char *caller) {
+  if (!backend_opened || !backend_initialized) {
+    FARF(ERROR, "%s: backend is not initialized", caller);
+    return AEE_EBADSTATE;
+  }
+  return AEE_SUCCESS;
+}
+
 struct MessageChannel {
   uint8_t      *msg;
   int           rpcmem_fd;
@@ -215,41 +228,86 @@ int message_channel_destroy(struct MessageChannel *chan) {
 AEEResult htp_ops_open(const char *uri, remote_handle64 *handle) {
   // We may keep this function simple and leave real initialization somewhere else
 
+  if (backend_opened) {
+    return AEE_EALREADY;
+  }
   *handle = (remote_handle64) &dummy_handle;
 
+  backend_opened      = true;
+  backend_initialized = false;
   message_channel_init(&global_msg_chan);
   return AEE_SUCCESS;
 }
 
 // FastRPC interface
 AEEResult htp_ops_close(remote_handle64 handle) {
+  if (!backend_opened) {
+    return AEE_EBADSTATE;
+  }
+  backend_initialized = false;
+
   mmap_manager_release_all();
-  message_channel_destroy(&global_msg_chan);
+  AEEResult result = message_channel_destroy(&global_msg_chan) == 0 ? AEE_SUCCESS : AEE_EFAILED;
 
-  hmx_manager_reset();
-  vtcm_manager_reset();
+  if (vtcm_manager_reset() != 0) {
+    return AEE_EFAILED;
+  }
+  if (hmx_manager_reset() != 0) {
+    return AEE_EFAILED;
+  }
   power_reset();
+  backend_opened = false;
 
-  return AEE_SUCCESS;
+  return result;
 }
-
-void init_precomputed_tables();
 
 // FastRPC interface
 AEEResult htp_ops_init_backend(remote_handle64 handle) {
   FARF(ALWAYS, "init_backend called");
 
-  power_setup();
-  vtcm_manager_setup();
-  hmx_manager_setup();
+  if (!backend_opened) {
+    return AEE_EBADSTATE;
+  }
+  if (backend_initialized) {
+    return AEE_SUCCESS;
+  }
+  backend_initialized = false;
 
-  init_precomputed_tables();
+  power_setup();
+  const int    vtcm_result = vtcm_manager_setup();
+  void *const  vtcm_base   = vtcm_manager_get_vtcm_base();
+  const size_t vtcm_size   = vtcm_manager_get_vtcm_size();
+  if (vtcm_result != 0 || !vtcm_base || vtcm_size == 0) {
+    FARF(ERROR, "VTCM manager setup failed");
+    if (vtcm_manager_reset() != 0) {
+      FARF(ERROR, "VTCM manager cleanup failed after setup error");
+    }
+    power_reset();
+    return AEE_ENOMEMORY;
+  }
+  FARF(ALWAYS, "VTCM manager acquired %u bytes", (unsigned int) vtcm_size);
+  if (hmx_manager_setup() != 0) {
+    FARF(ERROR, "HMX manager setup failed");
+    if (hmx_manager_reset() != 0) {
+      FARF(ERROR, "HMX manager cleanup failed after setup error");
+    }
+    if (vtcm_manager_reset() != 0) {
+      FARF(ERROR, "VTCM manager cleanup failed after HMX setup error");
+    }
+    power_reset();
+    return AEE_EFAILED;
+  }
+  backend_initialized = true;
 
   return AEE_SUCCESS;
 }
 
 // FastRPC interface
 AEEResult htp_ops_create_channel(remote_handle64 handle, int32 fd, uint32 size) {
+  const AEEResult guard_result = require_backend_initialized(__func__);
+  if (guard_result != AEE_SUCCESS) {
+    return guard_result;
+  }
   if (message_channel_is_active(&global_msg_chan)) {
     return AEE_EALREADY;
   }
@@ -265,6 +323,10 @@ AEEResult htp_ops_destroy_channel(remote_handle64 handle) {
 // FastRPC interface
 AEEResult htp_ops_rms_norm_f32(remote_handle64 handle, int32 fd0, int32 offset0, int32 fd1, int32 offset1, int32 ne0,
                                int32 ne1) {
+  const AEEResult guard_result = require_backend_initialized(__func__);
+  if (guard_result != AEE_SUCCESS) {
+    return guard_result;
+  }
   int64_t t0 = HAP_perf_get_qtimer_count();
 
   // TODO(hzx): maybe we should cache fd -> address mapping
@@ -320,6 +382,10 @@ bail:
 AEEResult htp_ops_mat_mul_permuted_w16a32(remote_handle64 handle, int32 output_fd, int32 output_offset,
                                           int32 activation_fd, int32 activation_offset, int32 weight_fd,
                                           int32 weight_offset, int32 m, int32 k, int32 n) {
+  const AEEResult guard_result = require_backend_initialized(__func__);
+  if (guard_result != AEE_SUCCESS) {
+    return guard_result;
+  }
   uint8_t *p0, *p1, *p2;
   p0 = p1 = p2 = NULL;
 
@@ -388,6 +454,10 @@ void internal_op_tests();
 
 // FastRPC interface
 AEEResult htp_ops_test_ops(remote_handle64 handle) {
+  const AEEResult guard_result = require_backend_initialized(__func__);
+  if (guard_result != AEE_SUCCESS) {
+    return guard_result;
+  }
   FARF(ALWAYS, "Op Tests!");
 
   internal_op_tests();

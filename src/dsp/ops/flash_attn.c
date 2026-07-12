@@ -12,6 +12,7 @@
 #include "dsp/hvx_convert.h"
 #include "dsp/hvx_internal.h"
 #include "dsp/hvx_math.h"
+#include "dsp/ops.h"
 #include "dsp/utils.h"
 #include "dsp/vtcm_mgr.h"
 #include "dsp/worker_pool.h"
@@ -42,9 +43,12 @@ typedef struct {
 typedef struct {
   worker_synctoken_t sync_ctx;
   unsigned int       task_id;
+  unsigned int       error_count;
   int                n_tasks;
   uint8_t           *vtcm_base;
+  size_t             acquired_vtcm_size;
   size_t             vtcm_size_per_thread;
+  unsigned int       vtcm_slice_count;
   __fp16            *O;
   const __fp16      *Q, *K, *V;
   const int32_t     *block_mask;
@@ -116,6 +120,150 @@ static inline int block_sparse_q_block_for_group_row(int block_q, int n_q_blocks
   const int q_head  = q_head_base + q_group_row % gqa_factor;
   const int q_blocks_per_head = n_q_blocks / n_heads;
   return q_head * q_blocks_per_head + q_token / block_q;
+}
+
+static bool checked_size_add(size_t a, size_t b, size_t *result) {
+  if (a > SIZE_MAX - b) {
+    return false;
+  }
+  *result = a + b;
+  return true;
+}
+
+static bool checked_size_mul(size_t a, size_t b, size_t *result) {
+  if (a != 0 && b > SIZE_MAX / a) {
+    return false;
+  }
+  *result = a * b;
+  return true;
+}
+
+static bool checked_size_align_up(size_t value, size_t alignment, size_t *result) {
+  size_t rounded;
+  if (alignment == 0 || !checked_size_add(value, alignment - 1, &rounded)) {
+    return false;
+  }
+  *result = rounded / alignment * alignment;
+  return true;
+}
+
+static bool block_sparse_fa_workspace_bytes(int gqa_factor, int head_dim, size_t blk_sz_c, size_t *workspace,
+                                            size_t *chunk, size_t *full_head) {
+  const size_t br = HMX_FP16_TILE_N_ROWS;
+  size_t g_br;
+  size_t value;
+  size_t qo_tile_size;
+  size_t core_tile_size;
+  size_t d_tile_size;
+  size_t col_vec_size;
+  size_t row_vec_size;
+  size_t total = 0;
+
+  if (!checked_size_mul((size_t) gqa_factor, br, &g_br) ||
+      !checked_size_align_up(g_br, HMX_FP16_TILE_N_ROWS, &g_br) ||
+      !checked_size_mul(g_br, (size_t) head_dim, &value) ||
+      !checked_size_mul(value, sizeof(__fp16), &value) || !checked_size_align_up(value, 4096, &qo_tile_size) ||
+      !checked_size_mul(g_br, blk_sz_c, &value) || !checked_size_mul(value, sizeof(__fp16), &value) ||
+      !checked_size_align_up(value, 4096, &core_tile_size) || !checked_size_mul(g_br, g_br, &value) ||
+      !checked_size_mul(value, sizeof(__fp16), &value) || !checked_size_align_up(value, 4096, &d_tile_size) ||
+      !checked_size_mul(g_br, sizeof(__fp16), &value) || !checked_size_align_up(value, 256, &col_vec_size) ||
+      !checked_size_mul(blk_sz_c, sizeof(__fp16), &value) || !checked_size_align_up(value, 256, &row_vec_size) ||
+      !checked_size_mul(blk_sz_c, (size_t) head_dim, &value) ||
+      !checked_size_mul(value, sizeof(__fp16), &value) || !checked_size_align_up(value, 4096, chunk)) {
+    return false;
+  }
+
+  if (!checked_size_mul(qo_tile_size, 3, &value) || !checked_size_add(total, value, &total) ||
+      !checked_size_mul(core_tile_size, 2, &value) || !checked_size_add(total, value, &total) ||
+      !checked_size_add(total, d_tile_size, &total) || !checked_size_mul(col_vec_size, 4, &value) ||
+      !checked_size_add(total, value, &total) || !checked_size_mul(row_vec_size, 2, &value) ||
+      !checked_size_add(total, value, &total) || !checked_size_add(total, 512, &total)) {
+    return false;
+  }
+
+  *workspace = total;
+  (void) full_head;
+  return true;
+}
+
+static bool block_sparse_fa_required_bytes(enum block_sparse_fa_mode mode, int gqa_factor, int head_dim, int kv_len,
+                                           size_t blk_sz_c, size_t *required) {
+  size_t workspace;
+  size_t chunk;
+  size_t full_head;
+  size_t value;
+  const size_t k_tiles = ((size_t) kv_len + HMX_FP16_TILE_N_COLS - 1) / HMX_FP16_TILE_N_COLS;
+  const size_t d_tiles = (size_t) head_dim / 32;
+
+  if (!block_sparse_fa_workspace_bytes(gqa_factor, head_dim, blk_sz_c, &workspace, &chunk, &full_head) ||
+      !checked_size_mul(k_tiles, d_tiles, &full_head) ||
+      !checked_size_mul(full_head, HMX_FP16_TILE_SIZE, &full_head)) {
+    return false;
+  }
+
+  switch (mode) {
+    case BLOCK_SPARSE_FA_FULL_KV:
+      if (!checked_size_mul(full_head, 2, &value)) {
+        return false;
+      }
+      break;
+    case BLOCK_SPARSE_FA_FULL_K:
+      if (!checked_size_add(full_head, chunk, &value)) {
+        return false;
+      }
+      break;
+    case BLOCK_SPARSE_FA_CHUNKED:
+      if (!checked_size_mul(chunk, 2, &value)) {
+        return false;
+      }
+      break;
+    default:
+      return false;
+  }
+  return checked_size_add(workspace, value, required);
+}
+
+static bool block_sparse_fa_find_mode_plan(block_sparse_fa_plan_t *plan, enum block_sparse_fa_mode mode,
+                                           int gqa_factor, int head_dim, int kv_len, size_t available_bytes) {
+  size_t max_blk_sz_c;
+  if (!checked_size_align_up((size_t) kv_len, 64, &max_blk_sz_c)) {
+    return false;
+  }
+
+  bool found = false;
+  for (size_t blk_sz_c = 64; blk_sz_c <= max_blk_sz_c; blk_sz_c += 64) {
+    size_t required;
+    if (!block_sparse_fa_required_bytes(mode, gqa_factor, head_dim, kv_len, blk_sz_c, &required)) {
+      return false;
+    }
+    if (required <= available_bytes) {
+      plan->mode           = mode;
+      plan->blk_sz_c       = blk_sz_c;
+      plan->required_bytes = required;
+      found                = true;
+    }
+  }
+  return found;
+}
+
+int block_sparse_fa_select_plan(block_sparse_fa_plan_t *plan, bool fast_path, int gqa_factor, int head_dim,
+                                int kv_len, size_t available_bytes) {
+  if (plan == NULL || gqa_factor <= 0 || head_dim <= 0 || head_dim % 32 != 0 || kv_len <= 0) {
+    return -1;
+  }
+
+  if (fast_path && block_sparse_fa_find_mode_plan(plan, BLOCK_SPARSE_FA_FULL_KV, gqa_factor, head_dim, kv_len,
+                                                  available_bytes)) {
+    return 0;
+  }
+  if (fast_path && block_sparse_fa_find_mode_plan(plan, BLOCK_SPARSE_FA_FULL_K, gqa_factor, head_dim, kv_len,
+                                                  available_bytes)) {
+    return 0;
+  }
+  if (block_sparse_fa_find_mode_plan(plan, BLOCK_SPARSE_FA_CHUNKED, gqa_factor, head_dim, kv_len, available_bytes)) {
+    return 0;
+  }
+  return -1;
 }
 
 size_t fa_f16_compute_vtcm_usage(int gqa_factor, int head_dim, int n_rows, int n_cols) {
@@ -197,6 +345,8 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
                                 const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
                                 const __fp16 *restrict qk_mask, int qo_len, int kv_len, int n_heads, int n_kv_heads,
                                 int head_dim, bool with_lse, int worker_index) {
+  (void) worker_index;
+
   // "compile-time" configs
   // TODO: make them real compile-time constants (constexpr or template parameters)
   const int G = n_heads / n_kv_heads;  // GQA factor
@@ -211,8 +361,7 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   const bool   has_qk_mask = true;
   const size_t kv_pad_len  = align_up(kv_len, 64);
 
-  const bool enable_vgather_exp = false;  // use table lookup (vgather) to compute exp, experimental
-  const bool use_fp32_exp       = false;  // compute FP32 exp
+  const bool use_fp32_exp = false;  // compute FP32 exp
 
   // determine block sizes
   size_t blk_sz_r, blk_sz_c;  // Br, Bc
@@ -288,16 +437,6 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
     // offsets within the first tile
     d_tile_vscatter_offsets[i * 2 + 0] = i * 136;
     d_tile_vscatter_offsets[i * 2 + 1] = i * 136 + 6;
-  }
-
-  // alternative computation method
-  const int    sub_table_idx  = worker_index % 4;
-  const size_t sub_table_size = 65536;
-
-  uint8_t *vtcm_exp2_table_base = vtcm_manager_query_area("safe_softmax::exp2_hf_qf16");
-  uint8_t *vtcm_exp2_table      = vtcm_exp2_table_base + sub_table_idx * sub_table_size;
-  if (!enable_vgather_exp) {
-    (void) vtcm_exp2_table;
   }
 
   // profile timers
@@ -570,44 +709,26 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
             HVX_Vector       v_p_rowsum0 = v_zero;  // qfloat
             HVX_Vector       v_p_rowsum1 = v_zero;  // qfloat
 
-            if (enable_vgather_exp) {
-              for (int c = 0; c < n_cols; c += 64) {
-                HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);
-                HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);
-
-                HVX_Vector v_gather_input0 = Q6_Vh_vasl_VhR(v_s_minus_m0, 1);
-                HVX_Vector v_gather_input1 = Q6_Vh_vasl_VhR(v_s_minus_m1, 1);
-
-                Q6_vgather_ARMVh(&row_buffer0[c / 64], (size_t) vtcm_exp2_table, 65535, v_gather_input0);
-                Q6_vgather_ARMVh(&row_buffer1[c / 64], (size_t) vtcm_exp2_table, 65535, v_gather_input1);
-              }
-            }
-
             for (int c = 0; c < n_cols; c += 64) {
               HVX_Vector v_p_row0_hf, v_p_row1_hf;
 
-              if (enable_vgather_exp) {
-                v_p_row0_hf = row_buffer0[c / 64];
-                v_p_row1_hf = row_buffer1[c / 64];
+              HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);  // qf16
+              HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);  // qf16
+
+              if (use_fp32_exp) {
+                HVX_VectorPair vp_s_minus_m0_sf = hvx_my_vqf16_to_wsf(v_s_minus_m0);
+                HVX_VectorPair vp_s_minus_m1_sf = hvx_my_vqf16_to_wsf(v_s_minus_m1);
+
+                HVX_Vector v_p_row00_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m0_sf));
+                HVX_Vector v_p_row01_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m0_sf));
+                HVX_Vector v_p_row10_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m1_sf));
+                HVX_Vector v_p_row11_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m1_sf));
+
+                v_p_row0_hf = hvx_my_wsf_to_vhf(v_p_row01_sf, v_p_row00_sf);
+                v_p_row1_hf = hvx_my_wsf_to_vhf(v_p_row11_sf, v_p_row10_sf);
               } else {
-                HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);  // qf16
-                HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);  // qf16
-
-                if (use_fp32_exp) {
-                  HVX_VectorPair vp_s_minus_m0_sf = hvx_my_vqf16_to_wsf(v_s_minus_m0);
-                  HVX_VectorPair vp_s_minus_m1_sf = hvx_my_vqf16_to_wsf(v_s_minus_m1);
-
-                  HVX_Vector v_p_row00_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m0_sf));
-                  HVX_Vector v_p_row01_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m0_sf));
-                  HVX_Vector v_p_row10_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m1_sf));
-                  HVX_Vector v_p_row11_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m1_sf));
-
-                  v_p_row0_hf = hvx_my_wsf_to_vhf(v_p_row01_sf, v_p_row00_sf);
-                  v_p_row1_hf = hvx_my_wsf_to_vhf(v_p_row11_sf, v_p_row10_sf);
-                } else {
-                  v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
-                  v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
-                }
+                v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
+                v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
               }
 
               // compute P tile output positions
@@ -1479,9 +1600,22 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
     return -1;
   }
 
-  const int    n_workers            = num_hvx128_contexts;
   const size_t vtcm_size_per_thread = 1024 * 1024;
-  assert(n_workers * vtcm_size_per_thread <= 6 * 1024 * 1024);  // don't use too much VTCM
+  const int    n_jobs               = num_hvx128_contexts;
+  const unsigned int vtcm_slice_count = num_workers;
+  if (n_jobs <= 0 || vtcm_slice_count == 0 || (size_t) vtcm_slice_count > SIZE_MAX / vtcm_size_per_thread) {
+    FARF(ERROR, "%s: invalid worker counts: jobs=%d pool_workers=%u", __func__, n_jobs, vtcm_slice_count);
+    return -1;
+  }
+
+  const size_t required_vtcm_size = (size_t) vtcm_slice_count * vtcm_size_per_thread;
+  uint8_t *const vtcm_base        = (uint8_t *) vtcm_manager_get_vtcm_base();
+  const size_t acquired_vtcm_size = vtcm_manager_get_vtcm_size();
+  if (!vtcm_base || acquired_vtcm_size < required_vtcm_size) {
+    FARF(ERROR, "%s: insufficient VTCM: acquired=%u required=%u pool_workers=%u", __func__,
+         (unsigned int) acquired_vtcm_size, (unsigned int) required_vtcm_size, vtcm_slice_count);
+    return -1;
+  }
 
   simple_fa_task_state_t state;
   state.O          = O;
@@ -1498,11 +1632,11 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
 
   // TODO(hzx): parallelize along query_len x n_kv_heads dimension
   // size_t n_tot_chunks      = qo_len * n_kv_heads;
-  // size_t n_chunks_per_task = ceil_div(n_tot_chunks, n_workers);
+  // size_t n_chunks_per_task = ceil_div(n_tot_chunks, n_jobs);
 
   state.task_id              = 0;
   state.n_tasks              = n_kv_heads;
-  state.vtcm_base            = (uint8_t *) vtcm_manager_get_vtcm_base();
+  state.vtcm_base            = vtcm_base;
   state.vtcm_size_per_thread = vtcm_size_per_thread;
 
   worker_pool_job_t job;
@@ -1511,8 +1645,8 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
 
   int64_t t0 = HAP_perf_get_time_us();
 
-  worker_pool_synctoken_init(&(state.sync_ctx), n_workers);
-  for (int i = 0; i < n_workers; ++i) {
+  worker_pool_synctoken_init(&(state.sync_ctx), n_jobs);
+  for (int i = 0; i < n_jobs; ++i) {
     worker_pool_submit(NULL, job);  // use default worker pool
   }
   worker_pool_synctoken_wait(&(state.sync_ctx));
@@ -1524,12 +1658,15 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
   return 0;
 }
 
-void block_sparse_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, __fp16 *restrict O,
-                                      const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
-                                      const int32_t *restrict block_mask, int qo_len, int kv_len, int n_heads,
-                                      int n_kv_heads, int head_dim, int block_q, int block_k, int n_q_blocks,
-                                      int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse,
-                                      int worker_index) {
+int block_sparse_flash_attn_f16_core_chunked(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
+                                             __fp16 *restrict O, const __fp16 *restrict Q,
+                                             const __fp16 *restrict K, const __fp16 *restrict V,
+                                             const int32_t *restrict block_mask, int qo_len, int kv_len, int n_heads,
+                                             int n_kv_heads, int head_dim, int block_q, int block_k, int n_q_blocks,
+                                             int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse,
+                                             int worker_index) {
+  (void) worker_index;
+
   // 一个 KV head 对应 G 个 Q heads
   // 当前函数只处理 kv_head_idx 对应的 K/V head
   // 以及 Q/O 中 [kv_head_idx * G, (kv_head_idx + 1) * G) 这 G 个 heads
@@ -1551,18 +1688,16 @@ void block_sparse_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *v
   const bool   qo_fp32_element = true;
   const size_t qo_element_size = qo_fp32_element ? sizeof(float) : sizeof(__fp16);
 
-  // Keep block-sparse full-keep numerically aligned with dense attention.
-  const bool   enable_vgather_exp = false;
-
   // 是否用 fp32 路径算 exp
-  // 当前 false，表示主要使用 fp16/qf16 exp2 路径或 vgather 查表
-  const bool   use_fp32_exp       = false;
+  // 当前 false，表示使用 fp16/qf16 exp2 路径
+  const bool use_fp32_exp = false;
 
-  size_t blk_sz_r, blk_sz_c;
-  fa_f16_find_chunk_size(&blk_sz_r, &blk_sz_c, G, head_dim, qo_len, kv_len, vtcm_limit - vtcm);
-  if (use_host_index) {
-    blk_sz_r = block_q;
+  block_sparse_fa_plan_t plan;
+  if (block_sparse_fa_select_plan(&plan, false, G, head_dim, kv_len, vtcm_limit - vtcm) != 0) {
+    return -1;
   }
+  const size_t blk_sz_r = HMX_FP16_TILE_N_ROWS;
+  const size_t blk_sz_c = plan.blk_sz_c;
   assert(blk_sz_c % 64 == 0);
 
   // 当前 Q block 展开 G 个 Q heads 后的行数是 G * Br
@@ -1711,17 +1846,6 @@ void block_sparse_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *v
   for (int i = 0; i < 16; ++i) {
     d_tile_vscatter_offsets[i * 2 + 0] = i * 136;
     d_tile_vscatter_offsets[i * 2 + 1] = i * 136 + 6;
-  }
-
-  // exp2 查表区域
-  // worker_index % 4 选择不同 sub-table，避免多 worker 访问冲突
-  const int    sub_table_idx  = worker_index % 4;
-  const size_t sub_table_size = 65536;
-
-  uint8_t *vtcm_exp2_table_base = vtcm_manager_query_area("safe_softmax::exp2_hf_qf16");
-  uint8_t *vtcm_exp2_table      = vtcm_exp2_table_base + sub_table_idx * sub_table_size;
-  if (!enable_vgather_exp) {
-    (void) vtcm_exp2_table;
   }
 
   // 外层循环：按 Q/O token 方向分块
@@ -1998,46 +2122,28 @@ void block_sparse_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *v
             HVX_Vector       v_p_rowsum0 = v_zero;
             HVX_Vector       v_p_rowsum1 = v_zero;
 
-            if (enable_vgather_exp) {
-              for (int c = 0; c < n_cols; c += 64) {
-                HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);
-                HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);
-
-                HVX_Vector v_gather_input0 = Q6_Vh_vasl_VhR(v_s_minus_m0, 1);
-                HVX_Vector v_gather_input1 = Q6_Vh_vasl_VhR(v_s_minus_m1, 1);
-
-                Q6_vgather_ARMVh(&row_buffer0[c / 64], (size_t) vtcm_exp2_table, 65535, v_gather_input0);
-                Q6_vgather_ARMVh(&row_buffer1[c / 64], (size_t) vtcm_exp2_table, 65535, v_gather_input1);
-              }
-            }
-
             for (int c = 0; c < n_cols; c += 64) {
               const int ne = smax(0, smin((int) n_real_cols - c, 64));
               HVX_VectorPred q_mask_keep = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
               HVX_Vector v_p_row0_hf, v_p_row1_hf;
 
-              if (enable_vgather_exp) {
-                v_p_row0_hf = row_buffer0[c / 64];
-                v_p_row1_hf = row_buffer1[c / 64];
+              HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);
+              HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);
+
+              if (use_fp32_exp) {
+                HVX_VectorPair vp_s_minus_m0_sf = hvx_my_vqf16_to_wsf(v_s_minus_m0);
+                HVX_VectorPair vp_s_minus_m1_sf = hvx_my_vqf16_to_wsf(v_s_minus_m1);
+
+                HVX_Vector v_p_row00_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m0_sf));
+                HVX_Vector v_p_row01_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m0_sf));
+                HVX_Vector v_p_row10_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m1_sf));
+                HVX_Vector v_p_row11_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m1_sf));
+
+                v_p_row0_hf = hvx_my_wsf_to_vhf(v_p_row01_sf, v_p_row00_sf);
+                v_p_row1_hf = hvx_my_wsf_to_vhf(v_p_row11_sf, v_p_row10_sf);
               } else {
-                HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);
-                HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);
-
-                if (use_fp32_exp) {
-                  HVX_VectorPair vp_s_minus_m0_sf = hvx_my_vqf16_to_wsf(v_s_minus_m0);
-                  HVX_VectorPair vp_s_minus_m1_sf = hvx_my_vqf16_to_wsf(v_s_minus_m1);
-
-                  HVX_Vector v_p_row00_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m0_sf));
-                  HVX_Vector v_p_row01_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m0_sf));
-                  HVX_Vector v_p_row10_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m1_sf));
-                  HVX_Vector v_p_row11_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m1_sf));
-
-                  v_p_row0_hf = hvx_my_wsf_to_vhf(v_p_row01_sf, v_p_row00_sf);
-                  v_p_row1_hf = hvx_my_wsf_to_vhf(v_p_row11_sf, v_p_row10_sf);
-                } else {
-                  v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
-                  v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
-                }
+                v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
+                v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
               }
 
               v_p_row0_hf = Q6_V_vmux_QVV(q_mask_keep, v_p_row0_hf, v_zero);
@@ -2291,12 +2397,1489 @@ void block_sparse_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *v
       }
     }
   }
+  return 0;
+}
+
+int block_sparse_flash_attn_f16_core_full_k(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
+                                             __fp16 *restrict O, const __fp16 *restrict Q,
+                                             const __fp16 *restrict K, const __fp16 *restrict V,
+                                             const int32_t *restrict block_mask, int qo_len, int kv_len, int n_heads,
+                                             int n_kv_heads, int head_dim, int block_q, int block_k, int n_q_blocks,
+                                             int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse,
+                                             int worker_index) {
+  (void) worker_index;
+
+  // 一个 KV head 对应 G 个 Q heads
+  // 当前函数只处理 kv_head_idx 对应的 K/V head
+  // 以及 Q/O 中 [kv_head_idx * G, (kv_head_idx + 1) * G) 这 G 个 heads
+  const int G = n_heads / n_kv_heads;
+  const int D = head_dim;
+  const int q_head_base = kv_head_idx * G;
+  const int k_blocks_per_head = n_k_blocks / n_kv_heads;
+  const bool use_host_index =
+    mask_format == 1 && max_kept_blocks > 0 && G == 1 && block_q == HMX_FP16_TILE_N_ROWS &&
+    block_k == HMX_FP16_TILE_N_COLS;
+
+  // 当前实现认为 Q/O 外部存储是 fp32
+  // 虽然函数参数类型是 __fp16*，
+  // 但实际通过 uint8_t* + qo_element_size 访问。
+  // qo_fp32_element = true 时：
+  //   Q/O 外部按 float 存储；
+  //   读入 VTCM 后转成 fp16 HMX tile；
+  //   写回 O 时再从 fp16 转回 float
+  const bool   qo_fp32_element = true;
+  const size_t qo_element_size = qo_fp32_element ? sizeof(float) : sizeof(__fp16);
+
+  // 是否用 fp32 路径算 exp
+  // 当前 false，表示使用 fp16/qf16 exp2 路径
+  const bool use_fp32_exp = false;
+
+  block_sparse_fa_plan_t plan;
+  if (!use_host_index ||
+      !block_sparse_fa_find_mode_plan(&plan, BLOCK_SPARSE_FA_FULL_K, G, head_dim, kv_len, vtcm_limit - vtcm)) {
+    return -1;
+  }
+  const size_t blk_sz_r = HMX_FP16_TILE_N_ROWS;
+  const size_t blk_sz_c = plan.blk_sz_c;
+  assert(blk_sz_c % 64 == 0);
+
+  // 当前 Q block 展开 G 个 Q heads 后的行数是 G * Br
+  // 为适配 HMX FP16 tile 的行数要求，按 HMX_FP16_TILE_N_ROWS 对齐
+  // g_br 表示对齐后的 Br'
+  const size_t g_br = align_up(G * blk_sz_r, HMX_FP16_TILE_N_ROWS);
+
+  // 当前 Q block 在行方向需要多少个 HMX tile
+  const size_t n_tiles_per_blk_r = g_br / HMX_FP16_TILE_N_ROWS;
+
+  // 当前 K/V block 在列方向需要多少个 HMX tile
+  const size_t n_tiles_per_blk_c = blk_sz_c / HMX_FP16_TILE_N_COLS;
+
+  // q_tile / o_tile:
+  //   逻辑形状 [Br', D]
+  //
+  // k_tile / v_tile:
+  //   逻辑形状 [Bc, D]
+  //
+  // s_tile / p_tile:
+  //   逻辑形状 [Br', Bc]
+  //   s_tile 保存 QK^T score；
+  //   p_tile 保存 softmax numerator P
+  //
+  // d_tile:
+  //   逻辑形状 [Br', Br']
+  //   保存对角矩阵，用于：
+  //     1. alpha * O_old
+  //     2. final O / l
+  //
+  // col_vec_size:
+  //   保存每一行的 m/l/rowmax/rowsum
+  //
+  // row_vec_size:
+  //   softmax 时把 HMX tile layout 中的 S/P 解码成连续 row buffer
+  const size_t qo_tile_size     = align_up(g_br * head_dim * sizeof(__fp16), 4096);
+  const size_t full_k_tile_size = (size_t) ceil_div(kv_len, HMX_FP16_TILE_N_COLS) * (head_dim / 32) *
+                                  HMX_FP16_TILE_SIZE;
+  const size_t v_tile_size      = align_up(blk_sz_c * head_dim * sizeof(__fp16), 4096);
+  const size_t core_tile_size   = align_up(g_br * blk_sz_c * sizeof(__fp16), 4096);
+  const size_t d_tile_size    = align_up(g_br * g_br * sizeof(__fp16), 4096);
+  const size_t col_vec_size   = align_up(g_br * sizeof(__fp16), 256);
+  const size_t row_vec_size   = align_up(blk_sz_c * sizeof(__fp16), 256);
+
+  // 原始 K/V 布局：
+  //   K/V: [kv_len, n_kv_heads, head_dim]
+  //
+  // kv_ld_blk_sz:
+  //   当前 kv_head_idx 对应的一个 head 的大小
+  //
+  // kv_ld_stride:
+  //   K/V 中一个 token 的完整 stride，即所有 KV heads 的大小
+  const size_t kv_ld_blk_sz   = head_dim;
+  const size_t kv_ld_stride   = n_kv_heads * head_dim;
+
+  // 原始 Q/O 布局：
+  //   Q: [qo_len, n_heads, head_dim]
+  //   O: [qo_len, n_heads, head_dim + (with_lse ? 1 : 0)]
+  //
+  // q_ld_blk_sz/o_st_blk_sz:
+  //   当前 kv_head_idx 对应的 G 个 Q heads 的总大小
+  //
+  // q_ld_stride/o_st_stride:
+  //   Q/O 中一个 token 的完整 stride，即所有 Q heads 的大小
+  const size_t q_ld_blk_sz = G * head_dim;
+  const size_t q_ld_stride = n_heads * head_dim;
+  const size_t o_head_dim  = head_dim + (with_lse ? 1 : 0);
+  const size_t o_st_blk_sz = G * o_head_dim;
+  const size_t o_st_stride = n_heads * o_head_dim;
+
+  // 从 vtcm 开始顺序分配所有临时 buffer
+  uint8_t *vtcm_cur = vtcm;
+  __fp16  *q_tile   = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, qo_tile_size);
+  __fp16  *o_tile0  = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, qo_tile_size);
+  __fp16  *o_tile1  = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, qo_tile_size);
+
+  __fp16 *packed_k = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, full_k_tile_size);
+  __fp16 *v_tile   = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, v_tile_size);
+
+  __fp16 *s_tile = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, core_tile_size);
+  __fp16 *p_tile = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, core_tile_size);
+
+  // D tile 保存对角矩阵
+  // 用于 HMX 计算 diag(scale) @ O
+  __fp16 *d_tile = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, d_tile_size);
+
+  // online softmax 状态：
+  //
+  // mvec_m:
+  //   m_i，当前已经处理过的 K/V blocks 的 row max
+  //
+  // mvec_l:
+  //   l_i，softmax denominator
+  //
+  // mvec_s_rowmax:
+  //   当前 K/V block 中每一行 S 的 rowmax
+  //   后面会复用为 exp(m_old - m_new)
+  //
+  // mvec_p_rowsum:
+  //   当前 K/V block 中每一行 P 的 rowsum
+  HVX_Vector *mvec_m        = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+  HVX_Vector *mvec_l        = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+  HVX_Vector *mvec_s_rowmax = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+  HVX_Vector *mvec_p_rowsum = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+
+  // softmax 时一次处理两行 S
+  // 从 HMX tile layout 解码出来后，放到这两个 row buffer 中
+  HVX_Vector *row_buffer0 = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, row_vec_size);
+  HVX_Vector *row_buffer1 = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, row_vec_size);
+
+  // HMX output scale buffer
+  //
+  // hmx_output_scales_id:
+  //   scale = 1，用于普通 HMX matmul 输出
+  //
+  // hmx_output_scales_qk:
+  //   scale = log2(e) / sqrt(D)，用于 QK^T
+  uint8_t *hmx_output_scales_id = (uint8_t *) vtcm_seq_alloc(&vtcm_cur, 256);
+  uint8_t *hmx_output_scales_qk = (uint8_t *) vtcm_seq_alloc(&vtcm_cur, 256);
+  assert(vtcm_cur <= vtcm_limit);
+
+  // qk_scale 用于 attention score：
+  //
+  //   QK^T / sqrt(D)
+  //
+  // 但后面 softmax 用的是 exp2，而不是 exp
+  // 因此这里提前乘上 log2(e)
+  float  qk_scale    = 1.0f / sqrtf(head_dim) * 1.44269504f;
+  __fp16 qk_scale_hf = (__fp16) qk_scale;
+
+  // 初始化 HMX 输出 scale
+  // 0x3c00 是 fp16 1.0
+  hmx_init_column_scales(hmx_output_scales_id, Q6_V_vsplat_R(0x3c00));
+
+  // QK^T 输出时直接乘 qk_scale_hf
+  hmx_init_column_scales(hmx_output_scales_qk, Q6_V_vsplat_R(fp16_to_bits(&qk_scale_hf)));
+
+  // transpose_vscatter_indices_base 用于 K tile 转置/重排
+  // vscatter 会把连续读入的 K row 写到 HMX RHS operand 需要的位置
+  static int32_t transpose_vscatter_indices_base[32] __vec_aligned__;
+  for (int i = 0; i < 32; ++i) {
+    transpose_vscatter_indices_base[i] = i * 128;
+  }
+
+  // d_tile_vscatter_offsets 用于生成对角矩阵 D tile
+  // offsets 指向 HMX tile layout 中对角线元素的位置
+  static int16_t d_tile_vscatter_offsets[64] __vec_aligned__;
+  for (int i = 0; i < 16; ++i) {
+    d_tile_vscatter_offsets[i * 2 + 0] = i * 136;
+    d_tile_vscatter_offsets[i * 2 + 1] = i * 136 + 6;
+  }
+
+  hvx_fill_uh(packed_k, 0, full_k_tile_size);
+  {
+    const __fp16 *k_ld_base = K + kv_head_idx * kv_ld_blk_sz;
+    const size_t n_k_tiles  = ceil_div(kv_len, HMX_FP16_TILE_N_COLS);
+    const HVX_Vector v_step = Q6_V_vsplat_R(4);
+    const HVX_Vector v_offsets_base = vmem(transpose_vscatter_indices_base);
+
+    l2fetch(k_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), kv_len, 1);
+    for (int k_tile_idx = 0; k_tile_idx < n_k_tiles; ++k_tile_idx) {
+      __fp16 *out_base = packed_k + k_tile_idx * HMX_FP16_TILE_N_COLS * head_dim;
+      HVX_Vector v_offsets = v_offsets_base;
+      for (int r1 = 0; r1 < HMX_FP16_TILE_N_COLS; ++r1) {
+        const int r = k_tile_idx * HMX_FP16_TILE_N_COLS + r1;
+        if (r >= kv_len) {
+          break;
+        }
+        const HVX_Vector *pv_in = (const HVX_Vector *) (k_ld_base + r * kv_ld_stride);
+#pragma unroll
+        for (int d = 0; d < D / 64; ++d) {
+          __fp16 *out_dual_tile = out_base + d * HMX_FP16_TILE_N_ELMS * 2;
+          Q6_vscatter_RMVwV((size_t) out_dual_tile, HMX_FP16_TILE_SIZE * 2 - 1, v_offsets, *pv_in++);
+        }
+        v_offsets = Q6_Vw_vadd_VwVw(v_offsets, v_step);
+      }
+    }
+  }
+
+  // 外层循环：按 Q/O token 方向分块
+  for (int ir = 0; ir < qo_len; ir += blk_sz_r) {
+    const size_t n_rows        = smin(qo_len - ir, blk_sz_r);
+    const size_t n_rows_g      = n_rows * G;
+    const size_t n_row_tiles   = ceil_div(n_rows_g, HMX_FP16_TILE_N_ROWS);
+    const size_t n_row_vec_cnt = ceil_div(n_rows_g, 64);
+
+    // load [n_rows * G, D] tile of Q into VTCM
+    {
+      const size_t q_ld_blk_sz_bytes = q_ld_blk_sz * qo_element_size;
+      const size_t q_ld_stride_bytes = q_ld_stride * qo_element_size;
+
+      const uint8_t *q_ld_base = ((uint8_t *) Q) + ir * q_ld_stride_bytes + kv_head_idx * q_ld_blk_sz_bytes;
+
+      l2fetch(q_ld_base, q_ld_stride_bytes, q_ld_blk_sz_bytes, n_rows, 1);
+
+      for (int r = 0; r < n_rows_g; r += 2) {
+        const bool next_row_valid = (r + 1) < n_rows_g;
+
+        int q_idx0 = (r + 0) / G;
+        int h_idx0 = (r + 0) % G;
+        int q_idx1 = (r + 1) / G;
+        int h_idx1 = (r + 1) % G;
+
+        const HVX_Vector *pv_in0 =
+          (const HVX_Vector *) (q_ld_base + q_idx0 * q_ld_stride_bytes + h_idx0 * head_dim * qo_element_size);
+        const HVX_Vector *pv_in1 =
+          (const HVX_Vector *) (q_ld_base + q_idx1 * q_ld_stride_bytes + h_idx1 * head_dim * qo_element_size);
+
+        int r0 = r / HMX_FP16_TILE_N_ROWS;
+        int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+        __fp16 *out_base = q_tile + r0 * HMX_FP16_TILE_N_ROWS * head_dim;
+
+        if (qo_fp32_element) {
+#pragma unroll
+          for (int d = 0; d < D / 32; ++d) {
+            const HVX_Vector v0    = *pv_in0++;
+            const HVX_Vector v1    = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+            const HVX_Vector v_out = hvx_my_wsf_to_vhf(v1, v0);
+
+            HVX_Vector *out_tile = (HVX_Vector *) (out_base + d * HMX_FP16_TILE_N_ELMS);
+            out_tile[r1 / 2]     = v_out;
+          }
+        } else {
+#pragma unroll
+          for (int d = 0; d < D / 64; ++d) {
+            const HVX_Vector     v0 = *pv_in0++;
+            const HVX_Vector     v1 = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+            const HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
+
+            __fp16     *out_dual_tile = out_base + d * HMX_FP16_TILE_N_ELMS * 2;
+            HVX_Vector *pv_out0       = ((HVX_Vector *) out_dual_tile) + r1 / 2;
+            HVX_Vector *pv_out1       = pv_out0 + 16;
+
+            *pv_out0 = Q6_V_lo_W(vp);
+            *pv_out1 = Q6_V_hi_W(vp);
+          }
+        }
+      }
+    }
+
+    // 初始化 online softmax 状态
+    hvx_fill_uh(mvec_m, 0xfbff, col_vec_size);
+    hvx_fill_uh(mvec_l, 0, col_vec_size);
+
+    __fp16 *o_tile_prev = o_tile0;
+    __fp16 *o_tile_curr = o_tile1;
+
+    hvx_fill_uh(o_tile_prev, 0, qo_tile_size);
+    hvx_fill_uh(d_tile, 0, d_tile_size);
+
+    int dense_jc = 0;
+    int index_pos = 0;
+    const int index_qb = block_sparse_q_block_for_group_row(block_q, n_q_blocks, n_heads, ir, 0, q_head_base, G);
+    const int32_t *index_row =
+      use_host_index && index_qb >= 0 && index_qb < n_q_blocks ? block_mask + (size_t) index_qb * max_kept_blocks :
+                                                                  NULL;
+    while (1) {
+      int jc = -1;
+      int index_cols = 0;
+      if (use_host_index) {
+        bool found_index_chunk = false;
+        while (index_row != NULL && index_pos < max_kept_blocks) {
+          const int kb_abs = index_row[index_pos++];
+          if (kb_abs < 0) {
+            break;
+          }
+          if (kb_abs < 0 || kb_abs >= n_k_blocks || kb_abs / k_blocks_per_head != kv_head_idx) {
+            continue;
+          }
+          const int start_block_in_head = kb_abs % k_blocks_per_head;
+          int end_block_in_head = start_block_in_head + 1;
+          while (index_pos < max_kept_blocks) {
+            const int next_kb_abs = index_row[index_pos];
+            if (next_kb_abs < 0 || next_kb_abs >= n_k_blocks || next_kb_abs / k_blocks_per_head != kv_head_idx) {
+              break;
+            }
+            const int next_block_in_head = next_kb_abs % k_blocks_per_head;
+            if (next_block_in_head != end_block_in_head) {
+              break;
+            }
+            const int next_cols = (next_block_in_head + 1 - start_block_in_head) * block_k;
+            if (next_cols > (int) blk_sz_c) {
+              break;
+            }
+            ++index_pos;
+            ++end_block_in_head;
+          }
+          jc = start_block_in_head * block_k;
+          index_cols = (end_block_in_head - start_block_in_head) * block_k;
+          if (jc + index_cols > kv_len) {
+            index_cols = kv_len - jc;
+          }
+          if (index_cols <= 0) {
+            continue;
+          }
+          found_index_chunk = true;
+          break;
+        }
+        if (!found_index_chunk) {
+          break;
+        }
+      } else {
+        if (dense_jc >= kv_len) {
+          break;
+        }
+        jc = dense_jc;
+        dense_jc += blk_sz_c;
+      }
+      const size_t n_real_cols = use_host_index ? (size_t) index_cols : smin(kv_len - jc, blk_sz_c);
+      const size_t n_cols      = n_real_cols;
+      const size_t n_col_tiles = ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
+
+      // 预取当前 block 对应的 V
+      {
+        const __fp16 *v_ld_base = V + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+        l2fetch(v_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), n_real_cols, 0);
+      }
+
+      // 计算块级 score：
+      //
+      //   dot(Q[Br', D], K[Bc, D]) ==> S[Br', Bc]
+      {
+        hmx_unit_acquire();
+        {
+          hmx_set_output_scales(hmx_output_scales_qk);
+          for (int r = 0; r < n_row_tiles; ++r) {
+            for (int c = 0; c < n_col_tiles; ++c) {
+              const __fp16 *row_tiles = q_tile + r * HMX_FP16_TILE_N_ROWS * head_dim;
+              const __fp16 *col_tiles = packed_k + (jc / HMX_FP16_TILE_N_COLS + c) * HMX_FP16_TILE_N_COLS * head_dim;
+              __fp16 *out_tile = s_tile + (r * n_tiles_per_blk_c + c) * HMX_FP16_TILE_N_ELMS;
+
+              hmx_dot_fp16(out_tile, row_tiles, col_tiles, head_dim / 32);
+            }
+          }
+        }
+        hmx_unit_release();
+      }
+
+      // safe softmax：
+      //   1. 从 S tile 解码出连续行
+      //   2. 对 HMX 对齐产生的 padding 列做 -inf mask
+      //   3. 计算当前 block 的 rowmax / rowsum
+      //   4. 生成 P tile
+      //
+      // host-index mode only visits kept K ranges. Dense-mask fallback computes full dense chunks.
+      {
+        const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);
+
+        for (int r_vec_idx = 0; r_vec_idx < n_row_vec_cnt; ++r_vec_idx) {
+          HVX_Vector v_s_rowmax_local = v_neg_inf;
+          HVX_Vector v_p_rowsum_local = Q6_V_vzero();
+
+          for (int r_vec_off = 0; r_vec_off < 64; r_vec_off += 2) {
+            int r = r_vec_idx * 64 + r_vec_off;
+            if (r >= align_up(n_rows_g, 2)) {
+              break;
+            }
+
+            int r0 = r / HMX_FP16_TILE_N_ROWS;
+            int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+            __fp16 *s_ld_base = s_tile + r0 * HMX_FP16_TILE_N_ROWS * blk_sz_c;
+            __fp16 *p_st_base = p_tile + r0 * HMX_FP16_TILE_N_ROWS * blk_sz_c;
+
+            HVX_Vector *pv_row_buf0 = row_buffer0;
+            HVX_Vector *pv_row_buf1 = row_buffer1;
+            for (int c = 0; c < n_cols; c += 64) {
+              const __fp16     *in_dual_tile = s_ld_base + (c / 64) * HMX_FP16_TILE_N_ELMS * 2;
+              const HVX_Vector *pv_s_in0     = ((const HVX_Vector *) in_dual_tile) + r1 / 2;
+              const HVX_Vector *pv_s_in1     = pv_s_in0 + 16;
+
+              HVX_VectorPair vp_s_dual_row = Q6_W_vdeal_VVR(*pv_s_in1, *pv_s_in0, -2);
+              *pv_row_buf0++               = Q6_V_lo_W(vp_s_dual_row);
+              *pv_row_buf1++               = Q6_V_hi_W(vp_s_dual_row);
+            }
+
+            HVX_Vector v_s_rowmax0 = v_neg_inf;
+            HVX_Vector v_s_rowmax1 = v_neg_inf;
+            for (int c = 0; c < n_cols; c += 64) {
+              const size_t ne = smin((int) n_real_cols - c, 64);
+              HVX_VectorPred q_mask_keep0 = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+              HVX_VectorPred q_mask_keep1 = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+
+              HVX_Vector v_s_row0 = Q6_V_vmux_QVV(q_mask_keep0, row_buffer0[c / 64], v_neg_inf);
+              HVX_Vector v_s_row1 = Q6_V_vmux_QVV(q_mask_keep1, row_buffer1[c / 64], v_neg_inf);
+
+              // 将被 mask 掉的位置直接改写成 -inf
+              // 后续 rowmax / exp / rowsum 都基于这个结果继续
+              row_buffer0[c / 64] = v_s_row0;
+              row_buffer1[c / 64] = v_s_row1;
+
+              v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v_s_row0);
+              v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v_s_row1);
+            }
+
+#pragma unroll
+            for (int s = 64; s >= 2; s >>= 1) {
+              v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, Q6_V_vlalign_VVR(v_s_rowmax0, v_neg_inf, s));
+              v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, Q6_V_vlalign_VVR(v_s_rowmax1, v_neg_inf, s));
+            }
+
+            HVX_Vector v_s_rowmax_pack2     = Q6_V_hi_W(Q6_W_vshuff_VVR(v_s_rowmax1, v_s_rowmax0, -2));
+            HVX_Vector v_s_rowmax_pack2_rot = Q6_V_vror_VR(v_s_rowmax_pack2, VLEN - 2 * sizeof(__fp16));
+            HVX_Vector v_s_rowmax_local_rot =
+              Q6_V_vror_VR(v_s_rowmax_local, r_vec_off * sizeof(__fp16));
+            v_s_rowmax_local =
+              Q6_V_vlalign_VVR(v_s_rowmax_pack2_rot, v_s_rowmax_local_rot, r_vec_off * sizeof(__fp16));
+
+            HVX_Vector v_m_cur = Q6_Vhf_vmax_VhfVhf(mvec_m[r_vec_idx], v_s_rowmax_local);
+
+            HVX_Vector v_m_lut  = Q6_V_vror_VR(v_m_cur, r_vec_off * sizeof(__fp16));
+            HVX_Vector v_dup_m0 = Q6_V_lo_W(Q6_Wh_vlut16_VbVhR_nomatch(Q6_V_vzero(), v_m_lut, 0));
+            HVX_Vector v_dup_m1 = Q6_V_lo_W(Q6_Wh_vlut16_VbVhR_nomatch(Q6_V_vzero(), v_m_lut, 2));
+
+            const HVX_Vector v_zero      = Q6_V_vzero();
+            HVX_Vector       v_p_rowsum0 = v_zero;
+            HVX_Vector       v_p_rowsum1 = v_zero;
+
+            for (int c = 0; c < n_cols; c += 64) {
+              const int ne = smax(0, smin((int) n_real_cols - c, 64));
+              HVX_VectorPred q_mask_keep = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+              HVX_Vector v_p_row0_hf, v_p_row1_hf;
+
+              HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);
+              HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);
+
+              if (use_fp32_exp) {
+                HVX_VectorPair vp_s_minus_m0_sf = hvx_my_vqf16_to_wsf(v_s_minus_m0);
+                HVX_VectorPair vp_s_minus_m1_sf = hvx_my_vqf16_to_wsf(v_s_minus_m1);
+
+                HVX_Vector v_p_row00_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m0_sf));
+                HVX_Vector v_p_row01_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m0_sf));
+                HVX_Vector v_p_row10_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m1_sf));
+                HVX_Vector v_p_row11_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m1_sf));
+
+                v_p_row0_hf = hvx_my_wsf_to_vhf(v_p_row01_sf, v_p_row00_sf);
+                v_p_row1_hf = hvx_my_wsf_to_vhf(v_p_row11_sf, v_p_row10_sf);
+              } else {
+                v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
+                v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
+              }
+
+              v_p_row0_hf = Q6_V_vmux_QVV(q_mask_keep, v_p_row0_hf, v_zero);
+              v_p_row1_hf = Q6_V_vmux_QVV(q_mask_keep, v_p_row1_hf, v_zero);
+
+              __fp16     *out_dual_tile = p_st_base + (c / 64) * HMX_FP16_TILE_N_ELMS * 2;
+              HVX_Vector *pv_p_out0     = ((HVX_Vector *) out_dual_tile) + r1 / 2;
+              HVX_Vector *pv_p_out1     = pv_p_out0 + 16;
+
+              HVX_VectorPair vp_p_dual_row = Q6_W_vshuff_VVR(v_p_row1_hf, v_p_row0_hf, -2);
+              *pv_p_out0                   = Q6_V_lo_W(vp_p_dual_row);
+              *pv_p_out1                   = Q6_V_hi_W(vp_p_dual_row);
+
+              HVX_VectorPair vp_p_row0 = hvx_my_vhf_to_wqf32(v_p_row0_hf);
+              HVX_VectorPair vp_p_row1 = hvx_my_vhf_to_wqf32(v_p_row1_hf);
+
+              v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(
+                v_p_rowsum0, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp_p_row0), Q6_V_hi_W(vp_p_row0)));
+              v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(
+                v_p_rowsum1, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp_p_row1), Q6_V_hi_W(vp_p_row1)));
+            }
+
+#pragma unroll
+            for (int s = 64; s >= 4; s >>= 1) {
+              v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_V_vlalign_VVR(v_p_rowsum0, v_zero, s));
+              v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_V_vlalign_VVR(v_p_rowsum1, v_zero, s));
+            }
+            HVX_Vector v_p_rowsum_pack2 = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(v_p_rowsum1, v_p_rowsum0));
+
+            HVX_Vector v_p_rowsum_pack2_rot = Q6_V_vror_VR(v_p_rowsum_pack2, VLEN - 2 * sizeof(__fp16));
+            HVX_Vector v_p_rowsum_local_rot = Q6_V_vror_VR(v_p_rowsum_local, r_vec_off * sizeof(__fp16));
+            v_p_rowsum_local =
+              Q6_V_vlalign_VVR(v_p_rowsum_pack2_rot, v_p_rowsum_local_rot, r_vec_off * sizeof(__fp16));
+          }
+
+          mvec_s_rowmax[r_vec_idx] = v_s_rowmax_local;
+          mvec_p_rowsum[r_vec_idx] = v_p_rowsum_local;
+        }
+      }
+
+      // load [Bc, D] tile of V into VTCM
+      // 与 K 类似，V 也要重排成 HMX RHS 可直接消费的布局
+      {
+        const __fp16 *v_ld_base = V + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+
+        for (int r = 0; r < n_real_cols; r += 2) {
+          const bool next_row_valid = (r + 1) < n_real_cols;
+
+          const HVX_Vector *pv_in0 = (const HVX_Vector *) (v_ld_base + (r + 0) * kv_ld_stride);
+          const HVX_Vector *pv_in1 = (const HVX_Vector *) (v_ld_base + (r + 1) * kv_ld_stride);
+
+#pragma unroll
+          for (int c = 0; c < D; c += 64) {
+            const HVX_Vector     v0 = *pv_in0++;
+            const HVX_Vector     v1 = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+            const HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
+
+            int r0 = r / HMX_FP16_TILE_N_ROWS;
+            int r1 = r % HMX_FP16_TILE_N_ROWS;
+            int c0 = c / HMX_FP16_TILE_N_COLS;
+
+            int     tile_idx0  = (c0 + 0) * n_tiles_per_blk_c + r0;
+            int     tile_idx1  = (c0 + 1) * n_tiles_per_blk_c + r0;
+            __fp16 *tile_base0 = v_tile + tile_idx0 * HMX_FP16_TILE_N_ELMS;
+            __fp16 *tile_base1 = v_tile + tile_idx1 * HMX_FP16_TILE_N_ELMS;
+
+            HVX_Vector *pv_out0 = ((HVX_Vector *) tile_base0) + r1 / 2;
+            HVX_Vector *pv_out1 = ((HVX_Vector *) tile_base1) + r1 / 2;
+            *pv_out0            = Q6_V_lo_W(vp);
+            *pv_out1            = Q6_V_hi_W(vp);
+          }
+        }
+      }
+
+      // 复用 mvec_s_rowmax 这块 buffer，
+      // 后续存 exp(m_i^{j-1} - m_i^j)
+      HVX_Vector *mvec_exp_m_diff = mvec_s_rowmax;
+
+      // 更新 online softmax 状态：
+      //
+      //   m_i^j = max(m_i^{j-1}, rowmax(S_i^j))
+      //   l_i^j = exp(m_i^{j-1} - m_i^j) * l_i^{j-1} + rowsum(P_i^j)
+      {
+        for (int i = 0; i < n_row_vec_cnt; ++i) {
+          HVX_Vector v_m_prev = mvec_m[i];
+          HVX_Vector v_m_curr = Q6_Vhf_vmax_VhfVhf(v_m_prev, mvec_s_rowmax[i]);
+          HVX_Vector v_m_diff = Q6_Vqf16_vsub_VhfVhf(v_m_prev, v_m_curr);
+
+          HVX_Vector v_exp_m_diff_hf = hvx_my_exp2_vhf_vqf16(v_m_diff);
+
+          HVX_Vector v_l_curr = Q6_Vqf16_vmpy_Vqf16Vhf(mvec_l[i], v_exp_m_diff_hf);
+          v_l_curr            = Q6_Vqf16_vadd_Vqf16Vhf(v_l_curr, mvec_p_rowsum[i]);
+
+          mvec_m[i] = v_m_curr;
+          mvec_l[i] = v_l_curr;
+
+          mvec_exp_m_diff[i] = v_exp_m_diff_hf;
+        }
+      }
+
+      // 更新当前输出：
+      //
+      //   O_i^j = diag(exp(m_i^{j-1} - m_i^j)) O_i^{j-1} + P_i^j V_j
+      {
+        const HVX_Vector     v_offsets       = vmem(d_tile_vscatter_offsets);
+        const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+        for (int i = 0; i < n_row_tiles; ++i) {
+          const HVX_Vector v_content = Q6_V_vror_VR(mvec_exp_m_diff[i / 2], (i % 2) * 64);
+
+          __fp16 *out_base = d_tile + i * (n_tiles_per_blk_r + 1) * HMX_FP16_TILE_N_ELMS;
+          Q6_vscatter_QRMVhV(q_32_elems_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
+        }
+
+        hmx_unit_acquire();
+        {
+          hmx_set_output_scales(hmx_output_scales_id);
+          for (int r = 0; r < n_row_tiles; ++r) {
+            for (int c = 0; c < head_dim / 32; ++c) {
+              __fp16 *d_tile_in = d_tile + (r * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+              __fp16 *o_tile_in = o_tile_prev + (c * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+              hmx_load_tiles_fp16(d_tile_in, o_tile_in, n_row_tiles);
+
+              __fp16 *p_tile_in = p_tile + (r * n_tiles_per_blk_c) * HMX_FP16_TILE_N_ELMS;
+              __fp16 *v_tile_in = v_tile + (c * n_tiles_per_blk_c) * HMX_FP16_TILE_N_ELMS;
+              for (int k = 0; k < n_col_tiles; ++k) {
+                int    offset  = k * HMX_FP16_TILE_N_ELMS;
+                size_t n_tiles = 1;
+                hmx_load_tiles_fp16(p_tile_in + offset, v_tile_in + offset, n_tiles);
+              }
+
+              __fp16 *o_tile_out = o_tile_curr + (c * n_tiles_per_blk_r + r) * HMX_FP16_TILE_N_ELMS;
+              hmx_consume_accumulator_fp16(o_tile_out);
+            }
+          }
+        }
+        hmx_unit_release();
+
+        swap_ptr(&o_tile_curr, &o_tile_prev);
+      }
+    }
+
+    // 最终归一化：
+    //
+    //   O_i = diag(l_i^{-1}) O_i
+    {
+      const HVX_Vector     v_offsets       = vmem(d_tile_vscatter_offsets);
+      const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+
+      HVX_Vector v_content;
+      for (int i = 0; i < n_row_tiles; ++i) {
+        if ((i % 2) == 0) {
+          v_content = hvx_my_inv_vhf(Q6_Vhf_equals_Vqf16(mvec_l[i / 2]));
+        } else {
+          v_content = Q6_V_vror_VR(v_content, 64);
+        }
+
+        __fp16 *out_base = d_tile + i * (n_tiles_per_blk_r + 1) * HMX_FP16_TILE_N_ELMS;
+        Q6_vscatter_QRMVhV(q_32_elems_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
+      }
+
+      hmx_unit_acquire();
+      {
+        hmx_set_output_scales(hmx_output_scales_id);
+        for (int r = 0; r < n_row_tiles; ++r) {
+          for (int c = 0; c < head_dim / 32; ++c) {
+            __fp16 *d_tile_in = d_tile + (r * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+            __fp16 *o_tile_in = o_tile_prev + (c * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+            __fp16 *o_tile_out = o_tile_curr + (r * head_dim / 32 + c) * HMX_FP16_TILE_N_ELMS;
+
+            hmx_dot_fp16(o_tile_out, d_tile_in, o_tile_in, n_row_tiles);
+          }
+        }
+      }
+      hmx_unit_release();
+    }
+
+    // 将当前 Q block 对应的结果从 VTCM 写回外部 O
+    {
+      const size_t o_st_blk_sz_bytes = o_st_blk_sz * qo_element_size;
+      const size_t o_st_stride_bytes = o_st_stride * qo_element_size;
+
+      uint8_t *o_st_base = ((uint8_t *) O) + ir * o_st_stride_bytes + kv_head_idx * o_st_blk_sz_bytes;
+
+      for (int r = 0; r < n_rows_g; r += 2) {
+        const bool next_row_valid = (r + 1) < n_rows_g;
+
+        int o_idx0 = (r + 0) / G;
+        int h_idx0 = (r + 0) % G;
+        int o_idx1 = (r + 1) / G;
+        int h_idx1 = (r + 1) % G;
+
+        uint8_t *row_out0 = o_st_base + o_idx0 * o_st_stride_bytes + h_idx0 * o_head_dim * qo_element_size;
+        uint8_t *row_out1 = o_st_base + o_idx1 * o_st_stride_bytes + h_idx1 * o_head_dim * qo_element_size;
+
+        HVX_Vector *pv_out0 = (HVX_Vector *) row_out0;
+        HVX_Vector *pv_out1 = (HVX_Vector *) row_out1;
+
+        int r0 = r / HMX_FP16_TILE_N_ROWS;
+        int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+        const __fp16 *in_base = o_tile_curr + r0 * HMX_FP16_TILE_N_ROWS * head_dim;  // [32, D] row chunk
+
+        // clang-format off
+        if (qo_fp32_element) {
+          #pragma unroll
+          for (int d = 0; d < D / 32; ++d) {
+            const HVX_Vector *in_tile = (const HVX_Vector *) (in_base + d * HMX_FP16_TILE_N_ELMS);
+
+            const HVX_VectorPair vp = hvx_my_vhf_to_wsf(in_tile[r1 / 2]);
+            const HVX_Vector v_out0 = Q6_V_lo_W(vp);
+            const HVX_Vector v_out1 = Q6_V_hi_W(vp);
+
+            if (with_lse) {
+              vstu_variable(row_out0 + d * 32 * sizeof(float), sizeof(v_out0), v_out0);
+              if (next_row_valid) {
+                vstu_variable(row_out1 + d * 32 * sizeof(float), sizeof(v_out1), v_out1);
+              }
+            } else {
+              *pv_out0++ = v_out0;
+              if (next_row_valid) {
+                *pv_out1++ = v_out1;
+              }
+            }
+          }
+
+          if (with_lse) {
+            const float lse0 = flash_attn_lse_from_f16_state(mvec_m, mvec_l, r + 0);
+            memcpy(row_out0 + D * sizeof(float), &lse0, sizeof(lse0));
+            if (next_row_valid) {
+              const float lse1 = flash_attn_lse_from_f16_state(mvec_m, mvec_l, r + 1);
+              memcpy(row_out1 + D * sizeof(float), &lse1, sizeof(lse1));
+            }
+          }
+        } else {
+          assert(!with_lse);
+          #pragma unroll
+          for (int d = 0; d < D / 64; ++d) {
+            const __fp16     *in_dual_tile = in_base + d * HMX_FP16_TILE_N_ELMS * 2;
+            const HVX_Vector *pv_in0       = ((const HVX_Vector *) in_dual_tile) + r1 / 2;
+            const HVX_Vector *pv_in1       = pv_in0 + 16;
+
+            const HVX_VectorPair vp = Q6_W_vdeal_VVR(*pv_in1, *pv_in0, -2);
+
+            *pv_out0++ = Q6_V_lo_W(vp);
+            if (next_row_valid) {
+              *pv_out1++ = Q6_V_hi_W(vp);
+            }
+          }
+        }
+        // clang-format on
+      }
+    }
+  }
+  return 0;
+}
+
+int block_sparse_flash_attn_f16_core_full_kv(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
+                                             __fp16 *restrict O, const __fp16 *restrict Q,
+                                             const __fp16 *restrict K, const __fp16 *restrict V,
+                                             const int32_t *restrict block_mask, int qo_len, int kv_len, int n_heads,
+                                             int n_kv_heads, int head_dim, int block_q, int block_k, int n_q_blocks,
+                                             int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse,
+                                             int worker_index) {
+  (void) worker_index;
+
+  // 一个 KV head 对应 G 个 Q heads
+  // 当前函数只处理 kv_head_idx 对应的 K/V head
+  // 以及 Q/O 中 [kv_head_idx * G, (kv_head_idx + 1) * G) 这 G 个 heads
+  const int G = n_heads / n_kv_heads;
+  const int D = head_dim;
+  const int q_head_base = kv_head_idx * G;
+  const int k_blocks_per_head = n_k_blocks / n_kv_heads;
+  const bool use_host_index =
+    mask_format == 1 && max_kept_blocks > 0 && G == 1 && block_q == HMX_FP16_TILE_N_ROWS &&
+    block_k == HMX_FP16_TILE_N_COLS;
+
+  // 当前实现认为 Q/O 外部存储是 fp32
+  // 虽然函数参数类型是 __fp16*，
+  // 但实际通过 uint8_t* + qo_element_size 访问。
+  // qo_fp32_element = true 时：
+  //   Q/O 外部按 float 存储；
+  //   读入 VTCM 后转成 fp16 HMX tile；
+  //   写回 O 时再从 fp16 转回 float
+  const bool   qo_fp32_element = true;
+  const size_t qo_element_size = qo_fp32_element ? sizeof(float) : sizeof(__fp16);
+
+  // 是否用 fp32 路径算 exp
+  // 当前 false，表示使用 fp16/qf16 exp2 路径
+  const bool use_fp32_exp = false;
+
+  block_sparse_fa_plan_t plan;
+  if (!use_host_index ||
+      !block_sparse_fa_find_mode_plan(&plan, BLOCK_SPARSE_FA_FULL_KV, G, head_dim, kv_len, vtcm_limit - vtcm)) {
+    return -1;
+  }
+  const size_t blk_sz_r = HMX_FP16_TILE_N_ROWS;
+  const size_t blk_sz_c = plan.blk_sz_c;
+  assert(blk_sz_c % 64 == 0);
+
+  // 当前 Q block 展开 G 个 Q heads 后的行数是 G * Br
+  // 为适配 HMX FP16 tile 的行数要求，按 HMX_FP16_TILE_N_ROWS 对齐
+  // g_br 表示对齐后的 Br'
+  const size_t g_br = align_up(G * blk_sz_r, HMX_FP16_TILE_N_ROWS);
+
+  // 当前 Q block 在行方向需要多少个 HMX tile
+  const size_t n_tiles_per_blk_r = g_br / HMX_FP16_TILE_N_ROWS;
+
+  // 当前 K/V block 在列方向需要多少个 HMX tile
+  const size_t n_tiles_per_blk_c = blk_sz_c / HMX_FP16_TILE_N_COLS;
+
+  // q_tile / o_tile:
+  //   逻辑形状 [Br', D]
+  //
+  // k_tile / v_tile:
+  //   逻辑形状 [Bc, D]
+  //
+  // s_tile / p_tile:
+  //   逻辑形状 [Br', Bc]
+  //   s_tile 保存 QK^T score；
+  //   p_tile 保存 softmax numerator P
+  //
+  // d_tile:
+  //   逻辑形状 [Br', Br']
+  //   保存对角矩阵，用于：
+  //     1. alpha * O_old
+  //     2. final O / l
+  //
+  // col_vec_size:
+  //   保存每一行的 m/l/rowmax/rowsum
+  //
+  // row_vec_size:
+  //   softmax 时把 HMX tile layout 中的 S/P 解码成连续 row buffer
+  const size_t qo_tile_size      = align_up(g_br * head_dim * sizeof(__fp16), 4096);
+  const size_t full_kv_tile_size = (size_t) ceil_div(kv_len, HMX_FP16_TILE_N_COLS) * (head_dim / 32) *
+                                   HMX_FP16_TILE_SIZE;
+  const size_t core_tile_size    = align_up(g_br * blk_sz_c * sizeof(__fp16), 4096);
+  const size_t d_tile_size    = align_up(g_br * g_br * sizeof(__fp16), 4096);
+  const size_t col_vec_size   = align_up(g_br * sizeof(__fp16), 256);
+  const size_t row_vec_size   = align_up(blk_sz_c * sizeof(__fp16), 256);
+
+  // 原始 K/V 布局：
+  //   K/V: [kv_len, n_kv_heads, head_dim]
+  //
+  // kv_ld_blk_sz:
+  //   当前 kv_head_idx 对应的一个 head 的大小
+  //
+  // kv_ld_stride:
+  //   K/V 中一个 token 的完整 stride，即所有 KV heads 的大小
+  const size_t kv_ld_blk_sz   = head_dim;
+  const size_t kv_ld_stride   = n_kv_heads * head_dim;
+
+  // 原始 Q/O 布局：
+  //   Q: [qo_len, n_heads, head_dim]
+  //   O: [qo_len, n_heads, head_dim + (with_lse ? 1 : 0)]
+  //
+  // q_ld_blk_sz/o_st_blk_sz:
+  //   当前 kv_head_idx 对应的 G 个 Q heads 的总大小
+  //
+  // q_ld_stride/o_st_stride:
+  //   Q/O 中一个 token 的完整 stride，即所有 Q heads 的大小
+  const size_t q_ld_blk_sz = G * head_dim;
+  const size_t q_ld_stride = n_heads * head_dim;
+  const size_t o_head_dim  = head_dim + (with_lse ? 1 : 0);
+  const size_t o_st_blk_sz = G * o_head_dim;
+  const size_t o_st_stride = n_heads * o_head_dim;
+
+  // 从 vtcm 开始顺序分配所有临时 buffer
+  uint8_t *vtcm_cur = vtcm;
+  __fp16  *q_tile   = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, qo_tile_size);
+  __fp16  *o_tile0  = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, qo_tile_size);
+  __fp16  *o_tile1  = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, qo_tile_size);
+
+  __fp16 *packed_k = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, full_kv_tile_size);
+  __fp16 *packed_v = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, full_kv_tile_size);
+
+  __fp16 *s_tile = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, core_tile_size);
+  __fp16 *p_tile = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, core_tile_size);
+
+  // D tile 保存对角矩阵
+  // 用于 HMX 计算 diag(scale) @ O
+  __fp16 *d_tile = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, d_tile_size);
+
+  // online softmax 状态：
+  //
+  // mvec_m:
+  //   m_i，当前已经处理过的 K/V blocks 的 row max
+  //
+  // mvec_l:
+  //   l_i，softmax denominator
+  //
+  // mvec_s_rowmax:
+  //   当前 K/V block 中每一行 S 的 rowmax
+  //   后面会复用为 exp(m_old - m_new)
+  //
+  // mvec_p_rowsum:
+  //   当前 K/V block 中每一行 P 的 rowsum
+  HVX_Vector *mvec_m        = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+  HVX_Vector *mvec_l        = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+  HVX_Vector *mvec_s_rowmax = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+  HVX_Vector *mvec_p_rowsum = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+
+  // softmax 时一次处理两行 S
+  // 从 HMX tile layout 解码出来后，放到这两个 row buffer 中
+  HVX_Vector *row_buffer0 = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, row_vec_size);
+  HVX_Vector *row_buffer1 = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, row_vec_size);
+
+  // HMX output scale buffer
+  //
+  // hmx_output_scales_id:
+  //   scale = 1，用于普通 HMX matmul 输出
+  //
+  // hmx_output_scales_qk:
+  //   scale = log2(e) / sqrt(D)，用于 QK^T
+  uint8_t *hmx_output_scales_id = (uint8_t *) vtcm_seq_alloc(&vtcm_cur, 256);
+  uint8_t *hmx_output_scales_qk = (uint8_t *) vtcm_seq_alloc(&vtcm_cur, 256);
+  assert(vtcm_cur <= vtcm_limit);
+
+  // qk_scale 用于 attention score：
+  //
+  //   QK^T / sqrt(D)
+  //
+  // 但后面 softmax 用的是 exp2，而不是 exp
+  // 因此这里提前乘上 log2(e)
+  float  qk_scale    = 1.0f / sqrtf(head_dim) * 1.44269504f;
+  __fp16 qk_scale_hf = (__fp16) qk_scale;
+
+  // 初始化 HMX 输出 scale
+  // 0x3c00 是 fp16 1.0
+  hmx_init_column_scales(hmx_output_scales_id, Q6_V_vsplat_R(0x3c00));
+
+  // QK^T 输出时直接乘 qk_scale_hf
+  hmx_init_column_scales(hmx_output_scales_qk, Q6_V_vsplat_R(fp16_to_bits(&qk_scale_hf)));
+
+  // transpose_vscatter_indices_base 用于 K tile 转置/重排
+  // vscatter 会把连续读入的 K row 写到 HMX RHS operand 需要的位置
+  static int32_t transpose_vscatter_indices_base[32] __vec_aligned__;
+  for (int i = 0; i < 32; ++i) {
+    transpose_vscatter_indices_base[i] = i * 128;
+  }
+
+  // d_tile_vscatter_offsets 用于生成对角矩阵 D tile
+  // offsets 指向 HMX tile layout 中对角线元素的位置
+  static int16_t d_tile_vscatter_offsets[64] __vec_aligned__;
+  for (int i = 0; i < 16; ++i) {
+    d_tile_vscatter_offsets[i * 2 + 0] = i * 136;
+    d_tile_vscatter_offsets[i * 2 + 1] = i * 136 + 6;
+  }
+
+  hvx_fill_uh(packed_k, 0, full_kv_tile_size);
+  hvx_fill_uh(packed_v, 0, full_kv_tile_size);
+  {
+    const __fp16 *k_ld_base = K + kv_head_idx * kv_ld_blk_sz;
+    const __fp16 *v_ld_base = V + kv_head_idx * kv_ld_blk_sz;
+    const size_t n_k_tiles  = ceil_div(kv_len, HMX_FP16_TILE_N_COLS);
+    const HVX_Vector v_step = Q6_V_vsplat_R(4);
+    const HVX_Vector v_offsets_base = vmem(transpose_vscatter_indices_base);
+
+    l2fetch(k_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), kv_len, 1);
+    for (int k_tile_idx = 0; k_tile_idx < n_k_tiles; ++k_tile_idx) {
+      __fp16 *out_base = packed_k + k_tile_idx * HMX_FP16_TILE_N_COLS * head_dim;
+      HVX_Vector v_offsets = v_offsets_base;
+      for (int r1 = 0; r1 < HMX_FP16_TILE_N_COLS; ++r1) {
+        const int r = k_tile_idx * HMX_FP16_TILE_N_COLS + r1;
+        if (r >= kv_len) {
+          break;
+        }
+        const HVX_Vector *pv_in = (const HVX_Vector *) (k_ld_base + r * kv_ld_stride);
+#pragma unroll
+        for (int d = 0; d < D / 64; ++d) {
+          __fp16 *out_dual_tile = out_base + d * HMX_FP16_TILE_N_ELMS * 2;
+          Q6_vscatter_RMVwV((size_t) out_dual_tile, HMX_FP16_TILE_SIZE * 2 - 1, v_offsets, *pv_in++);
+        }
+        v_offsets = Q6_Vw_vadd_VwVw(v_offsets, v_step);
+      }
+    }
+
+    l2fetch(v_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), kv_len, 1);
+    for (int r = 0; r < kv_len; r += 2) {
+      const bool next_row_valid = (r + 1) < kv_len;
+      const HVX_Vector *pv_in0 = (const HVX_Vector *) (v_ld_base + (r + 0) * kv_ld_stride);
+      const HVX_Vector *pv_in1 = (const HVX_Vector *) (v_ld_base + (r + 1) * kv_ld_stride);
+#pragma unroll
+      for (int c = 0; c < D; c += 64) {
+        const HVX_Vector v0 = *pv_in0++;
+        const HVX_Vector v1 = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+        const HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
+        const int k_tile_idx = r / HMX_FP16_TILE_N_ROWS;
+        const int row_in_tile = r % HMX_FP16_TILE_N_ROWS;
+        const int d_tile_idx = c / HMX_FP16_TILE_N_COLS;
+        __fp16 *tile_base0 =
+          packed_v + ((d_tile_idx + 0) * n_k_tiles + k_tile_idx) * HMX_FP16_TILE_N_ELMS;
+        __fp16 *tile_base1 =
+          packed_v + ((d_tile_idx + 1) * n_k_tiles + k_tile_idx) * HMX_FP16_TILE_N_ELMS;
+        HVX_Vector *pv_out0 = ((HVX_Vector *) tile_base0) + row_in_tile / 2;
+        HVX_Vector *pv_out1 = ((HVX_Vector *) tile_base1) + row_in_tile / 2;
+        *pv_out0 = Q6_V_lo_W(vp);
+        *pv_out1 = Q6_V_hi_W(vp);
+      }
+    }
+  }
+
+  // 外层循环：按 Q/O token 方向分块
+  for (int ir = 0; ir < qo_len; ir += blk_sz_r) {
+    const size_t n_rows        = smin(qo_len - ir, blk_sz_r);
+    const size_t n_rows_g      = n_rows * G;
+    const size_t n_row_tiles   = ceil_div(n_rows_g, HMX_FP16_TILE_N_ROWS);
+    const size_t n_row_vec_cnt = ceil_div(n_rows_g, 64);
+
+    // load [n_rows * G, D] tile of Q into VTCM
+    {
+      const size_t q_ld_blk_sz_bytes = q_ld_blk_sz * qo_element_size;
+      const size_t q_ld_stride_bytes = q_ld_stride * qo_element_size;
+
+      const uint8_t *q_ld_base = ((uint8_t *) Q) + ir * q_ld_stride_bytes + kv_head_idx * q_ld_blk_sz_bytes;
+
+      l2fetch(q_ld_base, q_ld_stride_bytes, q_ld_blk_sz_bytes, n_rows, 1);
+
+      for (int r = 0; r < n_rows_g; r += 2) {
+        const bool next_row_valid = (r + 1) < n_rows_g;
+
+        int q_idx0 = (r + 0) / G;
+        int h_idx0 = (r + 0) % G;
+        int q_idx1 = (r + 1) / G;
+        int h_idx1 = (r + 1) % G;
+
+        const HVX_Vector *pv_in0 =
+          (const HVX_Vector *) (q_ld_base + q_idx0 * q_ld_stride_bytes + h_idx0 * head_dim * qo_element_size);
+        const HVX_Vector *pv_in1 =
+          (const HVX_Vector *) (q_ld_base + q_idx1 * q_ld_stride_bytes + h_idx1 * head_dim * qo_element_size);
+
+        int r0 = r / HMX_FP16_TILE_N_ROWS;
+        int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+        __fp16 *out_base = q_tile + r0 * HMX_FP16_TILE_N_ROWS * head_dim;
+
+        if (qo_fp32_element) {
+#pragma unroll
+          for (int d = 0; d < D / 32; ++d) {
+            const HVX_Vector v0    = *pv_in0++;
+            const HVX_Vector v1    = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+            const HVX_Vector v_out = hvx_my_wsf_to_vhf(v1, v0);
+
+            HVX_Vector *out_tile = (HVX_Vector *) (out_base + d * HMX_FP16_TILE_N_ELMS);
+            out_tile[r1 / 2]     = v_out;
+          }
+        } else {
+#pragma unroll
+          for (int d = 0; d < D / 64; ++d) {
+            const HVX_Vector     v0 = *pv_in0++;
+            const HVX_Vector     v1 = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+            const HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
+
+            __fp16     *out_dual_tile = out_base + d * HMX_FP16_TILE_N_ELMS * 2;
+            HVX_Vector *pv_out0       = ((HVX_Vector *) out_dual_tile) + r1 / 2;
+            HVX_Vector *pv_out1       = pv_out0 + 16;
+
+            *pv_out0 = Q6_V_lo_W(vp);
+            *pv_out1 = Q6_V_hi_W(vp);
+          }
+        }
+      }
+    }
+
+    // 初始化 online softmax 状态
+    hvx_fill_uh(mvec_m, 0xfbff, col_vec_size);
+    hvx_fill_uh(mvec_l, 0, col_vec_size);
+
+    __fp16 *o_tile_prev = o_tile0;
+    __fp16 *o_tile_curr = o_tile1;
+
+    hvx_fill_uh(o_tile_prev, 0, qo_tile_size);
+    hvx_fill_uh(d_tile, 0, d_tile_size);
+
+    int dense_jc = 0;
+    int index_pos = 0;
+    const int index_qb = block_sparse_q_block_for_group_row(block_q, n_q_blocks, n_heads, ir, 0, q_head_base, G);
+    const int32_t *index_row =
+      use_host_index && index_qb >= 0 && index_qb < n_q_blocks ? block_mask + (size_t) index_qb * max_kept_blocks :
+                                                                  NULL;
+    while (1) {
+      int jc = -1;
+      int index_cols = 0;
+      if (use_host_index) {
+        bool found_index_chunk = false;
+        while (index_row != NULL && index_pos < max_kept_blocks) {
+          const int kb_abs = index_row[index_pos++];
+          if (kb_abs < 0) {
+            break;
+          }
+          if (kb_abs < 0 || kb_abs >= n_k_blocks || kb_abs / k_blocks_per_head != kv_head_idx) {
+            continue;
+          }
+          const int start_block_in_head = kb_abs % k_blocks_per_head;
+          int end_block_in_head = start_block_in_head + 1;
+          while (index_pos < max_kept_blocks) {
+            const int next_kb_abs = index_row[index_pos];
+            if (next_kb_abs < 0 || next_kb_abs >= n_k_blocks || next_kb_abs / k_blocks_per_head != kv_head_idx) {
+              break;
+            }
+            const int next_block_in_head = next_kb_abs % k_blocks_per_head;
+            if (next_block_in_head != end_block_in_head) {
+              break;
+            }
+            const int next_cols = (next_block_in_head + 1 - start_block_in_head) * block_k;
+            if (next_cols > (int) blk_sz_c) {
+              break;
+            }
+            ++index_pos;
+            ++end_block_in_head;
+          }
+          jc = start_block_in_head * block_k;
+          index_cols = (end_block_in_head - start_block_in_head) * block_k;
+          if (jc + index_cols > kv_len) {
+            index_cols = kv_len - jc;
+          }
+          if (index_cols <= 0) {
+            continue;
+          }
+          found_index_chunk = true;
+          break;
+        }
+        if (!found_index_chunk) {
+          break;
+        }
+      } else {
+        if (dense_jc >= kv_len) {
+          break;
+        }
+        jc = dense_jc;
+        dense_jc += blk_sz_c;
+      }
+      const size_t n_real_cols = use_host_index ? (size_t) index_cols : smin(kv_len - jc, blk_sz_c);
+      const size_t n_cols      = n_real_cols;
+      const size_t n_col_tiles = ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
+
+      // 计算块级 score：
+      //
+      //   dot(Q[Br', D], K[Bc, D]) ==> S[Br', Bc]
+      {
+        hmx_unit_acquire();
+        {
+          hmx_set_output_scales(hmx_output_scales_qk);
+          for (int r = 0; r < n_row_tiles; ++r) {
+            for (int c = 0; c < n_col_tiles; ++c) {
+              const __fp16 *row_tiles = q_tile + r * HMX_FP16_TILE_N_ROWS * head_dim;
+              const __fp16 *col_tiles = packed_k + (jc / HMX_FP16_TILE_N_COLS + c) * HMX_FP16_TILE_N_COLS * head_dim;
+              __fp16 *out_tile = s_tile + (r * n_tiles_per_blk_c + c) * HMX_FP16_TILE_N_ELMS;
+
+              hmx_dot_fp16(out_tile, row_tiles, col_tiles, head_dim / 32);
+            }
+          }
+        }
+        hmx_unit_release();
+      }
+
+      // safe softmax：
+      //   1. 从 S tile 解码出连续行
+      //   2. 对 HMX 对齐产生的 padding 列做 -inf mask
+      //   3. 计算当前 block 的 rowmax / rowsum
+      //   4. 生成 P tile
+      //
+      // host-index mode only visits kept K ranges. Dense-mask fallback computes full dense chunks.
+      {
+        const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);
+
+        for (int r_vec_idx = 0; r_vec_idx < n_row_vec_cnt; ++r_vec_idx) {
+          HVX_Vector v_s_rowmax_local = v_neg_inf;
+          HVX_Vector v_p_rowsum_local = Q6_V_vzero();
+
+          for (int r_vec_off = 0; r_vec_off < 64; r_vec_off += 2) {
+            int r = r_vec_idx * 64 + r_vec_off;
+            if (r >= align_up(n_rows_g, 2)) {
+              break;
+            }
+
+            int r0 = r / HMX_FP16_TILE_N_ROWS;
+            int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+            __fp16 *s_ld_base = s_tile + r0 * HMX_FP16_TILE_N_ROWS * blk_sz_c;
+            __fp16 *p_st_base = p_tile + r0 * HMX_FP16_TILE_N_ROWS * blk_sz_c;
+
+            HVX_Vector *pv_row_buf0 = row_buffer0;
+            HVX_Vector *pv_row_buf1 = row_buffer1;
+            for (int c = 0; c < n_cols; c += 64) {
+              const __fp16     *in_dual_tile = s_ld_base + (c / 64) * HMX_FP16_TILE_N_ELMS * 2;
+              const HVX_Vector *pv_s_in0     = ((const HVX_Vector *) in_dual_tile) + r1 / 2;
+              const HVX_Vector *pv_s_in1     = pv_s_in0 + 16;
+
+              HVX_VectorPair vp_s_dual_row = Q6_W_vdeal_VVR(*pv_s_in1, *pv_s_in0, -2);
+              *pv_row_buf0++               = Q6_V_lo_W(vp_s_dual_row);
+              *pv_row_buf1++               = Q6_V_hi_W(vp_s_dual_row);
+            }
+
+            HVX_Vector v_s_rowmax0 = v_neg_inf;
+            HVX_Vector v_s_rowmax1 = v_neg_inf;
+            for (int c = 0; c < n_cols; c += 64) {
+              const size_t ne = smin((int) n_real_cols - c, 64);
+              HVX_VectorPred q_mask_keep0 = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+              HVX_VectorPred q_mask_keep1 = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+
+              HVX_Vector v_s_row0 = Q6_V_vmux_QVV(q_mask_keep0, row_buffer0[c / 64], v_neg_inf);
+              HVX_Vector v_s_row1 = Q6_V_vmux_QVV(q_mask_keep1, row_buffer1[c / 64], v_neg_inf);
+
+              // 将被 mask 掉的位置直接改写成 -inf
+              // 后续 rowmax / exp / rowsum 都基于这个结果继续
+              row_buffer0[c / 64] = v_s_row0;
+              row_buffer1[c / 64] = v_s_row1;
+
+              v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v_s_row0);
+              v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v_s_row1);
+            }
+
+#pragma unroll
+            for (int s = 64; s >= 2; s >>= 1) {
+              v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, Q6_V_vlalign_VVR(v_s_rowmax0, v_neg_inf, s));
+              v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, Q6_V_vlalign_VVR(v_s_rowmax1, v_neg_inf, s));
+            }
+
+            HVX_Vector v_s_rowmax_pack2     = Q6_V_hi_W(Q6_W_vshuff_VVR(v_s_rowmax1, v_s_rowmax0, -2));
+            HVX_Vector v_s_rowmax_pack2_rot = Q6_V_vror_VR(v_s_rowmax_pack2, VLEN - 2 * sizeof(__fp16));
+            HVX_Vector v_s_rowmax_local_rot =
+              Q6_V_vror_VR(v_s_rowmax_local, r_vec_off * sizeof(__fp16));
+            v_s_rowmax_local =
+              Q6_V_vlalign_VVR(v_s_rowmax_pack2_rot, v_s_rowmax_local_rot, r_vec_off * sizeof(__fp16));
+
+            HVX_Vector v_m_cur = Q6_Vhf_vmax_VhfVhf(mvec_m[r_vec_idx], v_s_rowmax_local);
+
+            HVX_Vector v_m_lut  = Q6_V_vror_VR(v_m_cur, r_vec_off * sizeof(__fp16));
+            HVX_Vector v_dup_m0 = Q6_V_lo_W(Q6_Wh_vlut16_VbVhR_nomatch(Q6_V_vzero(), v_m_lut, 0));
+            HVX_Vector v_dup_m1 = Q6_V_lo_W(Q6_Wh_vlut16_VbVhR_nomatch(Q6_V_vzero(), v_m_lut, 2));
+
+            const HVX_Vector v_zero      = Q6_V_vzero();
+            HVX_Vector       v_p_rowsum0 = v_zero;
+            HVX_Vector       v_p_rowsum1 = v_zero;
+
+            for (int c = 0; c < n_cols; c += 64) {
+              const int ne = smax(0, smin((int) n_real_cols - c, 64));
+              HVX_VectorPred q_mask_keep = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+              HVX_Vector v_p_row0_hf, v_p_row1_hf;
+
+              HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);
+              HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);
+
+              if (use_fp32_exp) {
+                HVX_VectorPair vp_s_minus_m0_sf = hvx_my_vqf16_to_wsf(v_s_minus_m0);
+                HVX_VectorPair vp_s_minus_m1_sf = hvx_my_vqf16_to_wsf(v_s_minus_m1);
+
+                HVX_Vector v_p_row00_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m0_sf));
+                HVX_Vector v_p_row01_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m0_sf));
+                HVX_Vector v_p_row10_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m1_sf));
+                HVX_Vector v_p_row11_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m1_sf));
+
+                v_p_row0_hf = hvx_my_wsf_to_vhf(v_p_row01_sf, v_p_row00_sf);
+                v_p_row1_hf = hvx_my_wsf_to_vhf(v_p_row11_sf, v_p_row10_sf);
+              } else {
+                v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
+                v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
+              }
+
+              v_p_row0_hf = Q6_V_vmux_QVV(q_mask_keep, v_p_row0_hf, v_zero);
+              v_p_row1_hf = Q6_V_vmux_QVV(q_mask_keep, v_p_row1_hf, v_zero);
+
+              __fp16     *out_dual_tile = p_st_base + (c / 64) * HMX_FP16_TILE_N_ELMS * 2;
+              HVX_Vector *pv_p_out0     = ((HVX_Vector *) out_dual_tile) + r1 / 2;
+              HVX_Vector *pv_p_out1     = pv_p_out0 + 16;
+
+              HVX_VectorPair vp_p_dual_row = Q6_W_vshuff_VVR(v_p_row1_hf, v_p_row0_hf, -2);
+              *pv_p_out0                   = Q6_V_lo_W(vp_p_dual_row);
+              *pv_p_out1                   = Q6_V_hi_W(vp_p_dual_row);
+
+              HVX_VectorPair vp_p_row0 = hvx_my_vhf_to_wqf32(v_p_row0_hf);
+              HVX_VectorPair vp_p_row1 = hvx_my_vhf_to_wqf32(v_p_row1_hf);
+
+              v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(
+                v_p_rowsum0, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp_p_row0), Q6_V_hi_W(vp_p_row0)));
+              v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(
+                v_p_rowsum1, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp_p_row1), Q6_V_hi_W(vp_p_row1)));
+            }
+
+#pragma unroll
+            for (int s = 64; s >= 4; s >>= 1) {
+              v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_V_vlalign_VVR(v_p_rowsum0, v_zero, s));
+              v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_V_vlalign_VVR(v_p_rowsum1, v_zero, s));
+            }
+            HVX_Vector v_p_rowsum_pack2 = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(v_p_rowsum1, v_p_rowsum0));
+
+            HVX_Vector v_p_rowsum_pack2_rot = Q6_V_vror_VR(v_p_rowsum_pack2, VLEN - 2 * sizeof(__fp16));
+            HVX_Vector v_p_rowsum_local_rot = Q6_V_vror_VR(v_p_rowsum_local, r_vec_off * sizeof(__fp16));
+            v_p_rowsum_local =
+              Q6_V_vlalign_VVR(v_p_rowsum_pack2_rot, v_p_rowsum_local_rot, r_vec_off * sizeof(__fp16));
+          }
+
+          mvec_s_rowmax[r_vec_idx] = v_s_rowmax_local;
+          mvec_p_rowsum[r_vec_idx] = v_p_rowsum_local;
+        }
+      }
+
+      // 复用 mvec_s_rowmax 这块 buffer，
+      // 后续存 exp(m_i^{j-1} - m_i^j)
+      HVX_Vector *mvec_exp_m_diff = mvec_s_rowmax;
+
+      // 更新 online softmax 状态：
+      //
+      //   m_i^j = max(m_i^{j-1}, rowmax(S_i^j))
+      //   l_i^j = exp(m_i^{j-1} - m_i^j) * l_i^{j-1} + rowsum(P_i^j)
+      {
+        for (int i = 0; i < n_row_vec_cnt; ++i) {
+          HVX_Vector v_m_prev = mvec_m[i];
+          HVX_Vector v_m_curr = Q6_Vhf_vmax_VhfVhf(v_m_prev, mvec_s_rowmax[i]);
+          HVX_Vector v_m_diff = Q6_Vqf16_vsub_VhfVhf(v_m_prev, v_m_curr);
+
+          HVX_Vector v_exp_m_diff_hf = hvx_my_exp2_vhf_vqf16(v_m_diff);
+
+          HVX_Vector v_l_curr = Q6_Vqf16_vmpy_Vqf16Vhf(mvec_l[i], v_exp_m_diff_hf);
+          v_l_curr            = Q6_Vqf16_vadd_Vqf16Vhf(v_l_curr, mvec_p_rowsum[i]);
+
+          mvec_m[i] = v_m_curr;
+          mvec_l[i] = v_l_curr;
+
+          mvec_exp_m_diff[i] = v_exp_m_diff_hf;
+        }
+      }
+
+      // 更新当前输出：
+      //
+      //   O_i^j = diag(exp(m_i^{j-1} - m_i^j)) O_i^{j-1} + P_i^j V_j
+      {
+        const HVX_Vector     v_offsets       = vmem(d_tile_vscatter_offsets);
+        const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+        for (int i = 0; i < n_row_tiles; ++i) {
+          const HVX_Vector v_content = Q6_V_vror_VR(mvec_exp_m_diff[i / 2], (i % 2) * 64);
+
+          __fp16 *out_base = d_tile + i * (n_tiles_per_blk_r + 1) * HMX_FP16_TILE_N_ELMS;
+          Q6_vscatter_QRMVhV(q_32_elems_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
+        }
+
+        hmx_unit_acquire();
+        {
+          hmx_set_output_scales(hmx_output_scales_id);
+          for (int r = 0; r < n_row_tiles; ++r) {
+            for (int c = 0; c < head_dim / 32; ++c) {
+              __fp16 *d_tile_in = d_tile + (r * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+              __fp16 *o_tile_in = o_tile_prev + (c * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+              hmx_load_tiles_fp16(d_tile_in, o_tile_in, n_row_tiles);
+
+              __fp16 *p_tile_in = p_tile + (r * n_tiles_per_blk_c) * HMX_FP16_TILE_N_ELMS;
+              __fp16 *v_tile_in = packed_v + (c * ceil_div(kv_len, HMX_FP16_TILE_N_COLS) +
+                                                jc / HMX_FP16_TILE_N_COLS) * HMX_FP16_TILE_N_ELMS;
+              for (int k = 0; k < n_col_tiles; ++k) {
+                int    offset  = k * HMX_FP16_TILE_N_ELMS;
+                size_t n_tiles = 1;
+                hmx_load_tiles_fp16(p_tile_in + offset, v_tile_in + offset, n_tiles);
+              }
+
+              __fp16 *o_tile_out = o_tile_curr + (c * n_tiles_per_blk_r + r) * HMX_FP16_TILE_N_ELMS;
+              hmx_consume_accumulator_fp16(o_tile_out);
+            }
+          }
+        }
+        hmx_unit_release();
+
+        swap_ptr(&o_tile_curr, &o_tile_prev);
+      }
+    }
+
+    // 最终归一化：
+    //
+    //   O_i = diag(l_i^{-1}) O_i
+    {
+      const HVX_Vector     v_offsets       = vmem(d_tile_vscatter_offsets);
+      const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+
+      HVX_Vector v_content;
+      for (int i = 0; i < n_row_tiles; ++i) {
+        if ((i % 2) == 0) {
+          v_content = hvx_my_inv_vhf(Q6_Vhf_equals_Vqf16(mvec_l[i / 2]));
+        } else {
+          v_content = Q6_V_vror_VR(v_content, 64);
+        }
+
+        __fp16 *out_base = d_tile + i * (n_tiles_per_blk_r + 1) * HMX_FP16_TILE_N_ELMS;
+        Q6_vscatter_QRMVhV(q_32_elems_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
+      }
+
+      hmx_unit_acquire();
+      {
+        hmx_set_output_scales(hmx_output_scales_id);
+        for (int r = 0; r < n_row_tiles; ++r) {
+          for (int c = 0; c < head_dim / 32; ++c) {
+            __fp16 *d_tile_in = d_tile + (r * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+            __fp16 *o_tile_in = o_tile_prev + (c * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+            __fp16 *o_tile_out = o_tile_curr + (r * head_dim / 32 + c) * HMX_FP16_TILE_N_ELMS;
+
+            hmx_dot_fp16(o_tile_out, d_tile_in, o_tile_in, n_row_tiles);
+          }
+        }
+      }
+      hmx_unit_release();
+    }
+
+    // 将当前 Q block 对应的结果从 VTCM 写回外部 O
+    {
+      const size_t o_st_blk_sz_bytes = o_st_blk_sz * qo_element_size;
+      const size_t o_st_stride_bytes = o_st_stride * qo_element_size;
+
+      uint8_t *o_st_base = ((uint8_t *) O) + ir * o_st_stride_bytes + kv_head_idx * o_st_blk_sz_bytes;
+
+      for (int r = 0; r < n_rows_g; r += 2) {
+        const bool next_row_valid = (r + 1) < n_rows_g;
+
+        int o_idx0 = (r + 0) / G;
+        int h_idx0 = (r + 0) % G;
+        int o_idx1 = (r + 1) / G;
+        int h_idx1 = (r + 1) % G;
+
+        uint8_t *row_out0 = o_st_base + o_idx0 * o_st_stride_bytes + h_idx0 * o_head_dim * qo_element_size;
+        uint8_t *row_out1 = o_st_base + o_idx1 * o_st_stride_bytes + h_idx1 * o_head_dim * qo_element_size;
+
+        HVX_Vector *pv_out0 = (HVX_Vector *) row_out0;
+        HVX_Vector *pv_out1 = (HVX_Vector *) row_out1;
+
+        int r0 = r / HMX_FP16_TILE_N_ROWS;
+        int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+        const __fp16 *in_base = o_tile_curr + r0 * HMX_FP16_TILE_N_ROWS * head_dim;  // [32, D] row chunk
+
+        // clang-format off
+        if (qo_fp32_element) {
+          #pragma unroll
+          for (int d = 0; d < D / 32; ++d) {
+            const HVX_Vector *in_tile = (const HVX_Vector *) (in_base + d * HMX_FP16_TILE_N_ELMS);
+
+            const HVX_VectorPair vp = hvx_my_vhf_to_wsf(in_tile[r1 / 2]);
+            const HVX_Vector v_out0 = Q6_V_lo_W(vp);
+            const HVX_Vector v_out1 = Q6_V_hi_W(vp);
+
+            if (with_lse) {
+              vstu_variable(row_out0 + d * 32 * sizeof(float), sizeof(v_out0), v_out0);
+              if (next_row_valid) {
+                vstu_variable(row_out1 + d * 32 * sizeof(float), sizeof(v_out1), v_out1);
+              }
+            } else {
+              *pv_out0++ = v_out0;
+              if (next_row_valid) {
+                *pv_out1++ = v_out1;
+              }
+            }
+          }
+
+          if (with_lse) {
+            const float lse0 = flash_attn_lse_from_f16_state(mvec_m, mvec_l, r + 0);
+            memcpy(row_out0 + D * sizeof(float), &lse0, sizeof(lse0));
+            if (next_row_valid) {
+              const float lse1 = flash_attn_lse_from_f16_state(mvec_m, mvec_l, r + 1);
+              memcpy(row_out1 + D * sizeof(float), &lse1, sizeof(lse1));
+            }
+          }
+        } else {
+          assert(!with_lse);
+          #pragma unroll
+          for (int d = 0; d < D / 64; ++d) {
+            const __fp16     *in_dual_tile = in_base + d * HMX_FP16_TILE_N_ELMS * 2;
+            const HVX_Vector *pv_in0       = ((const HVX_Vector *) in_dual_tile) + r1 / 2;
+            const HVX_Vector *pv_in1       = pv_in0 + 16;
+
+            const HVX_VectorPair vp = Q6_W_vdeal_VVR(*pv_in1, *pv_in0, -2);
+
+            *pv_out0++ = Q6_V_lo_W(vp);
+            if (next_row_valid) {
+              *pv_out1++ = Q6_V_hi_W(vp);
+            }
+          }
+        }
+        // clang-format on
+      }
+    }
+  }
+  return 0;
 }
 
 static void block_sparse_flash_attn_worker(void *data, int worker_index) {
   block_sparse_fa_task_state_t *s = (block_sparse_fa_task_state_t *) data;
 
-  uint8_t *vtcm       = s->vtcm_base + worker_index * s->vtcm_size_per_thread;
+  if (worker_index < 0 || (unsigned int) worker_index >= s->vtcm_slice_count ||
+      (size_t) worker_index > SIZE_MAX / s->vtcm_size_per_thread) {
+    worker_pool_atomic_inc_return(&(s->error_count));
+    worker_pool_synctoken_jobdone(&(s->sync_ctx));
+    return;
+  }
+
+  const size_t vtcm_offset = (size_t) worker_index * s->vtcm_size_per_thread;
+  if (vtcm_offset > s->acquired_vtcm_size || s->vtcm_size_per_thread > s->acquired_vtcm_size - vtcm_offset) {
+    worker_pool_atomic_inc_return(&(s->error_count));
+    worker_pool_synctoken_jobdone(&(s->sync_ctx));
+    return;
+  }
+
+  uint8_t *vtcm       = s->vtcm_base + vtcm_offset;
   uint8_t *vtcm_limit = vtcm + s->vtcm_size_per_thread;
 
   hmx_manager_enable_execution();
@@ -2308,10 +3891,48 @@ static void block_sparse_flash_attn_worker(void *data, int worker_index) {
     }
 
     int kv_head_idx = task_id;
-    block_sparse_flash_attn_f16_core(kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->block_mask, s->qo_len,
-                                     s->kv_len, s->n_heads, s->n_kv_heads, s->head_dim, s->block_q, s->block_k,
-                                     s->n_q_blocks, s->n_k_blocks, s->mask_format, s->max_kept_blocks, s->with_lse,
-                                     worker_index);
+    block_sparse_fa_plan_t plan;
+    const int G = s->n_heads / s->n_kv_heads;
+    const bool fast_path = s->mask_format == 1 && s->max_kept_blocks > 0 && G == 1 &&
+                           s->block_q == HMX_FP16_TILE_N_ROWS && s->block_k == HMX_FP16_TILE_N_COLS;
+    const bool use_full_kv =
+      fast_path && block_sparse_fa_find_mode_plan(&plan, BLOCK_SPARSE_FA_FULL_KV, G, s->head_dim, s->kv_len,
+                                                  s->vtcm_size_per_thread);
+    const bool use_full_k =
+      !use_full_kv && fast_path && block_sparse_fa_find_mode_plan(&plan, BLOCK_SPARSE_FA_FULL_K, G, s->head_dim,
+                                                                  s->kv_len, s->vtcm_size_per_thread);
+    if (!use_full_kv && !use_full_k &&
+        !block_sparse_fa_find_mode_plan(&plan, BLOCK_SPARSE_FA_CHUNKED, G, s->head_dim, s->kv_len,
+                                        s->vtcm_size_per_thread)) {
+      worker_pool_atomic_inc_return(&(s->error_count));
+      continue;
+    }
+    const char *mode_name = use_full_kv ? "FULL_KV" : (use_full_k ? "FULL_K" : "CHUNKED");
+    if (kv_head_idx == 0) {
+      FARF(ALWAYS, "block_sparse_fa worker=%d kv_head=%d mode=%s Br=32 Bc=%u required=%u available=%u",
+           worker_index, kv_head_idx, mode_name, (unsigned int) plan.blk_sz_c,
+           (unsigned int) plan.required_bytes, (unsigned int) s->vtcm_size_per_thread);
+    }
+    int result;
+    if (use_full_kv) {
+      result = block_sparse_flash_attn_f16_core_full_kv(
+        kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->block_mask, s->qo_len, s->kv_len, s->n_heads,
+        s->n_kv_heads, s->head_dim, s->block_q, s->block_k, s->n_q_blocks, s->n_k_blocks, s->mask_format,
+        s->max_kept_blocks, s->with_lse, worker_index);
+    } else if (use_full_k) {
+      result = block_sparse_flash_attn_f16_core_full_k(
+        kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->block_mask, s->qo_len, s->kv_len, s->n_heads,
+        s->n_kv_heads, s->head_dim, s->block_q, s->block_k, s->n_q_blocks, s->n_k_blocks, s->mask_format,
+        s->max_kept_blocks, s->with_lse, worker_index);
+    } else {
+      result = block_sparse_flash_attn_f16_core_chunked(
+        kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->block_mask, s->qo_len, s->kv_len, s->n_heads,
+        s->n_kv_heads, s->head_dim, s->block_q, s->block_k, s->n_q_blocks, s->n_k_blocks, s->mask_format,
+        s->max_kept_blocks, s->with_lse, worker_index);
+    }
+    if (result != 0) {
+      worker_pool_atomic_inc_return(&(s->error_count));
+    }
   }
 
   hmx_manager_disable_execution();
@@ -2348,9 +3969,22 @@ int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const 
     return -1;
   }
 
-  const int    n_workers            = num_hvx128_contexts;
-  const size_t vtcm_size_per_thread = 1024 * 1024;
-  assert(n_workers * vtcm_size_per_thread <= 6 * 1024 * 1024);
+  const int n_jobs = num_hvx128_contexts;
+  const unsigned int vtcm_slice_count = num_workers;
+  uint8_t *const vtcm_base = (uint8_t *) vtcm_manager_get_vtcm_base();
+  const size_t acquired_vtcm_size = vtcm_manager_get_vtcm_size();
+  if (!vtcm_base || acquired_vtcm_size == 0 || n_jobs <= 0 || vtcm_slice_count == 0) {
+    FARF(ERROR, "%s: invalid worker counts: jobs=%d pool_workers=%u", __func__, n_jobs, vtcm_slice_count);
+    return -1;
+  }
+
+  const size_t vtcm_size_per_thread = acquired_vtcm_size / vtcm_slice_count / (64 * 1024) * (64 * 1024);
+  if (vtcm_size_per_thread == 0 || (size_t) vtcm_slice_count > SIZE_MAX / vtcm_size_per_thread ||
+      (size_t) vtcm_slice_count * vtcm_size_per_thread > acquired_vtcm_size) {
+    FARF(ERROR, "%s: invalid VTCM slice: acquired=%u slice=%u pool_workers=%u", __func__,
+         (unsigned int) acquired_vtcm_size, (unsigned int) vtcm_size_per_thread, vtcm_slice_count);
+    return -1;
+  }
 
   block_sparse_fa_task_state_t state;
   state.O          = O;
@@ -2372,9 +4006,12 @@ int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const 
   state.with_lse = with_lse;
 
   state.task_id              = 0;
+  state.error_count          = 0;
   state.n_tasks              = n_kv_heads;
-  state.vtcm_base            = (uint8_t *) vtcm_manager_get_vtcm_base();
+  state.vtcm_base            = vtcm_base;
+  state.acquired_vtcm_size   = acquired_vtcm_size;
   state.vtcm_size_per_thread = vtcm_size_per_thread;
+  state.vtcm_slice_count     = vtcm_slice_count;
 
   worker_pool_job_t job;
   job.fptr = block_sparse_flash_attn_worker;
@@ -2382,11 +4019,21 @@ int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const 
 
   int64_t t0 = HAP_perf_get_time_us();
 
-  worker_pool_synctoken_init(&(state.sync_ctx), n_workers);
-  for (int i = 0; i < n_workers; ++i) {
-    worker_pool_submit(NULL, job);
+  worker_pool_synctoken_init(&(state.sync_ctx), n_jobs);
+  for (int i = 0; i < n_jobs; ++i) {
+    const AEEResult submit_result = worker_pool_submit(NULL, job);
+    if (submit_result != AEE_SUCCESS) {
+      FARF(ERROR, "%s: worker submit failed: job=%d result=0x%x", __func__, i, submit_result);
+      worker_pool_atomic_inc_return(&(state.error_count));
+      worker_pool_synctoken_jobdone(&(state.sync_ctx));
+    }
   }
   worker_pool_synctoken_wait(&(state.sync_ctx));
+
+  if (state.error_count != 0) {
+    FARF(ERROR, "%s: worker errors=%u", __func__, state.error_count);
+    return -1;
+  }
 
   int64_t elapsed_us = HAP_perf_get_time_us() - t0;
   FARF(ALWAYS,

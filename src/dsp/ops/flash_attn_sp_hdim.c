@@ -86,8 +86,7 @@ static void simple_flash_attn_sp_hdim_f16_core(int kv_head_idx, uint8_t *vtcm, u
   const bool   has_qk_mask = (qk_mask != NULL);
   const size_t kv_pad_len  = align_up(kv_len, 64);
 
-  const bool enable_vgather_exp = true;   // use table lookup (vgather) to compute exp, experimental
-  const bool use_fp32_exp       = false;  // compute FP32 exp
+  const bool use_fp32_exp = false;  // compute FP32 exp
 
   // determine block sizes
   size_t blk_sz_r, blk_sz_c;  // Br, Bc
@@ -160,12 +159,6 @@ static void simple_flash_attn_sp_hdim_f16_core(int kv_head_idx, uint8_t *vtcm, u
     // offsets within the first tile
     d_tile_vscatter_offsets[i * 2 + 0] = i * 136;
     d_tile_vscatter_offsets[i * 2 + 1] = i * 136 + 6;
-  }
-
-  // alternative computation method
-  void *vtcm_exp2_table = vtcm_manager_query_area("safe_softmax::exp2_hf_qf16");
-  if (!enable_vgather_exp) {
-    (void) vtcm_exp2_table;
   }
 
   // profile timers
@@ -440,44 +433,26 @@ static void simple_flash_attn_sp_hdim_f16_core(int kv_head_idx, uint8_t *vtcm, u
             HVX_Vector       v_p_rowsum0 = v_zero;  // qfloat
             HVX_Vector       v_p_rowsum1 = v_zero;  // qfloat
 
-            if (enable_vgather_exp) {
-              for (int c = 0; c < n_cols; c += 64) {
-                HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);
-                HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);
-
-                HVX_Vector v_gather_input0 = Q6_Vh_vasl_VhR(v_s_minus_m0, 1);
-                HVX_Vector v_gather_input1 = Q6_Vh_vasl_VhR(v_s_minus_m1, 1);
-
-                Q6_vgather_ARMVh(&row_buffer0[c / 64], (size_t) vtcm_exp2_table, 65535, v_gather_input0);
-                Q6_vgather_ARMVh(&row_buffer1[c / 64], (size_t) vtcm_exp2_table, 65535, v_gather_input1);
-              }
-            }
-
             for (int c = 0; c < n_cols; c += 64) {
               HVX_Vector v_p_row0_hf, v_p_row1_hf;
 
-              if (enable_vgather_exp) {
-                v_p_row0_hf = row_buffer0[c / 64];
-                v_p_row1_hf = row_buffer1[c / 64];
+              HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);  // qf16
+              HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);  // qf16
+
+              if (use_fp32_exp) {
+                HVX_VectorPair vp_s_minus_m0_sf = hvx_my_vqf16_to_wsf(v_s_minus_m0);
+                HVX_VectorPair vp_s_minus_m1_sf = hvx_my_vqf16_to_wsf(v_s_minus_m1);
+
+                HVX_Vector v_p_row00_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m0_sf));
+                HVX_Vector v_p_row01_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m0_sf));
+                HVX_Vector v_p_row10_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m1_sf));
+                HVX_Vector v_p_row11_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m1_sf));
+
+                v_p_row0_hf = hvx_my_wsf_to_vhf(v_p_row01_sf, v_p_row00_sf);
+                v_p_row1_hf = hvx_my_wsf_to_vhf(v_p_row11_sf, v_p_row10_sf);
               } else {
-                HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);  // qf16
-                HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);  // qf16
-
-                if (use_fp32_exp) {
-                  HVX_VectorPair vp_s_minus_m0_sf = hvx_my_vqf16_to_wsf(v_s_minus_m0);
-                  HVX_VectorPair vp_s_minus_m1_sf = hvx_my_vqf16_to_wsf(v_s_minus_m1);
-
-                  HVX_Vector v_p_row00_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m0_sf));
-                  HVX_Vector v_p_row01_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m0_sf));
-                  HVX_Vector v_p_row10_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m1_sf));
-                  HVX_Vector v_p_row11_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m1_sf));
-
-                  v_p_row0_hf = hvx_my_wsf_to_vhf(v_p_row01_sf, v_p_row00_sf);
-                  v_p_row1_hf = hvx_my_wsf_to_vhf(v_p_row11_sf, v_p_row10_sf);
-                } else {
-                  v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
-                  v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
-                }
+                v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
+                v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
               }
 
               // compute P tile output positions
@@ -787,9 +762,22 @@ int simple_flash_attn_sp_hdim(__fp16 *restrict O, const __fp16 *restrict Q, cons
     return -1;
   }
 
-  const int    n_workers            = num_hvx128_contexts;
   const size_t vtcm_size_per_thread = 1024 * 1024;
-  assert(n_workers * vtcm_size_per_thread <= 6 * 1024 * 1024);  // don't use too much VTCM
+  const int    n_jobs               = num_hvx128_contexts;
+  const unsigned int vtcm_slice_count = num_workers;
+  if (n_jobs <= 0 || vtcm_slice_count == 0 || (size_t) vtcm_slice_count > SIZE_MAX / vtcm_size_per_thread) {
+    FARF(ERROR, "%s: invalid worker counts: jobs=%d pool_workers=%u", __func__, n_jobs, vtcm_slice_count);
+    return -1;
+  }
+
+  const size_t required_vtcm_size = (size_t) vtcm_slice_count * vtcm_size_per_thread;
+  uint8_t *const vtcm_base        = (uint8_t *) vtcm_manager_get_vtcm_base();
+  const size_t acquired_vtcm_size = vtcm_manager_get_vtcm_size();
+  if (!vtcm_base || acquired_vtcm_size < required_vtcm_size) {
+    FARF(ERROR, "%s: insufficient VTCM: acquired=%u required=%u pool_workers=%u", __func__,
+         (unsigned int) acquired_vtcm_size, (unsigned int) required_vtcm_size, vtcm_slice_count);
+    return -1;
+  }
 
   simple_fa_task_state_t state;
   state.O          = O;
@@ -805,11 +793,11 @@ int simple_flash_attn_sp_hdim(__fp16 *restrict O, const __fp16 *restrict Q, cons
 
   // TODO(hzx): parallelize along query_len x n_kv_heads dimension
   // size_t n_tot_chunks      = qo_len * n_kv_heads;
-  // size_t n_chunks_per_task = ceil_div(n_tot_chunks, n_workers);
+  // size_t n_chunks_per_task = ceil_div(n_tot_chunks, n_jobs);
 
   state.task_id              = 0;
   state.n_tasks              = n_kv_heads;
-  state.vtcm_base            = (uint8_t *) vtcm_manager_get_vtcm_base();
+  state.vtcm_base            = vtcm_base;
   state.vtcm_size_per_thread = vtcm_size_per_thread;
 
   worker_pool_job_t job;
@@ -818,8 +806,8 @@ int simple_flash_attn_sp_hdim(__fp16 *restrict O, const __fp16 *restrict Q, cons
 
   int64_t t0 = HAP_perf_get_time_us();
 
-  worker_pool_synctoken_init(&(state.sync_ctx), n_workers);
-  for (int i = 0; i < n_workers; ++i) {
+  worker_pool_synctoken_init(&(state.sync_ctx), n_jobs);
+  for (int i = 0; i < n_jobs; ++i) {
     worker_pool_submit(NULL, job);  // use default worker pool
   }
   worker_pool_synctoken_wait(&(state.sync_ctx));

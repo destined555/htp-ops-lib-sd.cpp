@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 
 #include "dsp/hmx_mgr.h"
 #include "dsp/hvx_math.h"
@@ -46,6 +47,65 @@ int compare_result(const float *x, const float *y, int n_elems) {
 }  // namespace op_utils
 
 namespace internal {
+
+#define OP_TEST_ASSERT(condition)                                                                                     \
+  do {                                                                                                                \
+    if (!(condition)) {                                                                                               \
+      FARF(ALWAYS, "%s:%d: check failed: %s", __FILE__, __LINE__, #condition);                                       \
+      abort();                                                                                                        \
+    }                                                                                                                 \
+  } while (0)
+
+void test_block_sparse_fa_select_plan() {
+  constexpr size_t available = 1376256;
+  block_sparse_fa_plan_t plan = {};
+
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, true, 1, 64, 410, available) == 0);
+  OP_TEST_ASSERT(plan.mode == BLOCK_SPARSE_FA_FULL_KV);
+  OP_TEST_ASSERT(plan.blk_sz_c == 448);
+  OP_TEST_ASSERT(plan.required_bytes == 183808);
+
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, true, 1, 64, 4250, available) == 0);
+  OP_TEST_ASSERT(plan.mode == BLOCK_SPARSE_FA_FULL_KV);
+  OP_TEST_ASSERT(plan.blk_sz_c == 1984);
+  OP_TEST_ASSERT(plan.required_bytes == 1369600);
+
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, true, 1, 128, 4250, available) == 0);
+  OP_TEST_ASSERT(plan.mode == BLOCK_SPARSE_FA_FULL_K);
+  OP_TEST_ASSERT(plan.blk_sz_c == 640);
+  OP_TEST_ASSERT(plan.required_bytes == 1368064);
+
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, true, 1, 128, 5281, available) == 0);
+  OP_TEST_ASSERT(plan.mode == BLOCK_SPARSE_FA_CHUNKED);
+  OP_TEST_ASSERT(plan.blk_sz_c == 2048);
+  OP_TEST_ASSERT(plan.required_bytes == 1349120);
+
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, false, 1, 64, 410, available) == 0);
+  OP_TEST_ASSERT(plan.mode == BLOCK_SPARSE_FA_CHUNKED);
+
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(nullptr, true, 1, 64, 410, available) == -1);
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, true, 0, 64, 410, available) == -1);
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, true, 1, 0, 410, available) == -1);
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, true, 1, 48, 410, available) == -1);
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, true, 1, 64, 0, available) == -1);
+
+  constexpr size_t min_chunked = 43008;
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, false, 1, 64, 410, min_chunked - 1) == -1);
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, false, 1, 64, 410, min_chunked) == 0);
+  OP_TEST_ASSERT(plan.mode == BLOCK_SPARSE_FA_CHUNKED);
+  OP_TEST_ASSERT(plan.blk_sz_c == 64);
+  OP_TEST_ASSERT(plan.required_bytes == min_chunked);
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, false, 1, 64, 410, min_chunked + 1) == 0);
+  OP_TEST_ASSERT(plan.blk_sz_c == 64);
+  OP_TEST_ASSERT(plan.required_bytes == min_chunked);
+
+  OP_TEST_ASSERT(block_sparse_fa_select_plan(&plan, true, 1, 2147483616, std::numeric_limits<int>::max(),
+                                             std::numeric_limits<size_t>::max()) == -1);
+
+  FARF(ALWAYS, "block_sparse_fa_select_plan: PASS");
+}
+
+#undef OP_TEST_ASSERT
 
 void test_int16_fp16_conversion() {
 #if __HVX_ARCH__ < 73
@@ -282,6 +342,8 @@ void internal_op_tests();
 
 void internal_op_tests() {
   using namespace internal;
+
+  test_block_sparse_fa_select_plan();
 
   // test_int16_fp16_conversion();
   // test_fp16_exp2();

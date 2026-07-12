@@ -4,102 +4,111 @@
 #include <HAP_farf.h>
 
 #include <cstring>
-#include <string>
-#include <unordered_map>
 
 namespace vtcm_manager {
 
-uint8_t *vtcm_base           = nullptr;
-uint8_t *vtcm_reserved_start = nullptr;
-
-int vtcm_mgr_ctx_id = 0;
-
-std::unordered_map<std::string, uint8_t *> reserved_areas;
+uint8_t *vtcm_base      = nullptr;
+size_t   vtcm_size      = 0;
+int      vtcm_mgr_ctx_id = 0;
 
 }  // namespace vtcm_manager
 
 extern "C" {
 
-void vtcm_manager_setup() {
+int vtcm_manager_setup() {
   using namespace vtcm_manager;
 
   int err;
 
+  if (vtcm_mgr_ctx_id && vtcm_base && vtcm_size > 0) {
+    return 0;
+  }
+
+  if (vtcm_mgr_ctx_id) {
+    err = HAP_compute_res_release(vtcm_mgr_ctx_id);
+    if (err) {
+      FARF(ERROR, "%s: failed to release existing context %d, return code 0x%x", __func__, vtcm_mgr_ctx_id, err);
+      return -1;
+    }
+    vtcm_mgr_ctx_id = 0;
+  }
+  vtcm_base = nullptr;
+  vtcm_size = 0;
+
   unsigned int            avail_size, total_size;
   compute_res_vtcm_page_t avail_pages, total_pages;
+
   err = HAP_compute_res_query_VTCM(0, &total_size, &total_pages, &avail_size, &avail_pages);
   if (err) {
-    FARF(ALWAYS, "HAP_compute_res_query_VTCM failed with return code 0x%x", err);
-    return;
+    FARF(ERROR, "%s: HAP_compute_res_query_VTCM failed with return code 0x%x", __func__, err);
+    return -1;
   }
-  FARF(ALWAYS, "available VTCM size: %d KiB, total VTCM size: %d KiB", avail_size / 1024, total_size / 1024);
+  if (avail_size == 0) {
+    FARF(ERROR, "%s: no VTCM is currently available", __func__);
+    return -1;
+  }
+  FARF(ALWAYS, "available VTCM size: %u KiB, total VTCM size: %u KiB", avail_size / 1024, total_size / 1024);
 
   compute_res_attr_t req;
-  HAP_compute_res_attr_init(&req);
-
-  // NOTE(hzx): here we try to request all VTCM memory in one page
-  HAP_compute_res_attr_set_vtcm_param(&req, total_size, 1);
-
-  vtcm_mgr_ctx_id = HAP_compute_res_acquire(&req, 10000);  // timeout 10ms
-  if (vtcm_mgr_ctx_id == 0) {
-    FARF(ALWAYS, "%s: HAP_compute_res_acquire failed", __func__);
-    return;
+  err = HAP_compute_res_attr_init(&req);
+  if (err) {
+    FARF(ERROR, "%s: HAP_compute_res_attr_init failed with return code 0x%x", __func__, err);
+    return -1;
   }
 
-  vtcm_base = (uint8_t *) HAP_compute_res_attr_get_vtcm_ptr(&req);
-  memset(vtcm_base, 0, total_size);
+  err = HAP_compute_res_attr_set_vtcm_param(&req, avail_size, 1);
+  if (err) {
+    FARF(ERROR, "%s: failed to request %u VTCM bytes in one page, return code 0x%x", __func__, avail_size, err);
+    return -1;
+  }
+  FARF(ALWAYS, "%s: requesting %u VTCM bytes in one page", __func__, avail_size);
 
-  vtcm_reserved_start = vtcm_base + total_size;
+  const int new_ctx_id = HAP_compute_res_acquire(&req, 10000);  // timeout 10ms
+  if (new_ctx_id == 0) {
+    FARF(ERROR, "%s: HAP_compute_res_acquire failed for %u VTCM bytes", __func__, avail_size);
+    return -1;
+  }
+
+  uint8_t *const acquired_base = (uint8_t *) HAP_compute_res_attr_get_vtcm_ptr(&req);
+  if (!acquired_base) {
+    FARF(ERROR, "%s: acquired context %d but VTCM pointer is null", __func__, new_ctx_id);
+    err = HAP_compute_res_release(new_ctx_id);
+    if (err) {
+      FARF(ERROR, "%s: failed to release context %d, return code 0x%x", __func__, new_ctx_id, err);
+      vtcm_mgr_ctx_id = new_ctx_id;
+    }
+    return -1;
+  }
+
+  vtcm_mgr_ctx_id = new_ctx_id;
+  vtcm_base       = acquired_base;
+  vtcm_size       = avail_size;
+  memset(vtcm_base, 0, vtcm_size);
+  FARF(ALWAYS, "%s: acquired %u VTCM bytes", __func__, (unsigned int) vtcm_size);
+  return 0;
 }
 
-void vtcm_manager_reset() {
+int vtcm_manager_reset() {
   using namespace vtcm_manager;
 
   if (vtcm_mgr_ctx_id) {
-    HAP_compute_res_release(vtcm_mgr_ctx_id);
+    const int err = HAP_compute_res_release(vtcm_mgr_ctx_id);
+    if (err) {
+      FARF(ERROR, "%s: failed to release context %d, return code 0x%x", __func__, vtcm_mgr_ctx_id, err);
+      return -1;
+    }
   }
+  vtcm_mgr_ctx_id = 0;
+  vtcm_base       = nullptr;
+  vtcm_size       = 0;
+  return 0;
 }
 
 void *vtcm_manager_get_vtcm_base() {
   return vtcm_manager::vtcm_base;
 }
 
-void *vtcm_manager_reserve_area(const char *name, size_t size, size_t alignment) {
-  using namespace vtcm_manager;
-
-  if (!name || (alignment & (alignment - 1)) != 0) {
-    return nullptr;
-  }
-
-  std::string ident = name;
-  auto        it    = reserved_areas.find(ident);
-  if (it != reserved_areas.end()) {
-    return it->second;
-  }
-
-  uintptr_t start_val = reinterpret_cast<uintptr_t>(vtcm_reserved_start - size) & ~(alignment - 1);
-  uint8_t  *new_start = reinterpret_cast<uint8_t *>(start_val);
-  if (new_start <= vtcm_base) {
-    return nullptr;  // no enough space left
-  }
-
-  vtcm_reserved_start   = new_start;
-  reserved_areas[ident] = new_start;
-  return new_start;
-}
-
-void *vtcm_manager_query_area(const char *name) {
-  using namespace vtcm_manager;
-
-  if (!name) {
-    return nullptr;
-  }
-
-  std::string ident = name;
-  auto        it    = reserved_areas.find(ident);
-  if (it == reserved_areas.end()) {
-    return nullptr;
-  }
-  return it->second;
+size_t vtcm_manager_get_vtcm_size() {
+  return vtcm_manager::vtcm_size;
 }
 }
