@@ -200,6 +200,7 @@ int execute_op_simple(struct OpComputeRequest *req) {
             simple_flash_attn((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
                               (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim, with_lse);
           const int64_t elapsed_us = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+          params->elapsed_us = (int32_t) elapsed_us;
           FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=simple elapsed_us=%lld", elapsed_us);
           validate_out_bufs();
         }
@@ -238,6 +239,7 @@ int execute_op_simple(struct OpComputeRequest *req) {
                                       n_kv_heads, head_dim, params->block_q, params->block_k, params->n_q_blocks,
                                       params->n_k_blocks, mask_format, max_kept_blocks, with_lse);
         const int64_t elapsed_us = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+        params->elapsed_us = (int32_t) elapsed_us;
         FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=block_sparse elapsed_us=%lld", elapsed_us);
         validate_out_bufs();
       }
