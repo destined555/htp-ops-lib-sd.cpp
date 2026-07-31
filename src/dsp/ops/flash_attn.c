@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -20,6 +21,8 @@
 // for debug
 #include <HAP_farf.h>
 #include <HAP_perf.h>
+#include <qurt_memory.h>
+#include <qurt/qurt_timer.h>
 
 #define MAX_G_BR        256
 #define __vec_aligned__ __attribute__((aligned(VLEN)))
@@ -44,6 +47,7 @@ typedef struct {
   worker_synctoken_t sync_ctx;
   unsigned int       task_id;
   unsigned int       error_count;
+  unsigned int       halo_fallback_count;
   int                n_tasks;
   uint8_t           *vtcm_base;
   size_t             acquired_vtcm_size;
@@ -55,6 +59,15 @@ typedef struct {
   int                qo_len, kv_len, n_heads, n_kv_heads, head_dim;
   int                block_q, block_k, n_q_blocks, n_k_blocks;
   int                mask_format, max_kept_blocks;
+  int                sparse_policy, image_tokens, text_tokens;
+  int                image_block_rows, image_block_cols, halo_kv_load_mode;
+  bool               halo_trace;
+  bool               halo_l2_enabled;
+  bool               halo_userdma_enabled;
+  bool               halo_force_chunked;
+  int                userdma_scope;
+  block_sparse_halo_run_trace_t *halo_run_trace;
+  block_sparse_halo_plan_t halo_plan;
   bool               with_lse;
 } block_sparse_fa_task_state_t;
 
@@ -84,7 +97,8 @@ static inline void hvx_fill_uw(void *p, uint32_t v, size_t size) {
   }
 }
 
-static inline float flash_attn_lse_from_f16_state(const HVX_Vector *mvec_m, const HVX_Vector *mvec_l, int row) {
+static inline float flash_attn_lse_from_f16_state_scaled(
+  const HVX_Vector *mvec_m, const HVX_Vector *mvec_l, int row, float m_scale) {
   enum { N = VLEN / sizeof(__fp16) };
   _Alignas(VLEN) __fp16 m_local[N];
   _Alignas(VLEN) __fp16 l_local[N];
@@ -96,7 +110,11 @@ static inline float flash_attn_lse_from_f16_state(const HVX_Vector *mvec_m, cons
 
   const float m = (float) m_local[vec_off];
   const float l = (float) l_local[vec_off];
-  return l > 0.0f ? m * FA_LN2 + logf(l) : -INFINITY;
+  return l > 0.0f ? m * m_scale + logf(l) : -INFINITY;
+}
+
+static inline float flash_attn_lse_from_f16_state(const HVX_Vector *mvec_m, const HVX_Vector *mvec_l, int row) {
+  return flash_attn_lse_from_f16_state_scaled(mvec_m, mvec_l, row, FA_LN2);
 }
 
 static inline float flash_attn_lse_from_f32_state(const HVX_Vector *mvec_m, const HVX_Vector *mvec_l, int row) {
@@ -136,6 +154,17 @@ static bool checked_size_mul(size_t a, size_t b, size_t *result) {
   }
   *result = a * b;
   return true;
+}
+
+static bool block_sparse_halo_mask_span_fits(int n_heads, int q_blocks_per_head,
+                                             int max_kept_blocks) {
+  size_t total_q_blocks;
+  size_t mask_elements;
+  size_t mask_bytes;
+  return n_heads > 0 && q_blocks_per_head > 0 && max_kept_blocks > 0 &&
+    checked_size_mul((size_t) n_heads, (size_t) q_blocks_per_head, &total_q_blocks) &&
+    checked_size_mul(total_q_blocks, (size_t) max_kept_blocks, &mask_elements) &&
+    checked_size_mul(mask_elements, sizeof(int32_t), &mask_bytes);
 }
 
 static bool checked_size_align_up(size_t value, size_t alignment, size_t *result) {
@@ -264,6 +293,1720 @@ int block_sparse_fa_select_plan(block_sparse_fa_plan_t *plan, bool fast_path, in
     return 0;
   }
   return -1;
+}
+
+int block_sparse_fa_select_halo_fallback_plan(block_sparse_fa_plan_t *plan, bool fast_path, int gqa_factor,
+                                              int head_dim, int kv_len, size_t available_bytes) {
+  return block_sparse_fa_select_plan(
+    plan, fast_path, gqa_factor, head_dim, kv_len, available_bytes);
+}
+
+int block_sparse_halo_parse_row(block_sparse_halo_row_t *parsed, const int32_t *row, int max_kept_blocks,
+                                int q_block, int q_blocks_per_head, int k_blocks_per_head, int image_blocks) {
+  if (parsed == NULL || row == NULL || max_kept_blocks <= 0 || q_block < 0 || q_blocks_per_head <= 0 ||
+      k_blocks_per_head <= 0 || image_blocks <= 0 || image_blocks > k_blocks_per_head ||
+      max_kept_blocks < k_blocks_per_head) {
+    return -1;
+  }
+
+  block_sparse_halo_row_t result = {0};
+  const int kv_head = q_block / q_blocks_per_head;
+  if (kv_head > INT_MAX / k_blocks_per_head) {
+    return -1;
+  }
+  const int q_block_in_head = q_block % q_blocks_per_head;
+  const int first_k_block = kv_head * k_blocks_per_head;
+  const bool is_text_query = q_block_in_head >= image_blocks;
+  result.is_text_query = is_text_query;
+
+  int entry_count = 0;
+  while (entry_count < max_kept_blocks && row[entry_count] != -1) {
+    const int32_t block = row[entry_count];
+    if (block < first_k_block || block >= first_k_block + k_blocks_per_head ||
+        (entry_count > 0 && block <= row[entry_count - 1])) {
+      return -1;
+    }
+    ++entry_count;
+  }
+  int i = entry_count;
+  for (; i <= max_kept_blocks - 8; i += 8) {
+    const int32_t all_minus_one = row[i + 0] & row[i + 1] & row[i + 2] & row[i + 3] &
+                                  row[i + 4] & row[i + 5] & row[i + 6] & row[i + 7];
+    if (all_minus_one != -1) {
+      return -1;
+    }
+  }
+  for (; i < max_kept_blocks; ++i) {
+    if (row[i] != -1) {
+      return -1;
+    }
+  }
+
+  if (is_text_query) {
+    if (entry_count != k_blocks_per_head) {
+      return -1;
+    }
+    for (int i = 0; i < entry_count; ++i) {
+      if (row[i] != first_k_block + i) {
+        return -1;
+      }
+    }
+  } else {
+    int image_count = 0;
+    while (image_count < entry_count && row[image_count] < first_k_block + image_blocks) {
+      if (image_count >= BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS) {
+        return -1;
+      }
+      result.image_blocks[image_count] = row[image_count];
+      ++image_count;
+    }
+    if (image_count != 4 && image_count != 6 && image_count != 9) {
+      return -1;
+    }
+    const int text_blocks = k_blocks_per_head - image_blocks;
+    if (entry_count != image_count + text_blocks) {
+      return -1;
+    }
+    for (int i = 0; i < text_blocks; ++i) {
+      if (row[image_count + i] != first_k_block + image_blocks + i) {
+        return -1;
+      }
+    }
+    result.image_count = image_count;
+  }
+
+  *parsed = result;
+  return 0;
+}
+
+int block_sparse_halo_schedule_q_row(block_sparse_halo_row_schedule_t *schedule, int q_row, int image_block_rows) {
+  if (schedule == NULL || q_row < 0 || image_block_rows <= 0 || q_row >= image_block_rows) {
+    return -1;
+  }
+
+  const int first_active_row = q_row > 0 ? q_row - 1 : 0;
+  const int last_active_row = q_row >= image_block_rows - 1 ? image_block_rows - 1 : q_row + 1;
+  schedule->first_active_row = first_active_row;
+  schedule->active_row_count = last_active_row - first_active_row + 1;
+  schedule->load_row = q_row <= image_block_rows - 3 ? q_row + 2 : -1;
+  return 0;
+}
+
+int block_sparse_halo_next_q_block(int current_block, int q_block_count) {
+  if (current_block < 0 || q_block_count <= 0 || current_block >= q_block_count - 1) {
+    return -1;
+  }
+  return current_block + 1;
+}
+
+int block_sparse_halo_schedule_text_row(block_sparse_halo_row_schedule_t *schedule, int image_row,
+                                        int image_block_rows) {
+  if (schedule == NULL || image_row < 0 || image_block_rows <= 0 || image_row >= image_block_rows) {
+    return -1;
+  }
+
+  schedule->first_active_row = image_row;
+  schedule->active_row_count = 1;
+  schedule->load_row = image_row < image_block_rows - 1 ? image_row + 1 : -1;
+  return 0;
+}
+
+int block_sparse_halo_text_prefetch_target(int prefetched_through, int chunk_last_row, int image_block_rows) {
+  if (image_block_rows <= 0 || prefetched_through < 0 || prefetched_through >= image_block_rows ||
+      chunk_last_row < 0 || chunk_last_row >= image_block_rows) {
+    return -1;
+  }
+
+  const int next_row = chunk_last_row < image_block_rows - 1 ? chunk_last_row + 1 : chunk_last_row;
+  return smax(prefetched_through, next_row);
+}
+
+int block_sparse_halo_find_ready_row_slot(const block_sparse_halo_row_slot_t slots[BLOCK_SPARSE_HALO_ROW_SLOTS],
+                                          int row_id) {
+  if (slots == NULL || row_id < 0) {
+    return -1;
+  }
+  for (int slot = 0; slot < BLOCK_SPARSE_HALO_ROW_SLOTS; ++slot) {
+    if (slots[slot].row_id == row_id && slots[slot].ready && !slots[slot].outstanding) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+int block_sparse_halo_select_staging_slot(const block_sparse_halo_row_slot_t slots[BLOCK_SPARSE_HALO_ROW_SLOTS],
+                                          int first_active_row, int active_row_count) {
+  if (slots == NULL || first_active_row < 0 || active_row_count <= 0 ||
+      active_row_count > BLOCK_SPARSE_HALO_ROW_SLOTS) {
+    return -1;
+  }
+  if (first_active_row > INT_MAX - active_row_count) {
+    return -1;
+  }
+  const int active_end = first_active_row + active_row_count;
+  for (int slot = 0; slot < BLOCK_SPARSE_HALO_ROW_SLOTS; ++slot) {
+    const int row_id = slots[slot].row_id;
+    if (!slots[slot].outstanding && (row_id < first_active_row || row_id >= active_end)) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+int block_sparse_halo_rotate_row_slots(block_sparse_halo_row_slot_t slots[BLOCK_SPARSE_HALO_ROW_SLOTS],
+                                       int evicted_row, int new_row) {
+  if (slots == NULL || evicted_row < 0 || new_row < 0 || evicted_row == new_row) {
+    return -1;
+  }
+  for (int slot = 0; slot < BLOCK_SPARSE_HALO_ROW_SLOTS; ++slot) {
+    if (slots[slot].row_id == evicted_row) {
+      if (slots[slot].outstanding) {
+        return -1;
+      }
+      for (int other = 0; other < BLOCK_SPARSE_HALO_ROW_SLOTS; ++other) {
+        if (other != slot && slots[other].row_id == new_row) {
+          return -1;
+        }
+      }
+      slots[slot].row_id = new_row;
+      slots[slot].ready = false;
+      return slot;
+    }
+  }
+  return -1;
+}
+
+int block_sparse_halo_find_packed_row(
+  const block_sparse_halo_packed_row_slot_t slots[BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS], int row_id) {
+  if (slots == NULL || row_id < 0) {
+    return -1;
+  }
+  for (int slot = 0; slot < BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS; ++slot) {
+    if (slots[slot].row_id == row_id && slots[slot].ready) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+int block_sparse_halo_select_packed_row_victim(
+  const block_sparse_halo_packed_row_slot_t slots[BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS],
+  int first_active_row, int active_row_count) {
+  if (slots == NULL || first_active_row < 0 || active_row_count <= 0 ||
+      active_row_count > BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS ||
+      first_active_row > INT_MAX - active_row_count) {
+    return -1;
+  }
+  const int active_end = first_active_row + active_row_count;
+  for (int slot = 0; slot < BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS; ++slot) {
+    const int row_id = slots[slot].row_id;
+    if (row_id < first_active_row || row_id >= active_end) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+int block_sparse_halo_bind_packed_row(
+  block_sparse_halo_packed_row_slot_t slots[BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS], int slot, int row_id) {
+  if (slots == NULL || slot < 0 || slot >= BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS || row_id < 0) {
+    return -1;
+  }
+  for (int other = 0; other < BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS; ++other) {
+    if (other != slot && slots[other].row_id == row_id) {
+      return -1;
+    }
+  }
+  slots[slot].row_id = row_id;
+  slots[slot].ready = true;
+  return 0;
+}
+
+int block_sparse_halo_plan_text_kv_batch(
+  block_sparse_halo_text_kv_batch_t *batch,
+  const block_sparse_halo_packed_row_slot_t slots[BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS],
+  int first_pending_row, int latest_packed_row, int image_block_rows, bool flush_tail) {
+  if (batch == NULL || slots == NULL || image_block_rows <= 0 ||
+      first_pending_row < 0 || first_pending_row > image_block_rows ||
+      latest_packed_row < -1 || latest_packed_row >= image_block_rows ||
+      (first_pending_row > 0 && latest_packed_row < first_pending_row - 1) ||
+      (first_pending_row == 0 && latest_packed_row < -1) ||
+      (flush_tail && latest_packed_row != image_block_rows - 1)) {
+    return -1;
+  }
+
+  int pending_rows = 0;
+  if (latest_packed_row >= first_pending_row) {
+    pending_rows = latest_packed_row - first_pending_row + 1;
+  }
+  if (pending_rows > BLOCK_SPARSE_HALO_TEXT_KV_BATCH_ROWS) {
+    return -1;
+  }
+
+  int pending_slots[BLOCK_SPARSE_HALO_TEXT_KV_BATCH_ROWS] = {-1, -1, -1};
+  for (int row_offset = 0; row_offset < pending_rows; ++row_offset) {
+    const int row_id = first_pending_row + row_offset;
+    int match_count = 0;
+    for (int slot = 0; slot < BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS; ++slot) {
+      if (slots[slot].ready && slots[slot].row_id == row_id) {
+        pending_slots[row_offset] = slot;
+        ++match_count;
+      }
+    }
+    if (match_count != 1) {
+      return -1;
+    }
+  }
+
+  const int row_count = flush_tail ? pending_rows :
+    (pending_rows == BLOCK_SPARSE_HALO_TEXT_KV_BATCH_ROWS ? pending_rows : 0);
+  block_sparse_halo_text_kv_batch_t result = {
+    .row_count = row_count,
+    .next_pending_row = first_pending_row,
+  };
+  for (int row_offset = 0; row_offset < row_count; ++row_offset) {
+    result.row_ids[row_offset] = first_pending_row + row_offset;
+    result.packed_slots[row_offset] = pending_slots[row_offset];
+  }
+  if (row_count > image_block_rows - first_pending_row) {
+    return -1;
+  }
+  result.next_pending_row = first_pending_row + row_count;
+  *batch = result;
+  return 0;
+}
+
+int block_sparse_halo_plan_update_segments(block_sparse_halo_update_segment_plan_t *plan,
+                                           const int *real_cols, int count,
+                                           size_t scratch_col_capacity) {
+  if (plan == NULL || real_cols == NULL || count <= 0 ||
+      count > BLOCK_SPARSE_HALO_MAX_UPDATE_SEGMENTS ||
+      scratch_col_capacity == 0 || scratch_col_capacity > INT_MAX ||
+      scratch_col_capacity % HMX_FP16_TILE_N_COLS != 0) {
+    return -1;
+  }
+
+  block_sparse_halo_update_segment_plan_t result = {0};
+  size_t total_cols = 0;
+  for (int segment = 0; segment < count; ++segment) {
+    const int cols = real_cols[segment];
+    if (cols <= 0 ||
+        (segment + 1 < count && cols % HMX_FP16_TILE_N_COLS != 0)) {
+      return -1;
+    }
+
+    size_t next_total;
+    if (!checked_size_add(total_cols, (size_t) cols, &next_total) ||
+        next_total > scratch_col_capacity || next_total > INT_MAX) {
+      return -1;
+    }
+    result.tile_offsets[segment] = (int) (total_cols / HMX_FP16_TILE_N_COLS);
+    result.tile_counts[segment] = ceil_div(cols, HMX_FP16_TILE_N_COLS);
+    total_cols = next_total;
+  }
+  result.total_cols = (int) total_cols;
+  *plan = result;
+  return 0;
+}
+
+int block_sparse_halo_get_packed_segment(block_sparse_halo_packed_segment_t *segment,
+                                         const block_sparse_halo_packed_row_slot_t *slot,
+                                         int col_start, int block_count, int image_block_cols, int head_dim) {
+  if (segment == NULL || slot == NULL || !slot->ready || slot->packed_k == NULL || slot->packed_v == NULL ||
+      col_start < 0 || block_count <= 0 || image_block_cols <= 0 ||
+      col_start > image_block_cols - block_count || head_dim <= 0 || head_dim % 64 != 0) {
+    return -1;
+  }
+
+  size_t k_tile_elems;
+  size_t k_offset_bytes;
+  size_t v_offset_bytes;
+  if (!checked_size_mul(HMX_FP16_TILE_N_COLS, (size_t) head_dim, &k_tile_elems) ||
+      !checked_size_mul((size_t) col_start, k_tile_elems, &k_tile_elems) ||
+      !checked_size_mul(k_tile_elems, sizeof(__fp16), &k_offset_bytes) ||
+      !checked_size_mul((size_t) col_start, HMX_FP16_TILE_SIZE, &v_offset_bytes)) {
+    return -1;
+  }
+
+  const uintptr_t k_base = (uintptr_t) slot->packed_k;
+  const uintptr_t v_base = (uintptr_t) slot->packed_v;
+  if (k_offset_bytes > UINTPTR_MAX - k_base || v_offset_bytes > UINTPTR_MAX - v_base) {
+    return -1;
+  }
+
+  block_sparse_halo_packed_segment_t result = {
+    .packed_k = (const __fp16 *) (k_base + k_offset_bytes),
+    .packed_v = (const __fp16 *) (v_base + v_offset_bytes),
+    .v_tile_stride = image_block_cols,
+    .block_count = block_count,
+  };
+  *segment = result;
+  return 0;
+}
+
+bool block_sparse_halo_can_merge_index_block(bool row_bounded, int start_block, int next_block,
+                                             int image_blocks, int image_block_cols,
+                                             int current_cols, int max_cols) {
+  if (start_block < 0 || next_block < 0 || current_cols <= 0 || max_cols <= 0 ||
+      current_cols % HMX_FP16_TILE_N_COLS != 0 || max_cols % HMX_FP16_TILE_N_COLS != 0 ||
+      max_cols < HMX_FP16_TILE_N_COLS) {
+    return false;
+  }
+  const int current_blocks = current_cols / HMX_FP16_TILE_N_COLS;
+  if (current_blocks <= 0 || start_block > INT_MAX - current_blocks ||
+      next_block != start_block + current_blocks ||
+      current_cols > max_cols - HMX_FP16_TILE_N_COLS) {
+    return false;
+  }
+  if (row_bounded) {
+    if (image_blocks <= 0 || image_block_cols <= 0) {
+      return false;
+    }
+    if (start_block < image_blocks &&
+        (next_block >= image_blocks ||
+         next_block / image_block_cols != start_block / image_block_cols)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int block_sparse_halo_text_q_blocks(int text_tokens) {
+  if (text_tokens < 0 || text_tokens > INT_MAX - (HMX_FP16_TILE_N_ROWS - 1)) {
+    return -1;
+  }
+  return ceil_div(text_tokens, HMX_FP16_TILE_N_ROWS);
+}
+
+int block_sparse_halo_text_q_rows(int text_tokens, int text_q_block) {
+  const int blocks = block_sparse_halo_text_q_blocks(text_tokens);
+  if (blocks <= 0 || text_q_block < 0 || text_q_block >= blocks ||
+      text_q_block > INT_MAX / HMX_FP16_TILE_N_ROWS) {
+    return -1;
+  }
+  return smin(HMX_FP16_TILE_N_ROWS,
+              text_tokens - text_q_block * HMX_FP16_TILE_N_ROWS);
+}
+
+int block_sparse_halo_text_o_next_bank(int current_bank, int completed_q_blocks, int total_q_blocks) {
+  if ((current_bank != 0 && current_bank != 1) || total_q_blocks <= 0 ||
+      completed_q_blocks != total_q_blocks) {
+    return -1;
+  }
+  return current_bank ^ 1;
+}
+
+int block_sparse_halo_text_o_bank_after_image_row(int current_bank, int image_block_cols) {
+  if ((current_bank != 0 && current_bank != 1) || image_block_cols <= 0) {
+    return -1;
+  }
+  return current_bank ^ 1;
+}
+
+int block_sparse_halo_plan_packed_row_event(block_sparse_halo_packed_row_event_t *event,
+                                            int row_id, int image_block_rows,
+                                            int image_block_cols, int text_q_blocks) {
+  if (event == NULL || row_id < 0 || row_id >= image_block_rows ||
+      image_block_rows < 2 || image_block_cols <= 0 || text_q_blocks <= 0 ||
+      image_block_cols > INT_MAX / text_q_blocks) {
+    return -1;
+  }
+  const block_sparse_halo_packed_row_event_t result = {
+    .row_id = row_id,
+    .startup_pack = row_id < 2,
+    .prefetch_row = row_id >= 2 ? row_id : -1,
+    .evicted_row = row_id >= BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS ?
+      row_id - BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS : -1,
+    .text_q_updates = text_q_blocks,
+    .image_block_count = image_block_cols,
+    .text_q_block_updates = image_block_cols * text_q_blocks,
+  };
+  *event = result;
+  return 0;
+}
+
+static bool block_sparse_halo_row_matches_grid(const block_sparse_halo_row_t *row, int q_block,
+                                               int q_blocks_per_head, int k_blocks_per_head,
+                                               int image_block_rows, int image_block_cols, int image_blocks) {
+  if (row == NULL || row->is_text_query || q_blocks_per_head <= 0 || k_blocks_per_head <= 0 ||
+      image_block_rows <= 0 || image_block_cols <= 0 || image_blocks <= 0 || q_block < 0) {
+    return false;
+  }
+
+  const int q_block_in_head = q_block % q_blocks_per_head;
+  if (q_block_in_head >= image_blocks) {
+    return false;
+  }
+  const int qy = q_block_in_head / image_block_cols;
+  const int qx = q_block_in_head % image_block_cols;
+  const int first_k_block = (q_block / q_blocks_per_head) * k_blocks_per_head;
+  int expected = 0;
+  for (int ky = qy - 1; ky <= qy + 1; ++ky) {
+    if (ky < 0 || ky >= image_block_rows) {
+      continue;
+    }
+    for (int kx = qx - 1; kx <= qx + 1; ++kx) {
+      if (kx < 0 || kx >= image_block_cols) {
+        continue;
+      }
+      if (expected >= row->image_count || row->image_blocks[expected] != first_k_block + ky * image_block_cols + kx) {
+        return false;
+      }
+      ++expected;
+    }
+  }
+  return expected == row->image_count;
+}
+
+int block_sparse_halo_plan_prefetch(block_sparse_halo_prefetch_plan_t *plan,
+                                    const block_sparse_halo_row_t *row, int first_image_block,
+                                    int image_blocks, int text_group_start) {
+  if (plan == NULL || row == NULL || first_image_block < 0 || image_blocks <= 0 || text_group_start < 0 ||
+      text_group_start >= image_blocks) {
+    return -1;
+  }
+
+  block_sparse_halo_prefetch_plan_t result = {0};
+  int32_t blocks[BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS];
+  const int count = row->is_text_query ? smin(BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS,
+                                               image_blocks - text_group_start) : row->image_count;
+  if (count <= 0 || count > BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS) {
+    return -1;
+  }
+  for (int i = 0; i < count; ++i) {
+    blocks[i] = row->is_text_query ? first_image_block + text_group_start + i : row->image_blocks[i];
+    if (blocks[i] < first_image_block || blocks[i] >= first_image_block + image_blocks ||
+        (i > 0 && blocks[i] <= blocks[i - 1])) {
+      return -1;
+    }
+  }
+
+  for (int i = 0; i < count; ++i) {
+    if (result.range_count == 0 ||
+        blocks[i] != result.ranges[result.range_count - 1].first_block +
+                       result.ranges[result.range_count - 1].block_count) {
+      result.ranges[result.range_count].first_block = blocks[i];
+      result.ranges[result.range_count].block_count = 1;
+      ++result.range_count;
+    } else {
+      ++result.ranges[result.range_count - 1].block_count;
+    }
+  }
+  result.block_count = count;
+  *plan = result;
+  return 0;
+}
+
+int block_sparse_halo_build_dma_descs(dma_desc_2d_t *descs, int desc_capacity, const void *k_base,
+                                      const void *v_base, void *raw_bank, int n_kv_heads, int kv_head,
+                                      int head_dim, int k_blocks_per_head, const block_sparse_halo_row_t *row) {
+  if (descs == NULL || ((uintptr_t) descs & 63u) != 0 || k_base == NULL || v_base == NULL || raw_bank == NULL ||
+      n_kv_heads <= 0 || kv_head < 0 || kv_head >= n_kv_heads || head_dim <= 0 || k_blocks_per_head <= 0 ||
+      row == NULL || row->is_text_query || row->image_count <= 0 ||
+      row->image_count > BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS || desc_capacity < row->image_count * 2) {
+    return -1;
+  }
+
+  size_t row_bytes;
+  size_t src_stride;
+  size_t block_bytes;
+  size_t pair_bytes;
+  if (!checked_size_mul((size_t) head_dim, sizeof(__fp16), &row_bytes) ||
+      !checked_size_mul((size_t) n_kv_heads, row_bytes, &src_stride) ||
+      !checked_size_mul(HMX_FP16_TILE_N_COLS, row_bytes, &block_bytes) ||
+      !checked_size_mul(block_bytes, 2, &pair_bytes)) {
+    return -1;
+  }
+
+  const uintptr_t k_addr = (uintptr_t) k_base;
+  const uintptr_t v_addr = (uintptr_t) v_base;
+  const uintptr_t bank_addr = (uintptr_t) raw_bank;
+  if (k_addr > UINT32_MAX || v_addr > UINT32_MAX || bank_addr > UINT32_MAX) {
+    return -1;
+  }
+
+  const int first_head_block = kv_head * k_blocks_per_head;
+  for (int slot = 0; slot < row->image_count; ++slot) {
+    const int local_block = row->image_blocks[slot] - first_head_block;
+    size_t block_token;
+    size_t token_offset;
+    size_t head_offset;
+    size_t src_offset;
+    size_t src_last_row_offset;
+    size_t src_last_byte;
+    size_t bank_offset;
+    size_t bank_last_byte;
+    if (local_block < 0 || local_block >= k_blocks_per_head ||
+        !checked_size_mul((size_t) local_block, HMX_FP16_TILE_N_COLS, &block_token) ||
+        !checked_size_mul(block_token, src_stride, &token_offset) ||
+        !checked_size_mul((size_t) kv_head, row_bytes, &head_offset) ||
+        !checked_size_add(token_offset, head_offset, &src_offset) ||
+        !checked_size_mul(HMX_FP16_TILE_N_COLS - 1, src_stride, &src_last_row_offset) ||
+        !checked_size_add(src_offset, src_last_row_offset, &src_last_byte) ||
+        !checked_size_add(src_last_byte, row_bytes - 1, &src_last_byte) ||
+        !checked_size_mul((size_t) slot, pair_bytes, &bank_offset) ||
+        !checked_size_add(bank_offset, pair_bytes - 1, &bank_last_byte) ||
+        src_last_byte > UINT32_MAX || bank_last_byte > UINT32_MAX ||
+        k_addr > UINT32_MAX - src_last_byte || v_addr > UINT32_MAX - src_last_byte ||
+        bank_addr > UINT32_MAX - bank_last_byte) {
+      return -1;
+    }
+
+    const int k_desc = slot * 2;
+    const int v_desc = k_desc + 1;
+    dma_desc_2d_t *k_next = &descs[v_desc];
+    dma_desc_2d_t *v_next = v_desc + 1 < row->image_count * 2 ? &descs[v_desc + 1] : NULL;
+    if (dma_desc_2d_init(&descs[k_desc], k_next, (const void *) (k_addr + src_offset),
+                         (void *) (bank_addr + bank_offset), row_bytes, HMX_FP16_TILE_N_COLS,
+                         src_stride, row_bytes) != DMA_SUBMIT_OK ||
+        dma_desc_2d_init(&descs[v_desc], v_next, (const void *) (v_addr + src_offset),
+                         (void *) (bank_addr + bank_offset + block_bytes), row_bytes, HMX_FP16_TILE_N_COLS,
+                         src_stride, row_bytes) != DMA_SUBMIT_OK) {
+      return -1;
+    }
+  }
+  return row->image_count * 2;
+}
+
+int block_sparse_halo_build_dma_row_descs(dma_desc_2d_t *descs, int desc_capacity, const void *k_base,
+                                          const void *v_base, void *raw_row, int n_kv_heads, int kv_head,
+                                          int head_dim, int image_block_cols, int row_id) {
+  if (descs == NULL || ((uintptr_t) descs & 63u) != 0 || k_base == NULL || v_base == NULL || raw_row == NULL ||
+      desc_capacity < BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW || n_kv_heads <= 0 || kv_head < 0 ||
+      kv_head >= n_kv_heads || head_dim <= 0 || head_dim % 64 != 0 || image_block_cols <= 0 || row_id < 0 ||
+      image_block_cols > UINT16_MAX / HMX_FP16_TILE_N_COLS) {
+    return -1;
+  }
+
+  size_t row_bytes;
+  size_t src_stride;
+  size_t row_height;
+  size_t row_half_bytes;
+  size_t row_token_start;
+  size_t token_offset;
+  size_t head_offset;
+  size_t src_offset;
+  size_t src_last_row_offset;
+  size_t src_last_byte;
+  size_t v_dst_offset;
+  size_t raw_last_byte;
+  if (!checked_size_mul((size_t) head_dim, sizeof(__fp16), &row_bytes) ||
+      !checked_size_mul((size_t) n_kv_heads, row_bytes, &src_stride) ||
+      !checked_size_mul((size_t) image_block_cols, HMX_FP16_TILE_N_COLS, &row_height) ||
+      !checked_size_mul(row_height, row_bytes, &row_half_bytes) ||
+      !checked_size_mul((size_t) row_id, row_height, &row_token_start) ||
+      !checked_size_mul(row_token_start, src_stride, &token_offset) ||
+      !checked_size_mul((size_t) kv_head, row_bytes, &head_offset) ||
+      !checked_size_mul(row_height - 1, src_stride, &src_last_row_offset) ||
+      !checked_size_add(token_offset, head_offset, &src_offset) ||
+      !checked_size_add(src_offset, src_last_row_offset, &src_last_byte) ||
+      !checked_size_add(src_last_byte, row_bytes - 1, &src_last_byte) ||
+      !checked_size_mul(row_half_bytes, 2, &raw_last_byte) || raw_last_byte == 0 ||
+      row_bytes > UINT16_MAX || src_stride > UINT16_MAX || row_height > UINT16_MAX ||
+      src_last_byte > UINT32_MAX) {
+    return -1;
+  }
+  --raw_last_byte;
+  if (raw_last_byte > UINT32_MAX) {
+    return -1;
+  }
+
+  const uintptr_t k_addr = (uintptr_t) k_base;
+  const uintptr_t v_addr = (uintptr_t) v_base;
+  const uintptr_t raw_addr = (uintptr_t) raw_row;
+  if (k_addr > UINT32_MAX || v_addr > UINT32_MAX || raw_addr > UINT32_MAX ||
+      k_addr > UINT32_MAX - src_last_byte || v_addr > UINT32_MAX - src_last_byte ||
+      raw_addr > UINT32_MAX - raw_last_byte) {
+    return -1;
+  }
+
+  if (!checked_size_mul(row_half_bytes, 1, &v_dst_offset)) {
+    return -1;
+  }
+  if (dma_desc_2d_init(&descs[0], &descs[1], (const void *) (k_addr + src_offset),
+                       (void *) raw_addr, row_bytes, row_height, src_stride, row_bytes) != DMA_SUBMIT_OK ||
+      dma_desc_2d_init(&descs[1], NULL, (const void *) (v_addr + src_offset),
+                       (void *) (raw_addr + v_dst_offset), row_bytes, row_height, src_stride, row_bytes) !=
+        DMA_SUBMIT_OK) {
+    return -1;
+  }
+  return BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW;
+}
+
+#define BLOCK_SPARSE_USERDMA_PROBE_BYTES (64 * 1024)
+#define BLOCK_SPARSE_USERDMA_PROBE_GUARD 128
+#define BLOCK_SPARSE_USERDMA_PROBE_ITERS 100
+
+typedef struct __attribute__((aligned(64))) {
+  dma_desc_2d_t desc[2];
+} block_sparse_userdma_probe_desc_t;
+
+typedef struct {
+  worker_synctoken_t sync_ctx;
+  unsigned int task_id;
+  unsigned int ready_count;
+  unsigned int start;
+  unsigned int dma_owner;
+  int n_jobs;
+  bool serialize_dma;
+  const uint8_t *src[2];
+  uint8_t *vtcm_base;
+  size_t vtcm_slice_size;
+  block_sparse_userdma_probe_desc_t descs[2];
+  int submit_result[2];
+  int wait_result[2];
+  bool data_ok[2];
+  bool guard_ok[2];
+  int worker_index[2];
+  int64_t begin_ticks[2];
+  int64_t end_ticks[2];
+} block_sparse_userdma_probe_state_t;
+
+static int block_sparse_halo_dma_wait_bounded(const dma_desc_2d_t *descs, size_t count,
+                                              int64_t timeout_us) {
+  const int64_t deadline = HAP_perf_get_time_us() + timeout_us;
+  int result;
+  while ((result = dma_chain_poll(descs, count)) == DMA_SUBMIT_BUSY) {
+    if (HAP_perf_get_time_us() >= deadline) {
+      // Descriptor storage is worker-local. Quiesce the engine before the
+      // caller unwinds, even though the operation is still reported as timed out.
+      (void) dma_chain_wait(descs, count);
+      return DMA_SUBMIT_HW_ERROR;
+    }
+    qurt_timer_sleep(1);
+  }
+  return result;
+}
+
+static void block_sparse_userdma_probe_worker(void *data, int worker_index) {
+  block_sparse_userdma_probe_state_t *state = (block_sparse_userdma_probe_state_t *) data;
+  const unsigned int slot = worker_pool_atomic_inc_return(&state->task_id) - 1;
+  if (slot >= (unsigned int) state->n_jobs || worker_index < 0 ||
+      (size_t) worker_index > SIZE_MAX / state->vtcm_slice_size) {
+    worker_pool_synctoken_jobdone(&state->sync_ctx);
+    return;
+  }
+
+  uint8_t *slice = state->vtcm_base + (size_t) worker_index * state->vtcm_slice_size;
+  uint8_t *dst = slice + BLOCK_SPARSE_USERDMA_PROBE_GUARD;
+  memset(slice, 0xa5, BLOCK_SPARSE_USERDMA_PROBE_GUARD);
+  memset(dst, 0, BLOCK_SPARSE_USERDMA_PROBE_BYTES);
+  memset(dst + BLOCK_SPARSE_USERDMA_PROBE_BYTES, 0x5a, BLOCK_SPARSE_USERDMA_PROBE_GUARD);
+  state->worker_index[slot] = worker_index;
+  const size_t half_bytes = BLOCK_SPARSE_USERDMA_PROBE_BYTES / 2;
+  state->submit_result[slot] = dma_desc_2d_init(&state->descs[slot].desc[0], &state->descs[slot].desc[1],
+                                                state->src[slot], dst, 128, half_bytes / 128, 128, 128);
+  if (state->submit_result[slot] == DMA_SUBMIT_OK) {
+    state->submit_result[slot] = dma_desc_2d_init(&state->descs[slot].desc[1], NULL,
+                                                  state->src[slot] + half_bytes, dst + half_bytes,
+                                                  128, half_bytes / 128, 128, 128);
+  }
+  worker_pool_atomic_inc_return(&state->ready_count);
+  while (__atomic_load_n(&state->start, __ATOMIC_ACQUIRE) == 0) {
+    qurt_timer_sleep(1);
+  }
+
+  if (state->serialize_dma) {
+    unsigned int expected;
+    do {
+      expected = 0;
+      if (!__atomic_compare_exchange_n(&state->dma_owner, &expected, slot + 1, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        qurt_timer_sleep(1);
+      }
+    } while (expected != 0);
+  }
+
+  state->begin_ticks[slot] = HAP_perf_get_qtimer_count();
+  if (state->submit_result[slot] == DMA_SUBMIT_OK) {
+    state->submit_result[slot] = dma_chain_submit(&state->descs[slot].desc[0]);
+  }
+  if (state->submit_result[slot] == DMA_SUBMIT_OK) {
+    qurt_timer_sleep(1);
+    state->wait_result[slot] = block_sparse_halo_dma_wait_bounded(&state->descs[slot].desc[0], 2, 1000000);
+  }
+  state->end_ticks[slot] = HAP_perf_get_qtimer_count();
+  if (state->serialize_dma) {
+    __atomic_store_n(&state->dma_owner, 0, __ATOMIC_RELEASE);
+  }
+
+  if (state->submit_result[slot] == DMA_SUBMIT_OK && state->wait_result[slot] == DMA_SUBMIT_OK) {
+    state->data_ok[slot] = memcmp(dst, state->src[slot], BLOCK_SPARSE_USERDMA_PROBE_BYTES) == 0;
+  }
+  state->guard_ok[slot] = true;
+  for (int i = 0; i < BLOCK_SPARSE_USERDMA_PROBE_GUARD; ++i) {
+    if (slice[i] != 0xa5 || dst[BLOCK_SPARSE_USERDMA_PROBE_BYTES + i] != 0x5a) {
+      state->guard_ok[slot] = false;
+      break;
+    }
+  }
+  worker_pool_synctoken_jobdone(&state->sync_ctx);
+}
+
+static int block_sparse_userdma_probe_batch(block_sparse_userdma_probe_state_t *state, int n_jobs,
+                                            bool serialize_dma) {
+  state->task_id = 0;
+  state->ready_count = 0;
+  state->start = 0;
+  state->dma_owner = 0;
+  state->n_jobs = n_jobs;
+  state->serialize_dma = serialize_dma;
+  for (int i = 0; i < 2; ++i) {
+    state->submit_result[i] = DMA_SUBMIT_BAD_DESC;
+    state->wait_result[i] = DMA_SUBMIT_BAD_DESC;
+    state->data_ok[i] = false;
+    state->guard_ok[i] = false;
+    state->worker_index[i] = -1;
+  }
+
+  worker_pool_job_t job = { .fptr = block_sparse_userdma_probe_worker, .dptr = state };
+  worker_pool_synctoken_init(&state->sync_ctx, n_jobs);
+  for (int i = 0; i < n_jobs; ++i) {
+    if (worker_pool_submit(NULL, job) != AEE_SUCCESS) {
+      __atomic_store_n(&state->start, 1, __ATOMIC_RELEASE);
+      for (int unsent = i; unsent < n_jobs; ++unsent) {
+        worker_pool_synctoken_jobdone(&state->sync_ctx);
+      }
+      worker_pool_synctoken_wait(&state->sync_ctx);
+      return -1;
+    }
+  }
+  while (__atomic_load_n(&state->ready_count, __ATOMIC_ACQUIRE) < (unsigned int) n_jobs) {
+    qurt_timer_sleep(1);
+  }
+  __atomic_store_n(&state->start, 1, __ATOMIC_RELEASE);
+  worker_pool_synctoken_wait(&state->sync_ctx);
+  return 0;
+}
+
+int block_sparse_halo_classify_userdma_pair(const int submit_result[2], const int wait_result[2],
+                                            const bool data_ok[2], const bool guard_ok[2],
+                                            const int worker_index[2]) {
+  if (submit_result == NULL || wait_result == NULL || data_ok == NULL || guard_ok == NULL ||
+      worker_index == NULL || !guard_ok[0] || !guard_ok[1] || worker_index[0] < 0 || worker_index[1] < 0 ||
+      worker_index[0] == worker_index[1]) {
+    return BLOCK_SPARSE_HALO_USERDMA_UNSAFE;
+  }
+
+  int ok_count = 0;
+  int busy_count = 0;
+  for (int slot = 0; slot < 2; ++slot) {
+    if (submit_result[slot] == DMA_SUBMIT_OK && wait_result[slot] == DMA_SUBMIT_OK && data_ok[slot]) {
+      ++ok_count;
+    } else if (submit_result[slot] == DMA_SUBMIT_BUSY && !data_ok[slot]) {
+      ++busy_count;
+    } else {
+      return BLOCK_SPARSE_HALO_USERDMA_UNSAFE;
+    }
+  }
+  if (ok_count == 2 && busy_count == 0) {
+    return BLOCK_SPARSE_HALO_USERDMA_PER_WORKER;
+  }
+  if (ok_count == 1 && busy_count == 1) {
+    return BLOCK_SPARSE_HALO_USERDMA_SHARED;
+  }
+  return BLOCK_SPARSE_HALO_USERDMA_UNSAFE;
+}
+
+int block_sparse_halo_finalize_userdma_scope(int concurrent_scope, bool serialized_ok) {
+  if (!serialized_ok) {
+    return BLOCK_SPARSE_HALO_USERDMA_UNSAFE;
+  }
+  return concurrent_scope == BLOCK_SPARSE_HALO_USERDMA_PER_WORKER ?
+    BLOCK_SPARSE_HALO_USERDMA_PER_WORKER : BLOCK_SPARSE_HALO_USERDMA_SHARED;
+}
+
+int block_sparse_halo_probe_userdma_scope(void) {
+  static int cached_scope = BLOCK_SPARSE_HALO_USERDMA_UNKNOWN;
+  if (cached_scope != BLOCK_SPARSE_HALO_USERDMA_UNKNOWN) {
+    return cached_scope;
+  }
+
+  block_sparse_userdma_probe_state_t *state = NULL;
+  uint8_t *src0 = NULL;
+  uint8_t *src1 = NULL;
+  if (posix_memalign((void **) &state, 64, sizeof(*state)) != 0 ||
+      posix_memalign((void **) &src0, 128, BLOCK_SPARSE_USERDMA_PROBE_BYTES) != 0 ||
+      posix_memalign((void **) &src1, 128, BLOCK_SPARSE_USERDMA_PROBE_BYTES) != 0) {
+    free(state);
+    free(src0);
+    free(src1);
+    cached_scope = BLOCK_SPARSE_HALO_USERDMA_UNSAFE;
+    return cached_scope;
+  }
+  memset(state, 0, sizeof(*state));
+  for (int i = 0; i < BLOCK_SPARSE_USERDMA_PROBE_BYTES; ++i) {
+    src0[i] = (uint8_t) (i * 17 + 3);
+    src1[i] = (uint8_t) (i * 29 + 11);
+  }
+  qurt_mem_cache_clean((qurt_addr_t) src0, BLOCK_SPARSE_USERDMA_PROBE_BYTES,
+                       QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+  qurt_mem_cache_clean((qurt_addr_t) src1, BLOCK_SPARSE_USERDMA_PROBE_BYTES,
+                       QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+  state->src[0] = src0;
+  state->src[1] = src1;
+  state->vtcm_base = (uint8_t *) vtcm_manager_get_vtcm_base();
+  const size_t vtcm_size = vtcm_manager_get_vtcm_size();
+  state->vtcm_slice_size = vtcm_size / num_workers / (64 * 1024) * (64 * 1024);
+  if (num_workers < 2 || state->vtcm_base == NULL ||
+      state->vtcm_slice_size < BLOCK_SPARSE_USERDMA_PROBE_BYTES + 2 * BLOCK_SPARSE_USERDMA_PROBE_GUARD) {
+    FARF(ALWAYS, "HTP_USERDMA_PROBE_FAIL stage=capacity workers=%u vtcm=%u slice=%u",
+         num_workers, (unsigned int) vtcm_size, (unsigned int) state->vtcm_slice_size);
+    cached_scope = BLOCK_SPARSE_HALO_USERDMA_UNSAFE;
+    goto done;
+  }
+
+  for (int iter = 0; iter < BLOCK_SPARSE_USERDMA_PROBE_ITERS; ++iter) {
+    if (block_sparse_userdma_probe_batch(state, 1, false) != 0 || state->submit_result[0] != DMA_SUBMIT_OK ||
+        state->wait_result[0] != DMA_SUBMIT_OK || !state->data_ok[0] || !state->guard_ok[0]) {
+      FARF(ALWAYS,
+           "HTP_USERDMA_PROBE_FAIL stage=single iter=%d submit=%d wait=%d data=%d guard=%d worker=%d",
+           iter, state->submit_result[0], state->wait_result[0], state->data_ok[0] ? 1 : 0,
+           state->guard_ok[0] ? 1 : 0, state->worker_index[0]);
+      cached_scope = BLOCK_SPARSE_HALO_USERDMA_UNSAFE;
+      goto done;
+    }
+  }
+
+  int observed_scope = BLOCK_SPARSE_HALO_USERDMA_UNKNOWN;
+  for (int iter = 0; iter < BLOCK_SPARSE_USERDMA_PROBE_ITERS; ++iter) {
+    if (block_sparse_userdma_probe_batch(state, 2, false) != 0) {
+      observed_scope = BLOCK_SPARSE_HALO_USERDMA_UNSAFE;
+      break;
+    }
+    const int iter_scope = block_sparse_halo_classify_userdma_pair(
+      state->submit_result, state->wait_result, state->data_ok, state->guard_ok, state->worker_index);
+    if (iter_scope == BLOCK_SPARSE_HALO_USERDMA_UNSAFE ||
+        (observed_scope != BLOCK_SPARSE_HALO_USERDMA_UNKNOWN && observed_scope != iter_scope)) {
+      FARF(ALWAYS,
+           "HTP_USERDMA_PROBE_NOTE stage=concurrent iter=%d scope=%d submit=%d,%d wait=%d,%d "
+           "data=%d,%d guard=%d,%d worker=%d,%d",
+           iter, iter_scope, state->submit_result[0], state->submit_result[1],
+           state->wait_result[0], state->wait_result[1], state->data_ok[0] ? 1 : 0,
+           state->data_ok[1] ? 1 : 0, state->guard_ok[0] ? 1 : 0, state->guard_ok[1] ? 1 : 0,
+           state->worker_index[0], state->worker_index[1]);
+      observed_scope = BLOCK_SPARSE_HALO_USERDMA_UNSAFE;
+      break;
+    }
+    observed_scope = iter_scope;
+  }
+
+  bool serialized_ok = true;
+  for (int iter = 0; iter < BLOCK_SPARSE_USERDMA_PROBE_ITERS; ++iter) {
+    if (block_sparse_userdma_probe_batch(state, 2, true) != 0 ||
+        block_sparse_halo_classify_userdma_pair(
+          state->submit_result, state->wait_result, state->data_ok, state->guard_ok,
+          state->worker_index) != BLOCK_SPARSE_HALO_USERDMA_PER_WORKER) {
+      FARF(ALWAYS,
+           "HTP_USERDMA_PROBE_FAIL stage=serialized iter=%d submit=%d,%d wait=%d,%d "
+           "data=%d,%d guard=%d,%d worker=%d,%d",
+           iter, state->submit_result[0], state->submit_result[1],
+           state->wait_result[0], state->wait_result[1], state->data_ok[0] ? 1 : 0,
+           state->data_ok[1] ? 1 : 0, state->guard_ok[0] ? 1 : 0, state->guard_ok[1] ? 1 : 0,
+           state->worker_index[0], state->worker_index[1]);
+      serialized_ok = false;
+      break;
+    }
+  }
+  cached_scope = block_sparse_halo_finalize_userdma_scope(observed_scope, serialized_ok);
+
+done:
+  FARF(ALWAYS, "HTP_USERDMA_SCOPE=%s single_iters=%d concurrent_iters=%d serialized_iters=%d",
+       cached_scope == BLOCK_SPARSE_HALO_USERDMA_PER_WORKER ? "PER_WORKER" :
+       (cached_scope == BLOCK_SPARSE_HALO_USERDMA_SHARED ? "SHARED" : "UNSAFE"),
+       BLOCK_SPARSE_USERDMA_PROBE_ITERS, BLOCK_SPARSE_USERDMA_PROBE_ITERS,
+       BLOCK_SPARSE_USERDMA_PROBE_ITERS);
+  free(src1);
+  free(src0);
+  free(state);
+  return cached_scope;
+}
+
+int block_sparse_halo_validate_shape(const int32_t *block_mask, int qo_len, int kv_len,
+                                     int n_heads, int n_kv_heads, int head_dim,
+                                     int block_q, int block_k, int n_q_blocks, int n_k_blocks,
+                                     int mask_format, int max_kept_blocks, int sparse_policy,
+                                     int image_tokens, int text_tokens,
+                                     int image_block_rows, int image_block_cols) {
+  if (block_mask == NULL || sparse_policy != 1 || mask_format != 1 || n_heads <= 0 || n_heads != n_kv_heads ||
+      head_dim <= 0 || head_dim % 64 != 0 || block_q != 32 || block_k != 32 || image_tokens <= 0 ||
+      image_tokens % 32 != 0 || text_tokens < 0 || image_tokens > INT_MAX - text_tokens || qo_len != kv_len ||
+      qo_len != image_tokens + text_tokens || image_block_rows <= 0 || image_block_cols <= 0 ||
+      image_block_rows > INT_MAX / image_block_cols) {
+    return -1;
+  }
+
+  const int grid_image_blocks = image_block_rows * image_block_cols;
+  if (grid_image_blocks > INT_MAX / block_k || grid_image_blocks * block_k != image_tokens) {
+    return -1;
+  }
+
+  const int q_blocks_per_head = qo_len / block_q + (qo_len % block_q != 0);
+  const int k_blocks_per_head = kv_len / block_k + (kv_len % block_k != 0);
+  const int image_blocks = image_tokens / block_k;
+  if (q_blocks_per_head > INT_MAX / n_heads || k_blocks_per_head > INT_MAX / n_kv_heads ||
+      n_q_blocks != n_heads * q_blocks_per_head || n_k_blocks != n_kv_heads * k_blocks_per_head ||
+      max_kept_blocks < k_blocks_per_head || image_blocks > q_blocks_per_head || image_blocks > k_blocks_per_head ||
+      !block_sparse_halo_mask_span_fits(n_heads, q_blocks_per_head, max_kept_blocks)) {
+    return -1;
+  }
+  return 0;
+}
+
+int block_sparse_halo_validate_kv_head_rows(const int32_t *block_mask, int kv_head_idx,
+                                            int n_kv_heads, int q_blocks_per_head,
+                                            int k_blocks_per_head, int max_kept_blocks,
+                                            int image_blocks, int image_block_rows,
+                                            int image_block_cols) {
+  if (block_mask == NULL || kv_head_idx < 0 || kv_head_idx >= n_kv_heads ||
+      q_blocks_per_head <= 0 || k_blocks_per_head <= 0 ||
+      max_kept_blocks < k_blocks_per_head || image_blocks <= 0 ||
+      image_blocks > q_blocks_per_head || image_blocks > k_blocks_per_head ||
+      image_block_rows <= 0 || image_block_cols <= 0 ||
+      image_block_rows > INT_MAX / image_block_cols ||
+      image_block_rows * image_block_cols != image_blocks ||
+      q_blocks_per_head > INT_MAX / n_kv_heads ||
+      k_blocks_per_head > INT_MAX / n_kv_heads) {
+    return -1;
+  }
+
+  if (!block_sparse_halo_mask_span_fits(n_kv_heads, q_blocks_per_head, max_kept_blocks)) {
+    return -1;
+  }
+
+  const int first_q_block = kv_head_idx * q_blocks_per_head;
+  for (int qb_in_head = 0; qb_in_head < q_blocks_per_head; ++qb_in_head) {
+    const int qb = first_q_block + qb_in_head;
+    size_t row_offset;
+    if (!checked_size_mul((size_t) qb, (size_t) max_kept_blocks, &row_offset)) {
+      return -1;
+    }
+    block_sparse_halo_row_t parsed;
+    if (block_sparse_halo_parse_row(&parsed, block_mask + row_offset,
+                                    max_kept_blocks, qb, q_blocks_per_head, k_blocks_per_head, image_blocks) != 0) {
+      return -1;
+    }
+    if (!parsed.is_text_query &&
+        !block_sparse_halo_row_matches_grid(&parsed, qb, q_blocks_per_head, k_blocks_per_head,
+                                            image_block_rows, image_block_cols, image_blocks)) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+int block_sparse_halo_validate(const int32_t *block_mask, int qo_len, int kv_len, int n_heads, int n_kv_heads,
+                               int head_dim, int block_q, int block_k, int n_q_blocks, int n_k_blocks,
+                               int mask_format, int max_kept_blocks, int sparse_policy, int image_tokens,
+                               int text_tokens, int image_block_rows, int image_block_cols) {
+  if (block_sparse_halo_validate_shape(
+        block_mask, qo_len, kv_len, n_heads, n_kv_heads, head_dim,
+        block_q, block_k, n_q_blocks, n_k_blocks, mask_format, max_kept_blocks,
+        sparse_policy, image_tokens, text_tokens, image_block_rows, image_block_cols) != 0) {
+    return -1;
+  }
+
+  const int q_blocks_per_head = n_q_blocks / n_heads;
+  const int k_blocks_per_head = n_k_blocks / n_kv_heads;
+  const int image_blocks = image_tokens / block_k;
+  for (int kv_head_idx = 0; kv_head_idx < n_kv_heads; ++kv_head_idx) {
+    if (block_sparse_halo_validate_kv_head_rows(
+          block_mask, kv_head_idx, n_kv_heads, q_blocks_per_head,
+          k_blocks_per_head, max_kept_blocks, image_blocks,
+          image_block_rows, image_block_cols) != 0) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+int block_sparse_halo_select_plan(block_sparse_halo_plan_t *plan, int halo_kv_load_mode, int head_dim,
+                                  int text_tokens, int image_block_cols, size_t available_bytes) {
+  if (plan == NULL || (halo_kv_load_mode != 1 && halo_kv_load_mode != 2) || head_dim <= 0 ||
+      head_dim % 64 != 0 || text_tokens < 0 ||
+      text_tokens > INT_MAX - (HMX_FP16_TILE_N_COLS - 1) || image_block_cols <= 0 ||
+      image_block_cols > INT_MAX / HMX_FP16_TILE_N_COLS ||
+      (halo_kv_load_mode == 2 && image_block_cols > UINT16_MAX / HMX_FP16_TILE_N_COLS)) {
+    return -1;
+  }
+
+  block_sparse_halo_plan_t result = {0};
+  size_t cursor = 0;
+  size_t value;
+  size_t qo_tile_size;
+  size_t kv_tile_size;
+  size_t core_tile_size;
+  size_t d_tile_size;
+  size_t col_vec_size;
+  size_t row_vec_size;
+  size_t text_blk_sz_c;
+  size_t scratch_blk_sz_c;
+  size_t three_row_cols;
+  size_t image_q_cols;
+  result.blk_sz_c = (size_t) smax(3, image_block_cols) * HMX_FP16_TILE_N_COLS;
+  if (!checked_size_align_up((size_t) text_tokens, HMX_FP16_TILE_N_COLS, &text_blk_sz_c)) {
+    return -1;
+  }
+  if (!checked_size_mul((size_t) image_block_cols,
+                        BLOCK_SPARSE_HALO_TEXT_KV_BATCH_ROWS * HMX_FP16_TILE_N_COLS,
+                        &three_row_cols) ||
+      three_row_cols > INT_MAX) {
+    return -1;
+  }
+  if (!checked_size_mul((size_t) smin(3, image_block_cols),
+                        BLOCK_SPARSE_HALO_TEXT_KV_BATCH_ROWS * HMX_FP16_TILE_N_COLS,
+                        &image_q_cols) ||
+      !checked_size_add(image_q_cols, text_blk_sz_c, &image_q_cols) ||
+      image_q_cols > INT_MAX) {
+    return -1;
+  }
+  scratch_blk_sz_c = smax(smax(result.blk_sz_c, text_blk_sz_c),
+                          smax(three_row_cols, image_q_cols));
+  result.scratch_col_capacity = scratch_blk_sz_c;
+  if (!checked_size_mul(32, (size_t) head_dim, &value) || !checked_size_mul(value, sizeof(__fp16), &value) ||
+      !checked_size_align_up(value, 4096, &qo_tile_size) ||
+      !checked_size_mul(result.blk_sz_c, (size_t) head_dim, &value) ||
+      !checked_size_mul(value, sizeof(__fp16), &value) || !checked_size_align_up(value, 4096, &kv_tile_size) ||
+      !checked_size_mul(32, scratch_blk_sz_c, &value) || !checked_size_mul(value, sizeof(__fp16), &value) ||
+      !checked_size_align_up(value, 4096, &core_tile_size) ||
+      !checked_size_mul(32, 32, &value) || !checked_size_mul(value, sizeof(__fp16), &value) ||
+      !checked_size_align_up(value, 4096, &d_tile_size) ||
+      !checked_size_align_up(32 * sizeof(__fp16), 256, &col_vec_size) ||
+      !checked_size_mul(scratch_blk_sz_c, sizeof(__fp16), &value) ||
+      !checked_size_align_up(value, 256, &row_vec_size)) {
+    return -1;
+  }
+
+#define HALO_PLAN_ALLOC(field, bytes)                     \
+  do {                                                    \
+    result.field = cursor;                                \
+    if (!checked_size_add(cursor, (bytes), &cursor)) {    \
+      return -1;                                          \
+    }                                                     \
+  } while (0)
+
+  result.workspace_offset = 0;
+  HALO_PLAN_ALLOC(q_offset, qo_tile_size);
+  HALO_PLAN_ALLOC(o_offsets[0], smax(qo_tile_size, d_tile_size));
+  result.o_offsets[1] = result.o_offsets[0];
+  result.diagonal_offset = result.o_offsets[0];
+  result.packed_k_bytes = kv_tile_size;
+  HALO_PLAN_ALLOC(packed_k_offset, result.packed_k_bytes);
+  result.packed_v_bytes = kv_tile_size;
+  HALO_PLAN_ALLOC(packed_v_offset, result.packed_v_bytes);
+  HALO_PLAN_ALLOC(score_offset, core_tile_size);
+  result.probability_offset = result.score_offset;
+  result.softmax_state_bytes = 2 * col_vec_size;
+  HALO_PLAN_ALLOC(softmax_state_offset, result.softmax_state_bytes);
+  result.row_buffer_bytes = 2 * row_vec_size;
+  HALO_PLAN_ALLOC(row_buffer_offset, result.row_buffer_bytes);
+  result.scales_bytes = 512;
+  HALO_PLAN_ALLOC(scales_offset, result.scales_bytes);
+  result.workspace_bytes = cursor;
+
+  const size_t text_blocks = ((size_t) text_tokens + 31) / 32;
+  if (!checked_size_mul(text_blocks, 2, &value) || !checked_size_mul(value, 32, &value) ||
+      !checked_size_mul(value, (size_t) head_dim, &value) || !checked_size_mul(value, sizeof(__fp16), &value)) {
+    return -1;
+  }
+  result.resident_text_bytes = value;
+
+  size_t row_tokens;
+  size_t row_half_bytes;
+  if (!checked_size_mul((size_t) image_block_cols, HMX_FP16_TILE_N_COLS, &row_tokens) ||
+      !checked_size_mul(row_tokens, (size_t) head_dim, &value) ||
+      !checked_size_mul(value, sizeof(__fp16), &row_half_bytes) ||
+      !checked_size_mul(row_half_bytes, 2, &result.packed_image_row_stride) ||
+      !checked_size_mul(result.packed_image_row_stride, BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS,
+                        &result.packed_image_row_bytes) ||
+      !checked_size_align_up(cursor, 4096, &cursor)) {
+    return -1;
+  }
+  result.packed_image_row_slot_count = BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS;
+  for (int slot = 0; slot < BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS; ++slot) {
+    result.packed_image_row_offsets[slot] = cursor;
+    if (!checked_size_add(cursor, result.packed_image_row_stride, &cursor)) {
+      return -1;
+    }
+  }
+
+  if (halo_kv_load_mode == 2) {
+    result.image_row_stride = result.packed_image_row_stride;
+    if (!checked_size_mul(result.image_row_stride, BLOCK_SPARSE_HALO_RAW_STAGING_SLOTS,
+                          &result.image_row_bytes)) {
+      return -1;
+    }
+    for (int slot = 0; slot < BLOCK_SPARSE_HALO_RAW_STAGING_SLOTS; ++slot) {
+      result.image_row_offsets[slot] = cursor;
+      if (!checked_size_add(cursor, result.image_row_stride, &cursor)) {
+        return -1;
+      }
+    }
+    if (!checked_size_mul(BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW, sizeof(dma_desc_2d_t),
+                          &result.descriptor_bytes)) {
+      return -1;
+    }
+  }
+
+  if (!checked_size_align_up(cursor, 4096, &cursor)) {
+    return -1;
+  }
+  result.resident_text_offset = cursor;
+  if (!checked_size_add(cursor, result.resident_text_bytes, &cursor)) {
+    return -1;
+  }
+
+  if (text_blocks > 0) {
+    if (text_blocks > INT_MAX ||
+        !checked_size_mul(text_blocks, qo_tile_size, &result.resident_text_q_bytes)) {
+      return -1;
+    }
+    result.resident_text_q_blocks = (int) text_blocks;
+    result.resident_text_q_offset = cursor;
+    if (!checked_size_add(cursor, result.resident_text_q_bytes, &cursor)) {
+      return -1;
+    }
+
+    result.resident_text_o_bytes = result.resident_text_q_bytes;
+    for (int bank = 0; bank < 2; ++bank) {
+      result.resident_text_o_offsets[bank] = cursor;
+      if (!checked_size_add(cursor, result.resident_text_o_bytes, &cursor)) {
+        return -1;
+      }
+    }
+
+    if (!checked_size_mul(text_blocks, 2, &value) ||
+        !checked_size_mul(value, col_vec_size, &result.resident_text_state_bytes)) {
+      return -1;
+    }
+    result.resident_text_state_offset = cursor;
+    if (!checked_size_add(cursor, result.resident_text_state_bytes, &cursor)) {
+      return -1;
+    }
+  }
+
+#undef HALO_PLAN_ALLOC
+
+  result.required_bytes = cursor;
+  if (result.required_bytes > available_bytes) {
+    return -1;
+  }
+  *plan = result;
+  return 0;
+}
+
+int block_sparse_halo_init_dma_banks(block_sparse_halo_dma_bank_t *banks[BLOCK_SPARSE_HALO_DMA_BANKS],
+                                     dma_desc_2d_t *external_descs[BLOCK_SPARSE_HALO_DMA_BANKS],
+                                     void *vtcm, size_t vtcm_bytes, const block_sparse_halo_plan_t *plan) {
+  if (banks == NULL || external_descs == NULL || vtcm == NULL || plan == NULL ||
+      plan->required_bytes > vtcm_bytes ||
+      ((uintptr_t) vtcm & 4095u) != 0 || plan->image_bank_stride == 0 ||
+      plan->descriptor_bytes != BLOCK_SPARSE_HALO_DMA_BANKS * BLOCK_SPARSE_HALO_DMA_DESCS_PER_BANK *
+                                 sizeof(dma_desc_2d_t) ||
+      plan->completion_bytes != BLOCK_SPARSE_HALO_DMA_BANKS * sizeof(block_sparse_halo_dma_bank_t)) {
+    return -1;
+  }
+
+  uint8_t *base = (uint8_t *) vtcm;
+  for (int bank = 0; bank < BLOCK_SPARSE_HALO_DMA_BANKS; ++bank) {
+    if (external_descs[bank] == NULL || ((uintptr_t) external_descs[bank] & 63u) != 0 ||
+        plan->descriptor_offsets[bank] != SIZE_MAX || (plan->completion_offsets[bank] & 63u) != 0 ||
+        plan->image_bank_offsets[bank] > plan->required_bytes ||
+        plan->image_bank_stride > plan->required_bytes - plan->image_bank_offsets[bank] ||
+        plan->completion_offsets[bank] > plan->required_bytes ||
+        sizeof(block_sparse_halo_dma_bank_t) > plan->required_bytes - plan->completion_offsets[bank]) {
+      return -1;
+    }
+    block_sparse_halo_dma_bank_t *state =
+      (block_sparse_halo_dma_bank_t *) (base + plan->completion_offsets[bank]);
+    memset(state, 0, sizeof(*state));
+    state->raw = base + plan->image_bank_offsets[bank];
+    state->descs = external_descs[bank];
+    memset(state->descs, 0, BLOCK_SPARSE_HALO_DMA_DESCS_PER_BANK * sizeof(dma_desc_2d_t));
+    for (int slot = 0; slot < BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS; ++slot) {
+      state->block_ids[slot] = -1;
+    }
+    state->submit_result = DMA_SUBMIT_BAD_DESC;
+    state->wait_result = DMA_SUBMIT_BAD_DESC;
+    banks[bank] = state;
+  }
+  return 0;
+}
+
+int block_sparse_halo_dma_preflight(const void *k_base, const void *v_base, const void *vtcm_base,
+                                    size_t vtcm_slice_size, unsigned int vtcm_slice_count,
+                                    int n_kv_heads, int head_dim, int image_tokens,
+                                    const block_sparse_halo_plan_t *plan) {
+  if (k_base == NULL || v_base == NULL || vtcm_base == NULL || plan == NULL ||
+      vtcm_slice_size == 0 || vtcm_slice_count == 0 || n_kv_heads <= 0 || head_dim <= 0 ||
+      image_tokens <= 0 || image_tokens % HMX_FP16_TILE_N_COLS != 0 ||
+      plan->required_bytes > vtcm_slice_size || plan->image_row_stride == 0 || plan->image_row_bytes == 0) {
+    return -1;
+  }
+
+  size_t row_bytes;
+  size_t src_stride;
+  size_t row_tokens;
+  size_t row_height;
+  size_t token_offset;
+  size_t head_offset;
+  size_t src_last_byte;
+  if (!checked_size_mul((size_t) head_dim, sizeof(__fp16), &row_bytes) ||
+      !checked_size_mul((size_t) n_kv_heads, row_bytes, &src_stride) ||
+      !checked_size_mul(row_bytes, 2, &row_tokens) || row_tokens == 0 ||
+      plan->image_row_stride % row_tokens != 0 ||
+      (row_height = plan->image_row_stride / row_tokens) == 0 ||
+      row_bytes > UINT16_MAX || src_stride > UINT16_MAX || row_height == 0 || row_height > UINT16_MAX ||
+      image_tokens % row_height != 0 ||
+      !checked_size_mul((size_t) (image_tokens - 1), src_stride, &token_offset) ||
+      !checked_size_mul((size_t) (n_kv_heads - 1), row_bytes, &head_offset) ||
+      !checked_size_add(token_offset, head_offset, &src_last_byte) ||
+      !checked_size_add(src_last_byte, row_bytes - 1, &src_last_byte)) {
+    return -1;
+  }
+
+  const uintptr_t k_addr = (uintptr_t) k_base;
+  const uintptr_t v_addr = (uintptr_t) v_base;
+  if (k_addr > UINT32_MAX || v_addr > UINT32_MAX || src_last_byte > UINT32_MAX ||
+      k_addr > UINT32_MAX - src_last_byte || v_addr > UINT32_MAX - src_last_byte) {
+    return -1;
+  }
+
+  size_t last_slice_offset;
+  if (!checked_size_mul((size_t) (vtcm_slice_count - 1), vtcm_slice_size, &last_slice_offset)) {
+    return -1;
+  }
+  const uintptr_t vtcm_addr = (uintptr_t) vtcm_base;
+  size_t expected_row_bytes;
+  if (!checked_size_mul(plan->image_row_stride, BLOCK_SPARSE_HALO_RAW_STAGING_SLOTS, &expected_row_bytes) ||
+      plan->image_row_bytes != expected_row_bytes ||
+      plan->descriptor_bytes != BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW * sizeof(dma_desc_2d_t)) {
+    return -1;
+  }
+  for (int slot = 0; slot < BLOCK_SPARSE_HALO_RAW_STAGING_SLOTS; ++slot) {
+    size_t row_last_byte;
+    if (plan->image_row_offsets[slot] > plan->required_bytes ||
+        plan->image_row_stride > plan->required_bytes - plan->image_row_offsets[slot] ||
+        !checked_size_add(last_slice_offset, plan->image_row_offsets[slot], &row_last_byte) ||
+        !checked_size_add(row_last_byte, plan->image_row_stride - 1, &row_last_byte) ||
+        vtcm_addr > UINT32_MAX || row_last_byte > UINT32_MAX ||
+        vtcm_addr > UINT32_MAX - row_last_byte) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+int block_sparse_halo_select_execution(block_sparse_halo_plan_t *plan, int halo_kv_load_mode,
+                                       bool geometry_valid, bool dma_preflight_valid, int userdma_scope, int head_dim,
+                                       int text_tokens, int image_block_cols, size_t available_bytes) {
+  if (plan == NULL || halo_kv_load_mode < 0 || halo_kv_load_mode > 2) {
+    return -1;
+  }
+  memset(plan, 0, sizeof(*plan));
+  if (halo_kv_load_mode == 0) {
+    return BLOCK_SPARSE_HALO_EXEC_BASELINE;
+  }
+  if (!geometry_valid) {
+    return BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
+  }
+  if (halo_kv_load_mode == 1) {
+    // The packed-row worker needs resident protected text state and two
+    // startup image rows. Keep these valid inputs on the normal fallback
+    // path instead of entering a worker that cannot initialize its state.
+    if (text_tokens <= 0) {
+      return BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
+    }
+    return block_sparse_halo_select_plan(plan, 1, head_dim, text_tokens, image_block_cols, available_bytes) == 0 ?
+      BLOCK_SPARSE_HALO_EXEC_L2_PREFETCH : BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
+  }
+  if (!dma_preflight_valid || userdma_scope != BLOCK_SPARSE_HALO_USERDMA_PER_WORKER) {
+    return BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
+  }
+  return block_sparse_halo_select_plan(plan, 2, head_dim, text_tokens, image_block_cols, available_bytes) == 0 ?
+    BLOCK_SPARSE_HALO_EXEC_USERDMA_ROWS : BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
+}
+
+static unsigned int block_sparse_halo_shared_dma_owner;
+
+static int block_sparse_halo_make_dma_row(block_sparse_halo_row_t *dma_row,
+                                          const block_sparse_halo_row_t *query_row,
+                                          int first_image_block, int image_blocks, int group_start) {
+  if (dma_row == NULL || query_row == NULL || first_image_block < 0 || image_blocks <= 0 ||
+      group_start < 0 || group_start >= image_blocks) {
+    return -1;
+  }
+  block_sparse_halo_row_t result = {0};
+  if (!query_row->is_text_query) {
+    if (group_start != 0 || query_row->image_count <= 0 ||
+        query_row->image_count > BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS) {
+      return -1;
+    }
+    result = *query_row;
+  } else {
+    result.image_count = smin(BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS, image_blocks - group_start);
+    for (int i = 0; i < result.image_count; ++i) {
+      result.image_blocks[i] = first_image_block + group_start + i;
+    }
+  }
+  result.is_text_query = false;
+  *dma_row = result;
+  return 0;
+}
+
+static int block_sparse_halo_dma_prepare(block_sparse_halo_dma_bank_t *bank,
+                                         const __fp16 *K, const __fp16 *V,
+                                         int n_kv_heads, int kv_head_idx, int head_dim,
+                                         int k_blocks_per_head, const block_sparse_halo_row_t *row) {
+  if (bank == NULL || bank->outstanding || bank->ready) {
+    return -1;
+  }
+  const int desc_count = block_sparse_halo_build_dma_descs(
+    bank->descs, BLOCK_SPARSE_HALO_DMA_DESCS_PER_BANK, K, V, bank->raw, n_kv_heads, kv_head_idx,
+    head_dim, k_blocks_per_head, row);
+  if (desc_count <= 0) {
+    return -1;
+  }
+  bank->block_count = row->image_count;
+  bank->desc_count = desc_count;
+  for (int i = 0; i < BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS; ++i) {
+    bank->block_ids[i] = i < row->image_count ? row->image_blocks[i] : -1;
+  }
+  bank->submit_result = DMA_SUBMIT_BAD_DESC;
+  bank->wait_result = DMA_SUBMIT_BAD_DESC;
+  return 0;
+}
+
+static bool block_sparse_halo_dma_try_acquire(int userdma_scope, int worker_index) {
+  if (userdma_scope == BLOCK_SPARSE_HALO_USERDMA_PER_WORKER) {
+    return true;
+  }
+  if (userdma_scope != BLOCK_SPARSE_HALO_USERDMA_SHARED || worker_index < 0) {
+    return false;
+  }
+  unsigned int expected = 0;
+  return __atomic_compare_exchange_n(&block_sparse_halo_shared_dma_owner, &expected,
+                                     (unsigned int) worker_index + 1, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+static void block_sparse_halo_dma_release(int userdma_scope, int worker_index) {
+  if (userdma_scope == BLOCK_SPARSE_HALO_USERDMA_SHARED) {
+    const unsigned int owner = (unsigned int) worker_index + 1;
+    unsigned int expected = owner;
+    (void) __atomic_compare_exchange_n(&block_sparse_halo_shared_dma_owner, &expected, 0, false,
+                                       __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+  }
+}
+
+static int block_sparse_halo_dma_try_submit(block_sparse_halo_dma_bank_t *bank,
+                                            int userdma_scope, int worker_index) {
+  if (bank == NULL || bank->ready || bank->outstanding || bank->desc_count <= 0) {
+    return DMA_SUBMIT_BAD_DESC;
+  }
+  if (!block_sparse_halo_dma_try_acquire(userdma_scope, worker_index)) {
+    bank->submit_result = DMA_SUBMIT_BUSY;
+    return DMA_SUBMIT_BUSY;
+  }
+  bank->submit_result = dma_chain_submit(bank->descs);
+  if (bank->submit_result != DMA_SUBMIT_OK) {
+    block_sparse_halo_dma_release(userdma_scope, worker_index);
+    return bank->submit_result;
+  }
+  bank->outstanding = true;
+  return DMA_SUBMIT_OK;
+}
+
+static int block_sparse_halo_dma_wait(block_sparse_halo_dma_bank_t *bank,
+                                      int userdma_scope, int worker_index) {
+  if (bank == NULL) {
+    return DMA_SUBMIT_BAD_DESC;
+  }
+  if (!bank->outstanding) {
+    const int submit_result = block_sparse_halo_dma_try_submit(bank, userdma_scope, worker_index);
+    if (submit_result != DMA_SUBMIT_OK) {
+      return submit_result;
+    }
+  }
+  bank->wait_result = block_sparse_halo_dma_wait_bounded(bank->descs, (size_t) bank->desc_count, 1000000);
+  bank->outstanding = false;
+  block_sparse_halo_dma_release(userdma_scope, worker_index);
+  if (bank->wait_result != DMA_SUBMIT_OK) {
+    return bank->wait_result;
+  }
+  bank->ready = true;
+  return DMA_SUBMIT_OK;
+}
+
+static __attribute__((unused)) int block_sparse_halo_dma_wait_blocking(block_sparse_halo_dma_bank_t *bank,
+                                                                       int userdma_scope, int worker_index) {
+  const int64_t deadline = HAP_perf_get_time_us() + 1000000;
+  int result;
+  while ((result = block_sparse_halo_dma_wait(bank, userdma_scope, worker_index)) == DMA_SUBMIT_BUSY) {
+    if (HAP_perf_get_time_us() >= deadline) {
+      return DMA_SUBMIT_HW_ERROR;
+    }
+    qurt_timer_sleep(1);
+  }
+  return result;
+}
+
+static __attribute__((unused)) void block_sparse_halo_dma_consume(block_sparse_halo_dma_bank_t *bank) {
+  if (bank != NULL) {
+    bank->ready = false;
+    bank->block_count = 0;
+    bank->desc_count = 0;
+  }
+}
+
+static __attribute__((unused)) void block_sparse_halo_dma_drain(
+  block_sparse_halo_dma_bank_t *banks[BLOCK_SPARSE_HALO_DMA_BANKS], int userdma_scope, int worker_index) {
+  if (banks == NULL) {
+    return;
+  }
+  for (int bank = 0; bank < BLOCK_SPARSE_HALO_DMA_BANKS; ++bank) {
+    if (banks[bank] != NULL && banks[bank]->outstanding) {
+      (void) block_sparse_halo_dma_wait_bounded(banks[bank]->descs, (size_t) banks[bank]->desc_count, 1000000);
+      banks[bank]->outstanding = false;
+      block_sparse_halo_dma_release(userdma_scope, worker_index);
+    }
+  }
+}
+
+static int block_sparse_halo_row_dma_submit(dma_desc_2d_t *descs, int desc_count, int userdma_scope,
+                                            int worker_index, bool *outstanding) {
+  if (descs == NULL || desc_count != BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW || outstanding == NULL || *outstanding) {
+    return DMA_SUBMIT_BAD_DESC;
+  }
+  if (!block_sparse_halo_dma_try_acquire(userdma_scope, worker_index)) {
+    return DMA_SUBMIT_BUSY;
+  }
+  const int result = dma_chain_submit(descs);
+  if (result != DMA_SUBMIT_OK) {
+    block_sparse_halo_dma_release(userdma_scope, worker_index);
+    return result;
+  }
+  *outstanding = true;
+  return DMA_SUBMIT_OK;
+}
+
+static int block_sparse_halo_row_dma_wait(dma_desc_2d_t *descs, int desc_count, int userdma_scope,
+                                          int worker_index, bool *outstanding) {
+  if (descs == NULL || desc_count != BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW || outstanding == NULL) {
+    return DMA_SUBMIT_BAD_DESC;
+  }
+  if (!*outstanding) {
+    return DMA_SUBMIT_OK;
+  }
+  const int result = block_sparse_halo_dma_wait_bounded(descs, (size_t) desc_count, 1000000);
+  *outstanding = false;
+  block_sparse_halo_dma_release(userdma_scope, worker_index);
+  return result;
+}
+
+static void block_sparse_halo_row_dma_drain(dma_desc_2d_t *descs, int desc_count, int userdma_scope,
+                                            int worker_index, bool *outstanding) {
+  if (descs == NULL || outstanding == NULL || !*outstanding) {
+    return;
+  }
+  (void) block_sparse_halo_dma_wait_bounded(descs, (size_t) desc_count, 1000000);
+  *outstanding = false;
+  block_sparse_halo_dma_release(userdma_scope, worker_index);
+}
+
+static int block_sparse_halo_row_dma_load_async(block_sparse_halo_row_slot_t *slot, dma_desc_2d_t *descs,
+                                                const __fp16 *K, const __fp16 *V, int n_kv_heads,
+                                                int kv_head_idx, int head_dim, int image_block_cols, int row_id,
+                                                int userdma_scope, int worker_index) {
+  if (slot == NULL || descs == NULL || slot->outstanding || slot->raw == NULL || row_id < 0 ||
+      block_sparse_halo_build_dma_row_descs(descs, BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW, K, V, slot->raw,
+                                            n_kv_heads, kv_head_idx, head_dim, image_block_cols, row_id) !=
+        BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW) {
+    return -1;
+  }
+  slot->row_id = row_id;
+  slot->ready = false;
+  if (block_sparse_halo_row_dma_submit(descs, BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW,
+                                       userdma_scope, worker_index, &slot->outstanding) != DMA_SUBMIT_OK) {
+    slot->outstanding = false;
+    return -1;
+  }
+  return 0;
+}
+
+static int block_sparse_halo_dma_row_for_q(block_sparse_halo_row_t *dma_row,
+                                           block_sparse_halo_row_t *query_row,
+                                           const int32_t *block_mask, int max_kept_blocks,
+                                           int q_head_base, int q_blocks_per_head,
+                                           int k_blocks_per_head, int image_blocks,
+                                           int block_q, int q_token, int group_start) {
+  if (dma_row == NULL || query_row == NULL || block_mask == NULL || q_token < 0) {
+    return -1;
+  }
+  const int q_block = q_head_base * q_blocks_per_head + q_token / block_q;
+  const int32_t *row_data = block_mask + (size_t) q_block * (size_t) max_kept_blocks;
+  if (block_sparse_halo_parse_row(query_row, row_data, max_kept_blocks, q_block,
+                                  q_blocks_per_head, k_blocks_per_head, image_blocks) != 0) {
+    return -1;
+  }
+  return block_sparse_halo_make_dma_row(dma_row, query_row,
+                                        (q_head_base * k_blocks_per_head), image_blocks, group_start);
+}
+
+static __attribute__((unused)) int block_sparse_halo_dma_prepare_for_q(
+  block_sparse_halo_dma_bank_t *bank, const __fp16 *K, const __fp16 *V, const int32_t *block_mask,
+  int max_kept_blocks, int n_kv_heads, int kv_head_idx, int head_dim, int q_head_base,
+  int q_blocks_per_head, int k_blocks_per_head, int image_blocks, int block_q, int q_token, int group_start) {
+  block_sparse_halo_row_t query_row;
+  block_sparse_halo_row_t dma_row;
+  if (block_sparse_halo_dma_row_for_q(&dma_row, &query_row, block_mask, max_kept_blocks,
+                                      q_head_base, q_blocks_per_head, k_blocks_per_head,
+                                      image_blocks, block_q, q_token, group_start) != 0 ||
+      block_sparse_halo_dma_prepare(bank, K, V, n_kv_heads, kv_head_idx, head_dim,
+                                    k_blocks_per_head, &dma_row) != 0) {
+    return -1;
+  }
+  return dma_row.image_count;
+}
+
+static void block_sparse_halo_l2_prefetch_image_row(const __fp16 *K, const __fp16 *V,
+                                                    int n_kv_heads, int kv_head_idx, int head_dim,
+                                                    int block_k, int image_block_cols, int row_id) {
+  if (K == NULL || V == NULL || n_kv_heads <= 0 || kv_head_idx < 0 || kv_head_idx >= n_kv_heads ||
+      head_dim <= 0 || block_k <= 0 || image_block_cols <= 0 || row_id < 0) {
+    return;
+  }
+  const int row_tokens = image_block_cols * block_k;
+  const size_t kv_ld_blk_sz = (size_t) head_dim;
+  const size_t kv_ld_stride = (size_t) n_kv_heads * kv_ld_blk_sz;
+  const size_t first_token = (size_t) row_id * (size_t) row_tokens;
+  const __fp16 *row_k = K + first_token * kv_ld_stride + (size_t) kv_head_idx * kv_ld_blk_sz;
+  const __fp16 *row_v = V + first_token * kv_ld_stride + (size_t) kv_head_idx * kv_ld_blk_sz;
+  l2fetch(row_k, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), row_tokens, 0);
+  l2fetch(row_v, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), row_tokens, 0);
+}
+
+static void block_sparse_pack_k_f16(__fp16 *packed, const __fp16 *src, int src_stride, int n_cols, int head_dim) {
+  static int32_t transpose_vscatter_indices_base[32] __vec_aligned__;
+  for (int i = 0; i < 32; ++i) {
+    transpose_vscatter_indices_base[i] = i * 128;
+  }
+
+  const int n_k_tiles = ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
+  const HVX_Vector v_step = Q6_V_vsplat_R(4);
+  const HVX_Vector v_offsets_base = vmem(transpose_vscatter_indices_base);
+  for (int k_tile_idx = 0; k_tile_idx < n_k_tiles; ++k_tile_idx) {
+    __fp16 *out_base = packed + k_tile_idx * HMX_FP16_TILE_N_COLS * head_dim;
+    HVX_Vector v_offsets = v_offsets_base;
+    for (int r1 = 0; r1 < HMX_FP16_TILE_N_COLS; ++r1) {
+      const int r = k_tile_idx * HMX_FP16_TILE_N_COLS + r1;
+      if (r >= n_cols) {
+        break;
+      }
+      const HVX_Vector *pv_in = (const HVX_Vector *) (src + r * src_stride);
+#pragma unroll
+      for (int d = 0; d < head_dim / 64; ++d) {
+        __fp16 *out_dual_tile = out_base + d * HMX_FP16_TILE_N_ELMS * 2;
+        Q6_vscatter_RMVwV((size_t) out_dual_tile, HMX_FP16_TILE_SIZE * 2 - 1, v_offsets, *pv_in++);
+      }
+      v_offsets = Q6_Vw_vadd_VwVw(v_offsets, v_step);
+    }
+  }
+}
+
+static void block_sparse_pack_v_f16(__fp16 *packed, const __fp16 *src, int src_stride, int n_cols,
+                                    int padded_cols, int head_dim) {
+  assert(padded_cols >= n_cols && padded_cols % HMX_FP16_TILE_N_COLS == 0);
+  const int n_k_tiles = padded_cols / HMX_FP16_TILE_N_COLS;
+  for (int r = 0; r < n_cols; r += 2) {
+    const bool next_row_valid = (r + 1) < n_cols;
+    const HVX_Vector *pv_in0 = (const HVX_Vector *) (src + (r + 0) * src_stride);
+    const HVX_Vector *pv_in1 = (const HVX_Vector *) (src + (r + 1) * src_stride);
+#pragma unroll
+    for (int c = 0; c < head_dim; c += 64) {
+      const HVX_Vector v0 = *pv_in0++;
+      const HVX_Vector v1 = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+      const HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
+      const int k_tile_idx = r / HMX_FP16_TILE_N_ROWS;
+      const int row_in_tile = r % HMX_FP16_TILE_N_ROWS;
+      const int d_tile_idx = c / HMX_FP16_TILE_N_COLS;
+      __fp16 *tile_base0 = packed + ((d_tile_idx + 0) * n_k_tiles + k_tile_idx) * HMX_FP16_TILE_N_ELMS;
+      __fp16 *tile_base1 = packed + ((d_tile_idx + 1) * n_k_tiles + k_tile_idx) * HMX_FP16_TILE_N_ELMS;
+      HVX_Vector *pv_out0 = ((HVX_Vector *) tile_base0) + row_in_tile / 2;
+      HVX_Vector *pv_out1 = ((HVX_Vector *) tile_base1) + row_in_tile / 2;
+      *pv_out0 = Q6_V_lo_W(vp);
+      *pv_out1 = Q6_V_hi_W(vp);
+    }
+  }
+}
+
+static void block_sparse_pack_v_block_f16(__fp16 *packed, const __fp16 *src, int src_stride,
+                                          int dst_col_tile, int total_col_tiles, int head_dim) {
+  assert(dst_col_tile >= 0 && dst_col_tile < total_col_tiles);
+  for (int r = 0; r < HMX_FP16_TILE_N_COLS; r += 2) {
+    const HVX_Vector *pv_in0 = (const HVX_Vector *) (src + (r + 0) * src_stride);
+    const HVX_Vector *pv_in1 = (const HVX_Vector *) (src + (r + 1) * src_stride);
+#pragma unroll
+    for (int c = 0; c < head_dim; c += 64) {
+      const HVX_VectorPair vp = Q6_W_vshuff_VVR(*pv_in1++, *pv_in0++, -2);
+      const int d_tile_idx = c / HMX_FP16_TILE_N_COLS;
+      __fp16 *tile_base0 = packed + ((d_tile_idx + 0) * total_col_tiles + dst_col_tile) * HMX_FP16_TILE_N_ELMS;
+      __fp16 *tile_base1 = packed + ((d_tile_idx + 1) * total_col_tiles + dst_col_tile) * HMX_FP16_TILE_N_ELMS;
+      HVX_Vector *pv_out0 = ((HVX_Vector *) tile_base0) + r / 2;
+      HVX_Vector *pv_out1 = ((HVX_Vector *) tile_base1) + r / 2;
+      *pv_out0 = Q6_V_lo_W(vp);
+      *pv_out1 = Q6_V_hi_W(vp);
+    }
+  }
+}
+
+static __attribute__((unused)) int block_sparse_pack_raw_bank_segment(
+  __fp16 *packed_k, __fp16 *packed_v, size_t packed_bytes, const block_sparse_halo_dma_bank_t *bank,
+  int first_slot, int block_count, int head_dim) {
+  if (packed_k == NULL || packed_v == NULL || bank == NULL || !bank->ready || first_slot < 0 ||
+      block_count <= 0 || block_count > 2 || first_slot > bank->block_count - block_count) {
+    return -1;
+  }
+  hvx_fill_uh(packed_k, 0, packed_bytes);
+  hvx_fill_uh(packed_v, 0, packed_bytes);
+  const size_t block_elems = (size_t) HMX_FP16_TILE_N_COLS * (size_t) head_dim;
+  const size_t pair_bytes = 2 * block_elems * sizeof(__fp16);
+  for (int i = 0; i < block_count; ++i) {
+    const __fp16 *raw_k = (const __fp16 *) (bank->raw + (size_t) (first_slot + i) * pair_bytes);
+    const __fp16 *raw_v = raw_k + block_elems;
+    block_sparse_pack_k_f16(packed_k + (size_t) i * block_elems, raw_k, head_dim,
+                            HMX_FP16_TILE_N_COLS, head_dim);
+    block_sparse_pack_v_block_f16(packed_v, raw_v, head_dim, i, 2, head_dim);
+  }
+  return 0;
+}
+
+int block_sparse_halo_pack_raw_row_segment(__fp16 *packed_k, __fp16 *packed_v, size_t packed_bytes,
+                                           const block_sparse_halo_row_slot_t *slot, int col_start,
+                                           int block_count, int image_block_cols, int head_dim) {
+  if (packed_k == NULL || packed_v == NULL || slot == NULL || !slot->ready || slot->outstanding ||
+      slot->raw == NULL ||
+      col_start < 0 || block_count <= 0 || block_count > 2 || image_block_cols <= 0 ||
+      col_start > image_block_cols - block_count || head_dim <= 0) {
+    return -1;
+  }
+  const size_t block_elems = (size_t) HMX_FP16_TILE_N_COLS * (size_t) head_dim;
+  const size_t row_half_bytes = (size_t) image_block_cols * HMX_FP16_TILE_N_COLS * (size_t) head_dim *
+                                sizeof(__fp16);
+  const size_t token_offset = (size_t) col_start * HMX_FP16_TILE_N_COLS * (size_t) head_dim * sizeof(__fp16);
+  const size_t segment_bytes = (size_t) block_count * block_elems * sizeof(__fp16);
+  if (token_offset > row_half_bytes || segment_bytes > row_half_bytes - token_offset ||
+      packed_bytes < block_count * block_elems * sizeof(__fp16)) {
+    return -1;
+  }
+  hvx_fill_uh(packed_k, 0, packed_bytes);
+  hvx_fill_uh(packed_v, 0, packed_bytes);
+  const __fp16 *raw_k = (const __fp16 *) (slot->raw + token_offset);
+  const __fp16 *raw_v = (const __fp16 *) (slot->raw + row_half_bytes + token_offset);
+  block_sparse_pack_k_f16(packed_k, raw_k, head_dim, block_count * HMX_FP16_TILE_N_COLS, head_dim);
+  block_sparse_pack_v_f16(packed_v, raw_v, head_dim, block_count * HMX_FP16_TILE_N_COLS,
+                          2 * HMX_FP16_TILE_N_COLS, head_dim);
+  return 0;
 }
 
 size_t fa_f16_compute_vtcm_usage(int gqa_factor, int head_dim, int n_rows, int n_cols) {
@@ -438,7 +2181,6 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
     d_tile_vscatter_offsets[i * 2 + 0] = i * 136;
     d_tile_vscatter_offsets[i * 2 + 1] = i * 136 + 6;
   }
-
   // profile timers
   TIMER_DEFINE(q_load);
   TIMER_DEFINE(k_load);
@@ -528,7 +2270,6 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
 
     __fp16 *o_tile_prev = o_tile0;
     __fp16 *o_tile_curr = o_tile1;
-
     hvx_fill_uh(o_tile_prev, 0, qo_tile_size);
     hvx_fill_uh(d_tile, 0, d_tile_size);
 
@@ -1658,6 +3399,722 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
   return 0;
 }
 
+typedef struct {
+  __fp16    *q;
+  __fp16    *o_prev;
+  __fp16    *o_next;
+  HVX_Vector *m;
+  HVX_Vector *l;
+  int         n_rows;
+} block_sparse_halo_q_state_t;
+
+typedef struct {
+  __fp16    *score;
+  __fp16    *probability;
+  __fp16    *diagonal;
+  HVX_Vector *rowmax;
+  HVX_Vector *rowsum;
+  HVX_Vector *row_buffer0;
+  HVX_Vector *row_buffer1;
+} block_sparse_halo_update_scratch_t;
+
+typedef struct {
+  const __fp16 *packed_k;
+  const __fp16 *packed_v;
+  int           v_tile_stride;
+  int           n_real_cols;
+} block_sparse_halo_update_segment_t;
+
+static int block_sparse_halo_pack_q_f32(__fp16 *packed_q, const float *raw_q,
+                                        size_t raw_q_stride, int n_rows, int head_dim) {
+  if (packed_q == NULL || raw_q == NULL || raw_q_stride < (size_t) head_dim ||
+      n_rows <= 0 || n_rows > HMX_FP16_TILE_N_ROWS || head_dim <= 0 || head_dim % 32 != 0) {
+    return -1;
+  }
+
+  for (int r = 0; r < n_rows; r += 2) {
+    const bool next_row_valid = r + 1 < n_rows;
+    const HVX_Vector *pv_in0 = (const HVX_Vector *) (raw_q + (size_t) r * raw_q_stride);
+    const HVX_Vector *pv_in1 = next_row_valid ?
+      (const HVX_Vector *) (raw_q + (size_t) (r + 1) * raw_q_stride) : pv_in0;
+    for (int d = 0; d < head_dim / 32; ++d) {
+      const HVX_Vector v0 = *pv_in0++;
+      const HVX_Vector v1 = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+      HVX_Vector *out_tile =
+        (HVX_Vector *) (packed_q + (size_t) d * HMX_FP16_TILE_N_ELMS);
+      out_tile[r / 2] = hvx_my_wsf_to_vhf(v1, v0);
+    }
+  }
+  return 0;
+}
+
+static int block_sparse_halo_update_packed_segments(
+  block_sparse_halo_q_state_t *state, block_sparse_halo_update_scratch_t *scratch,
+  const block_sparse_halo_update_segment_t *segments, int segment_count,
+  int scratch_col_capacity, int head_dim, const uint8_t *hmx_output_scales_qk,
+  const uint8_t *hmx_output_scales_id, const int16_t *d_tile_vscatter_offsets) {
+  if (state == NULL || scratch == NULL || segments == NULL ||
+      state->q == NULL || state->o_prev == NULL || state->o_next == NULL ||
+      state->m == NULL || state->l == NULL || scratch->score == NULL ||
+      scratch->probability == NULL || scratch->diagonal == NULL || scratch->rowmax == NULL ||
+      scratch->rowsum == NULL || scratch->row_buffer0 == NULL || scratch->row_buffer1 == NULL ||
+      hmx_output_scales_qk == NULL || hmx_output_scales_id == NULL || d_tile_vscatter_offsets == NULL ||
+      state->n_rows <= 0 || segment_count <= 0 ||
+      segment_count > BLOCK_SPARSE_HALO_MAX_UPDATE_SEGMENTS ||
+      scratch_col_capacity <= 0 || scratch_col_capacity % HMX_FP16_TILE_N_COLS != 0 ||
+      head_dim <= 0 || head_dim % 32 != 0) {
+    return -1;
+  }
+
+  int segment_cols[BLOCK_SPARSE_HALO_MAX_UPDATE_SEGMENTS] = {0};
+  for (int segment_idx = 0; segment_idx < segment_count; ++segment_idx) {
+    const block_sparse_halo_update_segment_t *segment = &segments[segment_idx];
+    if (segment->packed_k == NULL || segment->packed_v == NULL || segment->n_real_cols <= 0 ||
+        segment->v_tile_stride < ceil_div(segment->n_real_cols, HMX_FP16_TILE_N_COLS)) {
+      return -1;
+    }
+    segment_cols[segment_idx] = segment->n_real_cols;
+  }
+  block_sparse_halo_update_segment_plan_t segment_plan;
+  if (block_sparse_halo_plan_update_segments(
+        &segment_plan, segment_cols, segment_count, (size_t) scratch_col_capacity) != 0) {
+    return -1;
+  }
+  const int n_cols = segment_plan.total_cols;
+
+  const int n_rows = state->n_rows;
+  const int n_row_tiles = ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
+  const int n_row_vec_cnt = ceil_div(n_rows, 64);
+  const int n_tiles_per_blk_r = align_up(n_rows, HMX_FP16_TILE_N_ROWS) / HMX_FP16_TILE_N_ROWS;
+  const int n_tiles_per_scratch_row = scratch_col_capacity / HMX_FP16_TILE_N_COLS;
+
+  hmx_unit_acquire();
+  hmx_set_output_scales(hmx_output_scales_qk);
+  for (int segment_idx = 0; segment_idx < segment_count; ++segment_idx) {
+    const block_sparse_halo_update_segment_t *segment = &segments[segment_idx];
+    for (int r = 0; r < n_row_tiles; ++r) {
+      for (int c = 0; c < segment_plan.tile_counts[segment_idx]; ++c) {
+        const __fp16 *row_tiles = state->q + r * HMX_FP16_TILE_N_ROWS * head_dim;
+        const __fp16 *col_tiles = segment->packed_k + c * HMX_FP16_TILE_N_COLS * head_dim;
+        __fp16 *out_tile = scratch->score +
+          (r * n_tiles_per_scratch_row + segment_plan.tile_offsets[segment_idx] + c) *
+          HMX_FP16_TILE_N_ELMS;
+        hmx_dot_fp16(out_tile, row_tiles, col_tiles, head_dim / 32);
+      }
+    }
+  }
+  hmx_unit_release();
+
+  const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);
+  for (int r_vec_idx = 0; r_vec_idx < n_row_vec_cnt; ++r_vec_idx) {
+    HVX_Vector v_s_rowmax_local = v_neg_inf;
+    HVX_Vector v_p_rowsum_local = Q6_V_vzero();
+
+    for (int r_vec_off = 0; r_vec_off < 64; r_vec_off += 2) {
+      const int r = r_vec_idx * 64 + r_vec_off;
+      if (r >= align_up(n_rows, 2)) {
+        break;
+      }
+
+      const int r0 = r / HMX_FP16_TILE_N_ROWS;
+      const int r1 = r % HMX_FP16_TILE_N_ROWS;
+      __fp16 *s_ld_base = scratch->score + r0 * HMX_FP16_TILE_N_ROWS * scratch_col_capacity;
+      __fp16 *p_st_base = scratch->probability + r0 * HMX_FP16_TILE_N_ROWS * scratch_col_capacity;
+
+      HVX_Vector *pv_row_buf0 = scratch->row_buffer0;
+      HVX_Vector *pv_row_buf1 = scratch->row_buffer1;
+      for (int c = 0; c < n_cols; c += 64) {
+        const __fp16 *in_dual_tile = s_ld_base + (c / 64) * HMX_FP16_TILE_N_ELMS * 2;
+        const HVX_Vector *pv_s_in0 = ((const HVX_Vector *) in_dual_tile) + r1 / 2;
+        const bool second_tile_valid = c + HMX_FP16_TILE_N_COLS < n_cols;
+        const HVX_Vector v_s_in1 = second_tile_valid ? pv_s_in0[16] : Q6_V_vzero();
+        const HVX_VectorPair vp_s_dual_row = Q6_W_vdeal_VVR(v_s_in1, *pv_s_in0, -2);
+        *pv_row_buf0++ = Q6_V_lo_W(vp_s_dual_row);
+        *pv_row_buf1++ = Q6_V_hi_W(vp_s_dual_row);
+      }
+
+      HVX_Vector v_s_rowmax0 = v_neg_inf;
+      HVX_Vector v_s_rowmax1 = v_neg_inf;
+      for (int c = 0; c < n_cols; c += 64) {
+        const size_t ne = smin(n_cols - c, 64);
+        const HVX_VectorPred q_mask_keep0 = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+        const HVX_VectorPred q_mask_keep1 = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+        const HVX_Vector v_s_row0 =
+          Q6_V_vmux_QVV(q_mask_keep0, scratch->row_buffer0[c / 64], v_neg_inf);
+        const HVX_Vector v_s_row1 =
+          Q6_V_vmux_QVV(q_mask_keep1, scratch->row_buffer1[c / 64], v_neg_inf);
+        scratch->row_buffer0[c / 64] = v_s_row0;
+        scratch->row_buffer1[c / 64] = v_s_row1;
+        v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v_s_row0);
+        v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v_s_row1);
+      }
+
+#pragma unroll
+      for (int s = 64; s >= 2; s >>= 1) {
+        v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, Q6_V_vlalign_VVR(v_s_rowmax0, v_neg_inf, s));
+        v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, Q6_V_vlalign_VVR(v_s_rowmax1, v_neg_inf, s));
+      }
+
+      const HVX_Vector v_s_rowmax_pack2 = Q6_V_hi_W(Q6_W_vshuff_VVR(v_s_rowmax1, v_s_rowmax0, -2));
+      const HVX_Vector v_s_rowmax_pack2_rot =
+        Q6_V_vror_VR(v_s_rowmax_pack2, VLEN - 2 * sizeof(__fp16));
+      const HVX_Vector v_s_rowmax_local_rot =
+        Q6_V_vror_VR(v_s_rowmax_local, r_vec_off * sizeof(__fp16));
+      v_s_rowmax_local =
+        Q6_V_vlalign_VVR(v_s_rowmax_pack2_rot, v_s_rowmax_local_rot, r_vec_off * sizeof(__fp16));
+
+      const HVX_Vector v_m_cur = Q6_Vhf_vmax_VhfVhf(state->m[r_vec_idx], v_s_rowmax_local);
+      const HVX_Vector v_m_lut = Q6_V_vror_VR(v_m_cur, r_vec_off * sizeof(__fp16));
+      const HVX_Vector v_dup_m0 = Q6_V_lo_W(Q6_Wh_vlut16_VbVhR_nomatch(Q6_V_vzero(), v_m_lut, 0));
+      const HVX_Vector v_dup_m1 = Q6_V_lo_W(Q6_Wh_vlut16_VbVhR_nomatch(Q6_V_vzero(), v_m_lut, 2));
+      const HVX_Vector v_zero = Q6_V_vzero();
+      HVX_Vector v_p_rowsum0 = v_zero;
+      HVX_Vector v_p_rowsum1 = v_zero;
+
+      for (int c = 0; c < n_cols; c += 64) {
+        const int ne = smax(0, smin(n_cols - c, 64));
+        const HVX_VectorPred q_mask_keep = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+        const HVX_Vector v_s_minus_m0 =
+          Q6_Vqf16_vsub_VhfVhf(scratch->row_buffer0[c / 64], v_dup_m0);
+        const HVX_Vector v_s_minus_m1 =
+          Q6_Vqf16_vsub_VhfVhf(scratch->row_buffer1[c / 64], v_dup_m1);
+        HVX_Vector v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
+        HVX_Vector v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
+        v_p_row0_hf = Q6_V_vmux_QVV(q_mask_keep, v_p_row0_hf, v_zero);
+        v_p_row1_hf = Q6_V_vmux_QVV(q_mask_keep, v_p_row1_hf, v_zero);
+
+        __fp16 *out_dual_tile = p_st_base + (c / 64) * HMX_FP16_TILE_N_ELMS * 2;
+        HVX_Vector *pv_p_out0 = ((HVX_Vector *) out_dual_tile) + r1 / 2;
+        const HVX_VectorPair vp_p_dual_row = Q6_W_vshuff_VVR(v_p_row1_hf, v_p_row0_hf, -2);
+        *pv_p_out0 = Q6_V_lo_W(vp_p_dual_row);
+        if (c + HMX_FP16_TILE_N_COLS < n_cols) {
+          pv_p_out0[16] = Q6_V_hi_W(vp_p_dual_row);
+        }
+
+        const HVX_VectorPair vp_p_row0 = hvx_my_vhf_to_wqf32(v_p_row0_hf);
+        const HVX_VectorPair vp_p_row1 = hvx_my_vhf_to_wqf32(v_p_row1_hf);
+        v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(
+          v_p_rowsum0, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp_p_row0), Q6_V_hi_W(vp_p_row0)));
+        v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(
+          v_p_rowsum1, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp_p_row1), Q6_V_hi_W(vp_p_row1)));
+      }
+
+#pragma unroll
+      for (int s = 64; s >= 4; s >>= 1) {
+        v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(
+          v_p_rowsum0, Q6_V_vlalign_VVR(v_p_rowsum0, v_zero, s));
+        v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(
+          v_p_rowsum1, Q6_V_vlalign_VVR(v_p_rowsum1, v_zero, s));
+      }
+      const HVX_Vector v_p_rowsum_pack2 =
+        Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(v_p_rowsum1, v_p_rowsum0));
+      const HVX_Vector v_p_rowsum_pack2_rot =
+        Q6_V_vror_VR(v_p_rowsum_pack2, VLEN - 2 * sizeof(__fp16));
+      const HVX_Vector v_p_rowsum_local_rot =
+        Q6_V_vror_VR(v_p_rowsum_local, r_vec_off * sizeof(__fp16));
+      v_p_rowsum_local =
+        Q6_V_vlalign_VVR(v_p_rowsum_pack2_rot, v_p_rowsum_local_rot, r_vec_off * sizeof(__fp16));
+    }
+
+    scratch->rowmax[r_vec_idx] = v_s_rowmax_local;
+    scratch->rowsum[r_vec_idx] = v_p_rowsum_local;
+  }
+
+  HVX_Vector *mvec_exp_m_diff = scratch->rowmax;
+  for (int i = 0; i < n_row_vec_cnt; ++i) {
+    const HVX_Vector v_m_prev = state->m[i];
+    const HVX_Vector v_m_curr = Q6_Vhf_vmax_VhfVhf(v_m_prev, scratch->rowmax[i]);
+    const HVX_Vector v_m_diff = Q6_Vqf16_vsub_VhfVhf(v_m_prev, v_m_curr);
+    const HVX_Vector v_exp_m_diff_hf = hvx_my_exp2_vhf_vqf16(v_m_diff);
+    HVX_Vector v_l_curr = Q6_Vqf16_vmpy_Vqf16Vhf(state->l[i], v_exp_m_diff_hf);
+    v_l_curr = Q6_Vqf16_vadd_Vqf16Vhf(v_l_curr, scratch->rowsum[i]);
+    state->m[i] = v_m_curr;
+    state->l[i] = v_l_curr;
+    mvec_exp_m_diff[i] = v_exp_m_diff_hf;
+  }
+
+  const HVX_Vector v_offsets = vmem(d_tile_vscatter_offsets);
+  const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+  for (int i = 0; i < n_row_tiles; ++i) {
+    const HVX_Vector v_content = Q6_V_vror_VR(mvec_exp_m_diff[i / 2], (i % 2) * 64);
+    __fp16 *out_base = scratch->diagonal + i * (n_tiles_per_blk_r + 1) * HMX_FP16_TILE_N_ELMS;
+    Q6_vscatter_QRMVhV(q_32_elems_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1,
+                       v_offsets, v_content);
+  }
+
+  hmx_unit_acquire();
+  hmx_set_output_scales(hmx_output_scales_id);
+  for (int r = 0; r < n_row_tiles; ++r) {
+    for (int c = 0; c < head_dim / 32; ++c) {
+      __fp16 *d_tile_in = scratch->diagonal + (r * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+      __fp16 *o_tile_in = state->o_prev + (c * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+      hmx_load_tiles_fp16(d_tile_in, o_tile_in, n_row_tiles);
+
+      __fp16 *p_tile_in = scratch->probability +
+        (r * n_tiles_per_scratch_row) * HMX_FP16_TILE_N_ELMS;
+      for (int segment_idx = 0; segment_idx < segment_count; ++segment_idx) {
+        const block_sparse_halo_update_segment_t *segment = &segments[segment_idx];
+        const __fp16 *v_tile_in = segment->packed_v +
+          (size_t) c * (size_t) segment->v_tile_stride * HMX_FP16_TILE_N_ELMS;
+        for (int k = 0; k < segment_plan.tile_counts[segment_idx]; ++k) {
+          const int p_offset = (segment_plan.tile_offsets[segment_idx] + k) * HMX_FP16_TILE_N_ELMS;
+          const int v_offset = k * HMX_FP16_TILE_N_ELMS;
+          hmx_load_tiles_fp16(p_tile_in + p_offset, v_tile_in + v_offset, 1);
+        }
+      }
+
+      __fp16 *o_tile_out = state->o_next + (c * n_tiles_per_blk_r + r) * HMX_FP16_TILE_N_ELMS;
+      hmx_consume_accumulator_fp16(o_tile_out);
+    }
+  }
+  hmx_unit_release();
+
+  swap_ptr(&state->o_next, &state->o_prev);
+  return 0;
+}
+
+static int block_sparse_halo_stable_normal_packed_segments(
+  __fp16 *q, __fp16 *o, block_sparse_halo_update_scratch_t *scratch,
+  const block_sparse_halo_update_segment_t *segments, int segment_count,
+  int n_rows, int scratch_col_capacity, int head_dim,
+  const uint8_t *hmx_output_scales_qk, const uint8_t *hmx_output_scales_id,
+  const int16_t *d_tile_vscatter_offsets) {
+  if (q == NULL || o == NULL || scratch == NULL || segments == NULL ||
+      scratch->score == NULL || scratch->probability == NULL ||
+      scratch->rowmax == NULL || scratch->rowsum == NULL ||
+      scratch->row_buffer0 == NULL || scratch->row_buffer1 == NULL ||
+      hmx_output_scales_qk == NULL || hmx_output_scales_id == NULL ||
+      d_tile_vscatter_offsets == NULL ||
+      n_rows <= 0 || n_rows > HMX_FP16_TILE_N_ROWS || segment_count <= 0 ||
+      segment_count > BLOCK_SPARSE_HALO_MAX_UPDATE_SEGMENTS ||
+      scratch_col_capacity <= 0 || scratch_col_capacity % HMX_FP16_TILE_N_COLS != 0 ||
+      head_dim <= 0 || head_dim % 32 != 0) {
+    return -1;
+  }
+
+  int segment_cols[BLOCK_SPARSE_HALO_MAX_UPDATE_SEGMENTS] = {0};
+  for (int segment_idx = 0; segment_idx < segment_count; ++segment_idx) {
+    const block_sparse_halo_update_segment_t *segment = &segments[segment_idx];
+    if (segment->packed_k == NULL || segment->packed_v == NULL || segment->n_real_cols <= 0 ||
+        segment->v_tile_stride < ceil_div(segment->n_real_cols, HMX_FP16_TILE_N_COLS)) {
+      return -1;
+    }
+    segment_cols[segment_idx] = segment->n_real_cols;
+  }
+
+  block_sparse_halo_update_segment_plan_t segment_plan;
+  if (block_sparse_halo_plan_update_segments(
+        &segment_plan, segment_cols, segment_count, (size_t) scratch_col_capacity) != 0) {
+    return -1;
+  }
+  const int n_cols = segment_plan.total_cols;
+  const int n_row_tiles = ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
+  const int n_tiles_per_scratch_row = scratch_col_capacity / HMX_FP16_TILE_N_COLS;
+
+  hmx_unit_acquire();
+  hmx_set_output_scales(hmx_output_scales_qk);
+  for (int segment_idx = 0; segment_idx < segment_count; ++segment_idx) {
+    const block_sparse_halo_update_segment_t *segment = &segments[segment_idx];
+    for (int r = 0; r < n_row_tiles; ++r) {
+      for (int c = 0; c < segment_plan.tile_counts[segment_idx]; ++c) {
+        const __fp16 *row_tiles = q + r * HMX_FP16_TILE_N_ROWS * head_dim;
+        const __fp16 *col_tiles = segment->packed_k + c * HMX_FP16_TILE_N_COLS * head_dim;
+        __fp16 *out_tile = scratch->score +
+          (r * n_tiles_per_scratch_row + segment_plan.tile_offsets[segment_idx] + c) *
+          HMX_FP16_TILE_N_ELMS;
+        hmx_dot_fp16(out_tile, row_tiles, col_tiles, head_dim / 32);
+      }
+    }
+  }
+  hmx_unit_release();
+
+  const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);
+  const HVX_Vector v_zero = Q6_V_vzero();
+  HVX_Vector v_s_rowmax_local = v_neg_inf;
+  HVX_Vector v_p_rowsum_local = v_zero;
+  for (int r = 0; r < align_up(n_rows, 2); r += 2) {
+    const int r0 = r / HMX_FP16_TILE_N_ROWS;
+    const int r1 = r % HMX_FP16_TILE_N_ROWS;
+    __fp16 *s_ld_base = scratch->score + r0 * HMX_FP16_TILE_N_ROWS * scratch_col_capacity;
+    __fp16 *p_st_base = scratch->probability + r0 * HMX_FP16_TILE_N_ROWS * scratch_col_capacity;
+
+    HVX_Vector v_s_rowmax0 = v_neg_inf;
+    HVX_Vector v_s_rowmax1 = v_neg_inf;
+    for (int c = 0; c < n_cols; c += 64) {
+      const __fp16 *in_dual_tile = s_ld_base + (c / 64) * HMX_FP16_TILE_N_ELMS * 2;
+      const HVX_Vector *pv_s_in0 = ((const HVX_Vector *) in_dual_tile) + r1 / 2;
+      const bool second_tile_valid = c + HMX_FP16_TILE_N_COLS < n_cols;
+      const HVX_Vector v_s_in1 = second_tile_valid ? pv_s_in0[16] : Q6_V_vzero();
+      const HVX_VectorPair vp_s_dual_row = Q6_W_vdeal_VVR(v_s_in1, *pv_s_in0, -2);
+      const int ne = smax(0, smin(n_cols - c, 64));
+      const HVX_VectorPred q_mask_keep = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+      const HVX_Vector v_s_row0 =
+        Q6_V_vmux_QVV(q_mask_keep, Q6_V_lo_W(vp_s_dual_row), v_neg_inf);
+      const HVX_Vector v_s_row1 =
+        Q6_V_vmux_QVV(q_mask_keep, Q6_V_hi_W(vp_s_dual_row), v_neg_inf);
+      scratch->row_buffer0[c / 64] = v_s_row0;
+      scratch->row_buffer1[c / 64] = v_s_row1;
+      v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v_s_row0);
+      v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v_s_row1);
+    }
+
+#pragma unroll
+    for (int s = 64; s >= 2; s >>= 1) {
+      v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, Q6_V_vlalign_VVR(v_s_rowmax0, v_neg_inf, s));
+      v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, Q6_V_vlalign_VVR(v_s_rowmax1, v_neg_inf, s));
+    }
+
+    // Keep rowmax in the same packed HVX form used by online Flash Attention.
+    // The last lane of each reduction is packed into its row slot without a
+    // half-to-float scalar helper call.
+    const HVX_Vector v_s_rowmax_pack2 =
+      Q6_V_hi_W(Q6_W_vshuff_VVR(v_s_rowmax1, v_s_rowmax0, -2));
+    const HVX_Vector v_s_rowmax_pack2_rot =
+      Q6_V_vror_VR(v_s_rowmax_pack2, VLEN - 2 * sizeof(__fp16));
+    const HVX_Vector v_s_rowmax_local_rot =
+      Q6_V_vror_VR(v_s_rowmax_local, r * sizeof(__fp16));
+    v_s_rowmax_local =
+      Q6_V_vlalign_VVR(v_s_rowmax_pack2_rot, v_s_rowmax_local_rot, r * sizeof(__fp16));
+
+    const HVX_Vector v_m_lut = Q6_V_vror_VR(v_s_rowmax_local, r * sizeof(__fp16));
+    const HVX_Vector v_dup_m0 = Q6_V_lo_W(Q6_Wh_vlut16_VbVhR_nomatch(Q6_V_vzero(), v_m_lut, 0));
+    const HVX_Vector v_dup_m1 = Q6_V_lo_W(Q6_Wh_vlut16_VbVhR_nomatch(Q6_V_vzero(), v_m_lut, 2));
+    HVX_Vector v_p_rowsum0 = v_zero;
+    HVX_Vector v_p_rowsum1 = v_zero;
+    for (int c = 0; c < n_cols; c += 64) {
+      const int ne = smax(0, smin(n_cols - c, 64));
+      const HVX_VectorPred q_mask_keep = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+      const HVX_Vector v_s_minus_m0 =
+        Q6_Vqf16_vsub_VhfVhf(scratch->row_buffer0[c / 64], v_dup_m0);
+      const HVX_Vector v_s_minus_m1 =
+        Q6_Vqf16_vsub_VhfVhf(scratch->row_buffer1[c / 64], v_dup_m1);
+      HVX_Vector v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
+      HVX_Vector v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
+      v_p_row0_hf = Q6_V_vmux_QVV(q_mask_keep, v_p_row0_hf, v_zero);
+      v_p_row1_hf = Q6_V_vmux_QVV(q_mask_keep, v_p_row1_hf, v_zero);
+
+      __fp16 *out_dual_tile = p_st_base + (c / 64) * HMX_FP16_TILE_N_ELMS * 2;
+      HVX_Vector *pv_p_out0 = ((HVX_Vector *) out_dual_tile) + r1 / 2;
+      const HVX_VectorPair vp_p_dual_row = Q6_W_vshuff_VVR(v_p_row1_hf, v_p_row0_hf, -2);
+      *pv_p_out0 = Q6_V_lo_W(vp_p_dual_row);
+      if (c + HMX_FP16_TILE_N_COLS < n_cols) {
+        pv_p_out0[16] = Q6_V_hi_W(vp_p_dual_row);
+      }
+
+      const HVX_VectorPair vp_p_row0 = hvx_my_vhf_to_wqf32(v_p_row0_hf);
+      const HVX_VectorPair vp_p_row1 = hvx_my_vhf_to_wqf32(v_p_row1_hf);
+      v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(
+        v_p_rowsum0, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp_p_row0), Q6_V_hi_W(vp_p_row0)));
+      v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(
+        v_p_rowsum1, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp_p_row1), Q6_V_hi_W(vp_p_row1)));
+    }
+
+#pragma unroll
+    for (int s = 64; s >= 4; s >>= 1) {
+      v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(
+        v_p_rowsum0, Q6_V_vlalign_VVR(v_p_rowsum0, v_zero, s));
+      v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(
+        v_p_rowsum1, Q6_V_vlalign_VVR(v_p_rowsum1, v_zero, s));
+    }
+    const HVX_Vector v_p_rowsum_pack2 =
+      Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(v_p_rowsum1, v_p_rowsum0));
+    const HVX_Vector v_p_rowsum_pack2_rot =
+      Q6_V_vror_VR(v_p_rowsum_pack2, VLEN - 2 * sizeof(__fp16));
+    const HVX_Vector v_p_rowsum_local_rot =
+      Q6_V_vror_VR(v_p_rowsum_local, r * sizeof(__fp16));
+    v_p_rowsum_local =
+      Q6_V_vlalign_VVR(v_p_rowsum_pack2_rot, v_p_rowsum_local_rot, r * sizeof(__fp16));
+  }
+
+  scratch->rowmax[0] = v_s_rowmax_local;
+  scratch->rowsum[0] = Q6_Vqf16_vadd_Vqf16Vhf(v_zero, v_p_rowsum_local);
+
+  hmx_unit_acquire();
+  hmx_set_output_scales(hmx_output_scales_id);
+  for (int r = 0; r < n_row_tiles; ++r) {
+    for (int c = 0; c < head_dim / 32; ++c) {
+      __fp16 *p_tile_in = scratch->probability +
+        (r * n_tiles_per_scratch_row) * HMX_FP16_TILE_N_ELMS;
+      for (int segment_idx = 0; segment_idx < segment_count; ++segment_idx) {
+        const block_sparse_halo_update_segment_t *segment = &segments[segment_idx];
+        const __fp16 *v_tile_in = segment->packed_v +
+          (size_t) c * (size_t) segment->v_tile_stride * HMX_FP16_TILE_N_ELMS;
+        for (int k = 0; k < segment_plan.tile_counts[segment_idx]; ++k) {
+          const int p_offset = (segment_plan.tile_offsets[segment_idx] + k) * HMX_FP16_TILE_N_ELMS;
+          const int v_offset = k * HMX_FP16_TILE_N_ELMS;
+          hmx_load_tiles_fp16(p_tile_in + p_offset, v_tile_in + v_offset, 1);
+        }
+      }
+      __fp16 *o_tile_out = o + (c * n_row_tiles + r) * HMX_FP16_TILE_N_ELMS;
+      hmx_consume_accumulator_fp16(o_tile_out);
+    }
+  }
+  hmx_unit_release();
+
+  // Q is dead after QK and score/probability is dead after PV. Reuse those
+  // compact-plan aliases for the same FP16 diagonal normalization as Flash.
+  __fp16 *normalization_diagonal = scratch->score;
+  hvx_fill_uh(normalization_diagonal, 0, HMX_FP16_TILE_SIZE);
+  const HVX_Vector v_inv_rowsum = hvx_my_inv_vhf(Q6_Vhf_equals_Vqf16(scratch->rowsum[0]));
+  const HVX_Vector v_offsets = vmem(d_tile_vscatter_offsets);
+  const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+  Q6_vscatter_QRMVhV(q_32_elems_mask, (size_t) normalization_diagonal,
+                     HMX_FP16_TILE_SIZE - 1, v_offsets, v_inv_rowsum);
+
+  hmx_unit_acquire();
+  hmx_set_output_scales(hmx_output_scales_id);
+  for (int r = 0; r < n_row_tiles; ++r) {
+    for (int c = 0; c < head_dim / 32; ++c) {
+      const __fp16 *d_tile_in =
+        normalization_diagonal + (r * n_row_tiles) * HMX_FP16_TILE_N_ELMS;
+      const __fp16 *o_tile_in = o + (c * n_row_tiles) * HMX_FP16_TILE_N_ELMS;
+      __fp16 *o_tile_out = q + (r * head_dim / 32 + c) * HMX_FP16_TILE_N_ELMS;
+      hmx_dot_fp16(o_tile_out, d_tile_in, o_tile_in, n_row_tiles);
+    }
+  }
+  hmx_unit_release();
+  return 0;
+}
+
+static int block_sparse_halo_update_packed_segment(
+  block_sparse_halo_q_state_t *state, block_sparse_halo_update_scratch_t *scratch,
+  const __fp16 *packed_k, const __fp16 *packed_v, int v_tile_stride,
+  int n_real_cols, int scratch_col_capacity, int head_dim,
+  const uint8_t *hmx_output_scales_qk, const uint8_t *hmx_output_scales_id,
+  const int16_t *d_tile_vscatter_offsets) {
+  const block_sparse_halo_update_segment_t segment = {
+    .packed_k = packed_k,
+    .packed_v = packed_v,
+    .v_tile_stride = v_tile_stride,
+    .n_real_cols = n_real_cols,
+  };
+  return block_sparse_halo_update_packed_segments(
+    state, scratch, &segment, 1, scratch_col_capacity, head_dim,
+    hmx_output_scales_qk, hmx_output_scales_id, d_tile_vscatter_offsets);
+}
+
+int block_sparse_halo_pack_image_row(
+  block_sparse_halo_packed_row_slot_t *slot, const __fp16 *K, const __fp16 *V,
+  int n_kv_heads, int kv_head_idx, int head_dim, int image_block_cols, int row_id) {
+  if (slot == NULL || slot->packed_k == NULL || slot->packed_v == NULL || K == NULL || V == NULL ||
+      n_kv_heads <= 0 || kv_head_idx < 0 || kv_head_idx >= n_kv_heads || head_dim <= 0 ||
+      image_block_cols <= 0 || row_id < 0 || image_block_cols > INT_MAX / HMX_FP16_TILE_N_COLS) {
+    return -1;
+  }
+  const int row_tokens = image_block_cols * HMX_FP16_TILE_N_COLS;
+  const int kv_stride = n_kv_heads * head_dim;
+  const size_t first_token = (size_t) row_id * (size_t) row_tokens;
+  const __fp16 *row_k = K + first_token * (size_t) kv_stride + (size_t) kv_head_idx * head_dim;
+  const __fp16 *row_v = V + first_token * (size_t) kv_stride + (size_t) kv_head_idx * head_dim;
+
+  slot->ready = false;
+  block_sparse_pack_k_f16(slot->packed_k, row_k, kv_stride, row_tokens, head_dim);
+  block_sparse_pack_v_f16(slot->packed_v, row_v, kv_stride, row_tokens, row_tokens, head_dim);
+  slot->row_id = row_id;
+  slot->ready = true;
+  return 0;
+}
+
+static int block_sparse_halo_pack_staged_row(
+  block_sparse_halo_packed_row_slot_t *packed_slot,
+  const block_sparse_halo_row_slot_t *staging_slot,
+  int image_block_cols, int head_dim) {
+  if (packed_slot == NULL || staging_slot == NULL || staging_slot->raw == NULL ||
+      !staging_slot->ready || staging_slot->outstanding || staging_slot->row_id < 0 ||
+      image_block_cols <= 0 || image_block_cols > INT_MAX / HMX_FP16_TILE_N_COLS ||
+      head_dim <= 0) {
+    return -1;
+  }
+  const size_t row_half_elems =
+    (size_t) image_block_cols * HMX_FP16_TILE_N_COLS * (size_t) head_dim;
+  const __fp16 *raw_k = (const __fp16 *) staging_slot->raw;
+  const __fp16 *raw_v = raw_k + row_half_elems;
+  const int row_id = staging_slot->row_id;
+  if (block_sparse_halo_pack_image_row(
+        packed_slot, raw_k, raw_v, 1, 0, head_dim, image_block_cols, 0) != 0) {
+    return -1;
+  }
+  packed_slot->row_id = row_id;
+  return 0;
+}
+
+static int block_sparse_halo_update_resident_text_q_segments(
+  __fp16 *resident_text_q, __fp16 *resident_text_o[2], uint8_t *resident_text_state,
+  int resident_text_q_blocks, int text_tokens, size_t qo_tile_size, size_t col_vec_size,
+  int *current_o_bank, block_sparse_halo_update_scratch_t *scratch,
+  const block_sparse_halo_update_segment_t *segments, int segment_count,
+  int scratch_col_capacity, int head_dim, const uint8_t *hmx_output_scales_qk,
+  const uint8_t *hmx_output_scales_id, const int16_t *d_tile_vscatter_offsets) {
+  if (resident_text_q == NULL || resident_text_o == NULL || resident_text_o[0] == NULL ||
+      resident_text_o[1] == NULL || resident_text_state == NULL || current_o_bank == NULL ||
+      scratch == NULL || scratch->diagonal == NULL ||
+      (*current_o_bank != 0 && *current_o_bank != 1)) {
+    return -1;
+  }
+  // Image-Q output aliases this tile. Reestablish a zero off-diagonal before
+  // the text-Q online update scatters its new diagonal entries.
+  hvx_fill_uh(scratch->diagonal, 0, HMX_FP16_TILE_SIZE);
+  const int next_o_bank = *current_o_bank ^ 1;
+  for (int text_q_block = 0; text_q_block < resident_text_q_blocks; ++text_q_block) {
+    uint8_t *state_block = resident_text_state + (size_t) text_q_block * 2 * col_vec_size;
+    block_sparse_halo_q_state_t q_state = {
+      .q = (__fp16 *) ((uint8_t *) resident_text_q + (size_t) text_q_block * qo_tile_size),
+      .o_prev = (__fp16 *) ((uint8_t *) resident_text_o[*current_o_bank] +
+                            (size_t) text_q_block * qo_tile_size),
+      .o_next = (__fp16 *) ((uint8_t *) resident_text_o[next_o_bank] +
+                            (size_t) text_q_block * qo_tile_size),
+      .m = (HVX_Vector *) state_block,
+      .l = (HVX_Vector *) (state_block + col_vec_size),
+      .n_rows = block_sparse_halo_text_q_rows(text_tokens, text_q_block),
+    };
+    if (q_state.n_rows <= 0 || block_sparse_halo_update_packed_segments(
+          &q_state, scratch, segments, segment_count, scratch_col_capacity,
+          head_dim, hmx_output_scales_qk, hmx_output_scales_id,
+          d_tile_vscatter_offsets) != 0 ||
+        q_state.o_prev != (__fp16 *) ((uint8_t *) resident_text_o[next_o_bank] +
+                                      (size_t) text_q_block * qo_tile_size)) {
+      return -1;
+    }
+  }
+  const int completed_bank = block_sparse_halo_text_o_next_bank(
+    *current_o_bank, resident_text_q_blocks, resident_text_q_blocks);
+  if (completed_bank < 0) {
+    return -1;
+  }
+  *current_o_bank = completed_bank;
+  return 0;
+}
+
+static int block_sparse_halo_update_resident_text_q(
+  __fp16 *resident_text_q, __fp16 *resident_text_o[2], uint8_t *resident_text_state,
+  int resident_text_q_blocks, int text_tokens, size_t qo_tile_size, size_t col_vec_size,
+  int *current_o_bank, block_sparse_halo_update_scratch_t *scratch,
+  const __fp16 *packed_k, const __fp16 *packed_v, int v_tile_stride, int n_real_cols,
+  int scratch_col_capacity, int head_dim, const uint8_t *hmx_output_scales_qk,
+  const uint8_t *hmx_output_scales_id, const int16_t *d_tile_vscatter_offsets) {
+  const block_sparse_halo_update_segment_t segment = {
+    .packed_k = packed_k,
+    .packed_v = packed_v,
+    .v_tile_stride = v_tile_stride,
+    .n_real_cols = n_real_cols,
+  };
+  return block_sparse_halo_update_resident_text_q_segments(
+    resident_text_q, resident_text_o, resident_text_state,
+    resident_text_q_blocks, text_tokens, qo_tile_size, col_vec_size,
+    current_o_bank, scratch, &segment, 1, scratch_col_capacity, head_dim,
+    hmx_output_scales_qk, hmx_output_scales_id, d_tile_vscatter_offsets);
+}
+
+static int block_sparse_halo_update_resident_text_q_from_packed_batch(
+  const block_sparse_halo_packed_row_slot_t slots[BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS],
+  const block_sparse_halo_text_kv_batch_t *batch, int image_block_cols,
+  __fp16 *resident_text_q, __fp16 *resident_text_o[2], uint8_t *resident_text_state,
+  int resident_text_q_blocks, int text_tokens, size_t qo_tile_size, size_t col_vec_size,
+  int *current_o_bank, block_sparse_halo_update_scratch_t *scratch,
+  int scratch_col_capacity, int head_dim, const uint8_t *hmx_output_scales_qk,
+  const uint8_t *hmx_output_scales_id, const int16_t *d_tile_vscatter_offsets) {
+  if (slots == NULL || batch == NULL || batch->row_count <= 0 ||
+      batch->row_count > BLOCK_SPARSE_HALO_TEXT_KV_BATCH_ROWS ||
+      image_block_cols <= 0 || image_block_cols > INT_MAX / HMX_FP16_TILE_N_COLS ||
+      current_o_bank == NULL || (*current_o_bank != 0 && *current_o_bank != 1)) {
+    return -1;
+  }
+  const int row_cols = image_block_cols * HMX_FP16_TILE_N_COLS;
+  if (row_cols > scratch_col_capacity / batch->row_count) {
+    return -1;
+  }
+
+  block_sparse_halo_update_segment_t segments[BLOCK_SPARSE_HALO_TEXT_KV_BATCH_ROWS] = {0};
+  bool used_slots[BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS] = {false};
+  for (int batch_row = 0; batch_row < batch->row_count; ++batch_row) {
+    const int packed_slot = batch->packed_slots[batch_row];
+    const int row_id = batch->row_ids[batch_row];
+    if (packed_slot < 0 || packed_slot >= BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS ||
+        used_slots[packed_slot] || row_id < 0 ||
+        (batch_row > 0 && row_id != batch->row_ids[batch_row - 1] + 1) ||
+        !slots[packed_slot].ready || slots[packed_slot].row_id != row_id) {
+      return -1;
+    }
+    used_slots[packed_slot] = true;
+
+    block_sparse_halo_packed_segment_t packed_segment;
+    if (block_sparse_halo_get_packed_segment(
+          &packed_segment, &slots[packed_slot], 0, image_block_cols,
+          image_block_cols, head_dim) != 0) {
+      return -1;
+    }
+    segments[batch_row] = (block_sparse_halo_update_segment_t) {
+      .packed_k = packed_segment.packed_k,
+      .packed_v = packed_segment.packed_v,
+      .v_tile_stride = packed_segment.v_tile_stride,
+      .n_real_cols = row_cols,
+    };
+  }
+  if (batch->row_ids[batch->row_count - 1] >= INT_MAX ||
+      batch->next_pending_row != batch->row_ids[batch->row_count - 1] + 1) {
+    return -1;
+  }
+
+  const int expected_o_bank = *current_o_bank ^ 1;
+  if (block_sparse_halo_update_resident_text_q_segments(
+        resident_text_q, resident_text_o, resident_text_state,
+        resident_text_q_blocks, text_tokens, qo_tile_size, col_vec_size,
+        current_o_bank, scratch, segments, batch->row_count, scratch_col_capacity,
+        head_dim, hmx_output_scales_qk, hmx_output_scales_id,
+        d_tile_vscatter_offsets) != 0) {
+    return -1;
+  }
+  return *current_o_bank == expected_o_bank ? 0 : -1;
+}
+
+static int block_sparse_halo_store_resident_text_q(
+  block_sparse_halo_q_state_t *state, __fp16 *diagonal, float *raw_o, size_t raw_o_stride,
+  int head_dim, bool with_lse, const uint8_t *hmx_output_scales_id,
+  const int16_t *d_tile_vscatter_offsets) {
+  if (state == NULL || diagonal == NULL || raw_o == NULL || state->n_rows <= 0 ||
+      state->n_rows > HMX_FP16_TILE_N_ROWS || head_dim <= 0 || head_dim % 32 != 0) {
+    return -1;
+  }
+  const HVX_Vector v_offsets = vmem(d_tile_vscatter_offsets);
+  const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+  const HVX_Vector v_inverse_l = hvx_my_inv_vhf(Q6_Vhf_equals_Vqf16(state->l[0]));
+  Q6_vscatter_QRMVhV(q_32_elems_mask, (size_t) diagonal, HMX_FP16_TILE_SIZE - 1,
+                     v_offsets, v_inverse_l);
+
+  hmx_unit_acquire();
+  hmx_set_output_scales(hmx_output_scales_id);
+  for (int c = 0; c < head_dim / 32; ++c) {
+    __fp16 *o_tile_in = state->o_prev + (size_t) c * HMX_FP16_TILE_N_ELMS;
+    __fp16 *o_tile_out = state->o_next + (size_t) c * HMX_FP16_TILE_N_ELMS;
+    hmx_dot_fp16(o_tile_out, diagonal, o_tile_in, 1);
+  }
+  hmx_unit_release();
+
+  for (int r = 0; r < state->n_rows; r += 2) {
+    const bool next_row_valid = r + 1 < state->n_rows;
+    float *row_out0 = raw_o + (size_t) r * raw_o_stride;
+    float *row_out1 = next_row_valid ? raw_o + (size_t) (r + 1) * raw_o_stride : row_out0;
+    for (int d = 0; d < head_dim / 32; ++d) {
+      const HVX_Vector *in_tile =
+        (const HVX_Vector *) (state->o_next + (size_t) d * HMX_FP16_TILE_N_ELMS);
+      const HVX_VectorPair vp = hvx_my_vhf_to_wsf(in_tile[r / 2]);
+      const HVX_Vector v_out0 = Q6_V_lo_W(vp);
+      const HVX_Vector v_out1 = Q6_V_hi_W(vp);
+      vstu_variable(row_out0 + d * 32, sizeof(v_out0), v_out0);
+      if (next_row_valid) {
+        vstu_variable(row_out1 + d * 32, sizeof(v_out1), v_out1);
+      }
+    }
+    if (with_lse) {
+      row_out0[head_dim] = flash_attn_lse_from_f16_state(state->m, state->l, r);
+      if (next_row_valid) {
+        row_out1[head_dim] = flash_attn_lse_from_f16_state(state->m, state->l, r + 1);
+      }
+    }
+  }
+  return 0;
+}
+
 int block_sparse_flash_attn_f16_core_chunked(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
                                              __fp16 *restrict O, const __fp16 *restrict Q,
                                              const __fp16 *restrict K, const __fp16 *restrict V,
@@ -1910,15 +4367,8 @@ int block_sparse_flash_attn_f16_core_chunked(int kv_head_idx, uint8_t *vtcm, uin
       }
     }
 
-    // 初始化 online softmax 状态
-    hvx_fill_uh(mvec_m, 0xfbff, col_vec_size);
-    hvx_fill_uh(mvec_l, 0, col_vec_size);
-
     __fp16 *o_tile_prev = o_tile0;
     __fp16 *o_tile_curr = o_tile1;
-
-    hvx_fill_uh(o_tile_prev, 0, qo_tile_size);
-    hvx_fill_uh(d_tile, 0, d_tile_size);
 
     int dense_jc = 0;
     int index_pos = 0;
@@ -1926,6 +4376,10 @@ int block_sparse_flash_attn_f16_core_chunked(int kv_head_idx, uint8_t *vtcm, uin
     const int32_t *index_row =
       use_host_index && index_qb >= 0 && index_qb < n_q_blocks ? block_mask + (size_t) index_qb * max_kept_blocks :
                                                                   NULL;
+    hvx_fill_uh(mvec_m, 0xfbff, col_vec_size);
+    hvx_fill_uh(mvec_l, 0, col_vec_size);
+    hvx_fill_uh(o_tile_prev, 0, qo_tile_size);
+    hvx_fill_uh(d_tile, 0, d_tile_size);
     while (1) {
       int jc = -1;
       int index_cols = 0;
@@ -2400,6 +4854,1343 @@ int block_sparse_flash_attn_f16_core_chunked(int kv_head_idx, uint8_t *vtcm, uin
   return 0;
 }
 
+/*
+ * Halo-row FlashAttention 的统一执行核心。
+ *
+ * 这个函数由两种入口共用：
+ *   - halo_l2：通过 L2 prefetch 提前准备 image K/V row；
+ *   - halo_userdma：通过 per-worker UserDMA 把 image K/V row 搬到 raw staging，
+ *     再转换为 HMX 可直接消费的 packed row。
+ *
+ * 每次调用只处理一个 KV head，以及 G = n_heads / n_kv_heads 个对应的
+ * Q heads。逻辑上的输入/输出布局为：
+ *
+ *   Q: [qo_len, n_heads,    head_dim]
+ *   K/V: [kv_len, n_kv_heads, head_dim]
+ *   O: [qo_len, n_heads,    head_dim + (with_lse ? 1 : 0)]
+ *
+ * 在 halo 场景中，KV 序列由 image tokens 和 text tokens 组成。对每个
+ * image query block，block_mask 给出需要访问的 image block；相邻 image
+ * block row 被当作 halo 一起复用，text K/V 则可常驻 VTCM。当前 Q block
+ * 的每个 K/V segment 会按以下优先级选择数据源：
+ *
+ *   1. resident_text_k/v：text K/V 已经预打包并常驻 VTCM；
+ *   2. packed_row_slots：image row 已经被 L2 或 UserDMA 准备好；
+ *   3. 临时 k_tile/v_tile：从外部 K/V 读取并现场转换为 HMX layout。
+ *
+ * 当前有效的 halo 执行走 image-Q 融合路径：先收集当前 image query 所需的
+ * halo/text segments，再一次性执行稳定的 packed-segment 更新；image query
+ * 的输出直接复用 q_tile，text query 则使用 resident state 在循环外更新。
+ * 函数内保留的逐 segment online softmax 更新代码是旧路径/防御性代码，
+ * 当前入口会在进入该路径前拒绝不满足融合条件的配置。
+ *
+ * halo_plan 描述了 VTCM workspace、packed row slot、resident text state 和
+ * DMA staging 的布局；因此本函数只接受已经完成预分配/校验的 plan，不在
+ * 这里动态申请 workspace。Q/O 的外部存储当前按 fp32 处理，VTCM 内部使用
+ * fp16 HMX tile；with_lse 为 true 时，最后额外写回每行的 LSE。
+ */
+static int block_sparse_flash_attn_f16_core_halo_rows(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
+                                             __fp16 *restrict O, const __fp16 *restrict Q,
+                                             const __fp16 *restrict K, const __fp16 *restrict V,
+                                             const int32_t *restrict block_mask, int qo_len, int kv_len, int n_heads,
+                                             int n_kv_heads, int head_dim, int block_q, int block_k, int n_q_blocks,
+                                             int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse,
+                                             int worker_index, const block_sparse_halo_plan_t *halo_plan,
+                                             int image_tokens, int text_tokens, int image_block_rows,
+                                             int image_block_cols, bool resident_text_enabled,
+                                             bool userdma_enabled, int userdma_scope, bool halo_trace,
+                                             block_sparse_halo_run_trace_t *halo_run_trace) {
+  if (userdma_enabled && userdma_scope != BLOCK_SPARSE_HALO_USERDMA_PER_WORKER) {
+    return -1;
+  }
+
+  // 一个 KV head 对应 G 个 Q heads
+  // 当前函数只处理 kv_head_idx 对应的 K/V head
+  // 以及 Q/O 中 [kv_head_idx * G, (kv_head_idx + 1) * G) 这 G 个 heads
+  const int G = n_heads / n_kv_heads;
+  const int D = head_dim;
+  const int q_head_base = kv_head_idx * G;
+  const int k_blocks_per_head = n_k_blocks / n_kv_heads;
+  const bool use_host_index =
+    mask_format == 1 && max_kept_blocks > 0 && G == 1 && block_q == HMX_FP16_TILE_N_ROWS &&
+    block_k == HMX_FP16_TILE_N_COLS;
+
+  // L2 模式提前把 image K/V 按 row 打包到 packed_row_slots；
+  // UserDMA 模式则先 DMA 到 raw staging，再使用同一组 packed row slots。
+  const bool row_l2_prefetch_enabled =
+    resident_text_enabled && !userdma_enabled && image_block_rows > 0 && image_block_cols > 0;
+
+  // 两种 halo loader 都复用 packed image row。启用后，image Q 可以直接消费
+  // packed segment，避免在每个 Q block 中重复读取/重排同一 image row。
+  const bool packed_row_reuse_enabled =
+    resident_text_enabled && image_block_rows > 0 && image_block_cols > 0 &&
+    (row_l2_prefetch_enabled || userdma_enabled);
+
+  // text Q 的状态也常驻 VTCM：先处理 image halo 对 text Q 的增量，再处理
+  // resident text K/V，最后统一写回 text Q 的 O/LSE。
+  const bool row_text_reuse_enabled =
+    resident_text_enabled && text_tokens > 0 && image_block_rows > 0 && image_block_cols > 0 &&
+    packed_row_reuse_enabled;
+
+  // 当前实现认为 Q/O 外部存储是 fp32
+  // 虽然函数参数类型是 __fp16*，
+  // 但实际通过 uint8_t* + qo_element_size 访问。
+  // qo_fp32_element = true 时：
+  //   Q/O 外部按 float 存储；
+  //   读入 VTCM 后转成 fp16 HMX tile；
+  //   写回 O 时再从 fp16 转回 float
+  const bool   qo_fp32_element = true;
+  const size_t qo_element_size = qo_fp32_element ? sizeof(float) : sizeof(__fp16);
+
+  block_sparse_fa_plan_t plan;
+  if (halo_plan != NULL) {
+    plan.mode = BLOCK_SPARSE_FA_CHUNKED;
+    plan.blk_sz_c = halo_plan->blk_sz_c;
+    plan.required_bytes = halo_plan->required_bytes;
+  } else if (block_sparse_fa_select_plan(&plan, false, G, head_dim, kv_len, vtcm_limit - vtcm) != 0) {
+    return -1;
+  }
+  const size_t blk_sz_r = HMX_FP16_TILE_N_ROWS;
+  const size_t blk_sz_c = plan.blk_sz_c;
+  if (text_tokens > INT_MAX - (HMX_FP16_TILE_N_COLS - 1)) {
+    return -1;
+  }
+  const size_t text_blk_sz_c = align_up((size_t) text_tokens, HMX_FP16_TILE_N_COLS);
+  size_t three_row_cols;
+  size_t image_q_cols;
+  if (image_block_cols <= 0 ||
+      !checked_size_mul((size_t) image_block_cols,
+                        BLOCK_SPARSE_HALO_TEXT_KV_BATCH_ROWS * HMX_FP16_TILE_N_COLS,
+                        &three_row_cols) ||
+      three_row_cols > INT_MAX ||
+      !checked_size_mul((size_t) smin(3, image_block_cols),
+                        BLOCK_SPARSE_HALO_TEXT_KV_BATCH_ROWS * HMX_FP16_TILE_N_COLS,
+                        &image_q_cols) ||
+      !checked_size_add(image_q_cols, text_blk_sz_c, &image_q_cols) ||
+      image_q_cols > INT_MAX) {
+    return -1;
+  }
+  const size_t minimum_scratch_cols =
+    smax(smax(blk_sz_c, text_blk_sz_c), smax(three_row_cols, image_q_cols));
+  const size_t scratch_blk_sz_c = halo_plan != NULL ?
+    halo_plan->scratch_col_capacity : minimum_scratch_cols;
+  if (scratch_blk_sz_c != minimum_scratch_cols || scratch_blk_sz_c > INT_MAX ||
+      scratch_blk_sz_c % HMX_FP16_TILE_N_COLS != 0) {
+    return -1;
+  }
+  assert(blk_sz_c % HMX_FP16_TILE_N_COLS == 0);
+
+  // 当前 Q block 展开 G 个 Q heads 后的行数是 G * Br
+  // 为适配 HMX FP16 tile 的行数要求，按 HMX_FP16_TILE_N_ROWS 对齐
+  // g_br 表示对齐后的 Br'
+  const size_t g_br = align_up(G * blk_sz_r, HMX_FP16_TILE_N_ROWS);
+
+  // 当前 Q block 在行方向需要多少个 HMX tile
+  const size_t n_tiles_per_blk_r = g_br / HMX_FP16_TILE_N_ROWS;
+
+  // 当前 K/V block 在列方向需要多少个 HMX tile
+  const size_t n_tiles_per_blk_c = blk_sz_c / HMX_FP16_TILE_N_COLS;
+
+  // q_tile / o_tile:
+  //   逻辑形状 [Br', D]
+  //
+  // k_tile / v_tile:
+  //   逻辑形状 [Bc, D]
+  //
+  // s_tile / p_tile:
+  //   逻辑形状 [Br', Bc]
+  //   s_tile 保存 QK^T score；
+  //   p_tile 保存 softmax numerator P
+  //
+  // d_tile:
+  //   逻辑形状 [Br', Br']
+  //   保存对角矩阵，用于：
+  //     1. alpha * O_old
+  //     2. final O / l
+  //
+  // col_vec_size:
+  //   保存每一行的 m/l/rowmax/rowsum
+  //
+  // row_vec_size:
+  //   softmax 时把 HMX tile layout 中的 S/P 解码成连续 row buffer
+  const size_t qo_tile_size   = align_up(g_br * head_dim * sizeof(__fp16), 4096);
+  const size_t kv_tile_size   = align_up(blk_sz_c * head_dim * sizeof(__fp16), 4096);
+  const size_t core_tile_size = align_up(g_br * scratch_blk_sz_c * sizeof(__fp16), 4096);
+  const size_t d_tile_size    = align_up(g_br * g_br * sizeof(__fp16), 4096);
+  const size_t col_vec_size   = align_up(g_br * sizeof(__fp16), 256);
+  const size_t row_vec_size   = align_up(scratch_blk_sz_c * sizeof(__fp16), 256);
+
+  // 原始 K/V 布局：
+  //   K/V: [kv_len, n_kv_heads, head_dim]
+  //
+  // kv_ld_blk_sz:
+  //   当前 kv_head_idx 对应的一个 head 的大小
+  //
+  // kv_ld_stride:
+  //   K/V 中一个 token 的完整 stride，即所有 KV heads 的大小
+  const size_t kv_ld_blk_sz   = head_dim;
+  const size_t kv_ld_stride   = n_kv_heads * head_dim;
+
+  // 原始 Q/O 布局：
+  //   Q: [qo_len, n_heads, head_dim]
+  //   O: [qo_len, n_heads, head_dim + (with_lse ? 1 : 0)]
+  //
+  // q_ld_blk_sz/o_st_blk_sz:
+  //   当前 kv_head_idx 对应的 G 个 Q heads 的总大小
+  //
+  // q_ld_stride/o_st_stride:
+  //   Q/O 中一个 token 的完整 stride，即所有 Q heads 的大小
+  const size_t q_ld_blk_sz = G * head_dim;
+  const size_t q_ld_stride = n_heads * head_dim;
+  const size_t o_head_dim  = head_dim + (with_lse ? 1 : 0);
+  const size_t o_st_blk_sz = G * o_head_dim;
+  const size_t o_st_stride = n_heads * o_head_dim;
+
+  const size_t halo_available_bytes = (size_t) (vtcm_limit - vtcm);
+  if (halo_plan == NULL || halo_plan->workspace_offset != 0 ||
+      halo_plan->workspace_bytes > halo_available_bytes ||
+      halo_plan->q_offset > halo_plan->workspace_bytes ||
+      qo_tile_size > halo_plan->workspace_bytes - halo_plan->q_offset ||
+      halo_plan->o_offsets[0] > halo_plan->workspace_bytes ||
+      smax(qo_tile_size, d_tile_size) > halo_plan->workspace_bytes - halo_plan->o_offsets[0] ||
+      halo_plan->o_offsets[1] != halo_plan->o_offsets[0] ||
+      halo_plan->diagonal_offset != halo_plan->o_offsets[0] ||
+      halo_plan->packed_k_bytes != kv_tile_size ||
+      halo_plan->packed_k_offset > halo_plan->workspace_bytes ||
+      kv_tile_size > halo_plan->workspace_bytes - halo_plan->packed_k_offset ||
+      halo_plan->packed_v_bytes != kv_tile_size ||
+      halo_plan->packed_v_offset > halo_plan->workspace_bytes ||
+      kv_tile_size > halo_plan->workspace_bytes - halo_plan->packed_v_offset ||
+      halo_plan->score_offset > halo_plan->workspace_bytes ||
+      core_tile_size > halo_plan->workspace_bytes - halo_plan->score_offset ||
+      halo_plan->probability_offset != halo_plan->score_offset ||
+      halo_plan->softmax_state_bytes != 2 * col_vec_size ||
+      halo_plan->softmax_state_offset > halo_plan->workspace_bytes ||
+      halo_plan->softmax_state_bytes > halo_plan->workspace_bytes - halo_plan->softmax_state_offset ||
+      halo_plan->row_buffer_bytes != 2 * row_vec_size ||
+      halo_plan->row_buffer_offset > halo_plan->workspace_bytes ||
+      halo_plan->row_buffer_bytes > halo_plan->workspace_bytes - halo_plan->row_buffer_offset ||
+      halo_plan->scales_bytes != 512 || halo_plan->scales_offset > halo_plan->workspace_bytes ||
+      halo_plan->scales_bytes > halo_plan->workspace_bytes - halo_plan->scales_offset) {
+    return -1;
+  }
+
+  __fp16 *q_tile = (__fp16 *) (vtcm + halo_plan->q_offset);
+  __fp16 *o_tile0 = (__fp16 *) (vtcm + halo_plan->o_offsets[0]);
+  __fp16 *o_tile1 = (__fp16 *) (vtcm + halo_plan->o_offsets[1]);
+  __fp16 *k_tile = (__fp16 *) (vtcm + halo_plan->packed_k_offset);
+  __fp16 *v_tile = (__fp16 *) (vtcm + halo_plan->packed_v_offset);
+  __fp16 *s_tile = (__fp16 *) (vtcm + halo_plan->score_offset);
+  __fp16 *p_tile = (__fp16 *) (vtcm + halo_plan->probability_offset);
+  __fp16 *d_tile = (__fp16 *) (vtcm + halo_plan->diagonal_offset);
+
+  HVX_Vector *mvec_s_rowmax = (HVX_Vector *) (vtcm + halo_plan->softmax_state_offset);
+  HVX_Vector *mvec_p_rowsum = (HVX_Vector *)
+    (vtcm + halo_plan->softmax_state_offset + col_vec_size);
+  // 当前 halo 执行要求走 fused image-Q 路径，因此不再单独分配 m/l：
+  // mvec_s_rowmax 和 mvec_p_rowsum 在融合更新中分别复用为 rowmax/rowsum；
+  // 下面的别名只保证被拒绝的 legacy non-fused 分支保持类型/布局完整。
+  HVX_Vector *mvec_m = mvec_s_rowmax;
+  HVX_Vector *mvec_l = mvec_p_rowsum;
+
+  HVX_Vector *row_buffer0 = (HVX_Vector *) (vtcm + halo_plan->row_buffer_offset);
+  HVX_Vector *row_buffer1 = (HVX_Vector *)
+    (vtcm + halo_plan->row_buffer_offset + row_vec_size);
+  uint8_t *hmx_output_scales_id = vtcm + halo_plan->scales_offset;
+  uint8_t *hmx_output_scales_qk = hmx_output_scales_id + 256;
+  uint8_t *vtcm_cur = vtcm + halo_plan->workspace_bytes;
+  __fp16 *resident_text_k = NULL;
+  __fp16 *resident_text_v = NULL;
+  int resident_text_tiles = 0;
+  size_t resident_text_half_bytes = 0;
+  __fp16 *resident_text_q = NULL;
+  __fp16 *resident_text_o[2] = {NULL, NULL};
+  uint8_t *resident_text_state = NULL;
+  int resident_text_q_blocks = 0;
+  block_sparse_halo_packed_row_slot_t packed_row_slots[BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS] = {};
+  if (resident_text_enabled) {
+    if (halo_plan == NULL || halo_plan->resident_text_offset < halo_plan->workspace_bytes ||
+        halo_plan->resident_text_offset > (size_t) (vtcm_limit - vtcm) ||
+        halo_plan->resident_text_bytes > (size_t) (vtcm_limit - vtcm) - halo_plan->resident_text_offset) {
+      return -1;
+    }
+    vtcm_cur = vtcm + halo_plan->resident_text_offset;
+    resident_text_tiles = ceil_div(text_tokens, HMX_FP16_TILE_N_COLS);
+    resident_text_half_bytes = halo_plan->resident_text_bytes / 2;
+    resident_text_k = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, resident_text_half_bytes);
+    resident_text_v = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, resident_text_half_bytes);
+  }
+  if (row_text_reuse_enabled) {
+    resident_text_q_blocks = block_sparse_halo_text_q_blocks(text_tokens);
+    if (resident_text_q_blocks <= 0 || halo_plan->resident_text_q_blocks != resident_text_q_blocks ||
+        image_tokens < 0 || text_tokens > qo_len - image_tokens ||
+        halo_plan->resident_text_q_bytes != (size_t) resident_text_q_blocks * qo_tile_size ||
+        halo_plan->resident_text_o_bytes != (size_t) resident_text_q_blocks * qo_tile_size ||
+        halo_plan->resident_text_state_bytes != (size_t) resident_text_q_blocks * 2 * col_vec_size ||
+        halo_plan->resident_text_q_offset > halo_available_bytes ||
+        halo_plan->resident_text_q_bytes > halo_available_bytes - halo_plan->resident_text_q_offset ||
+        halo_plan->resident_text_o_offsets[0] > halo_available_bytes ||
+        halo_plan->resident_text_o_bytes > halo_available_bytes - halo_plan->resident_text_o_offsets[0] ||
+        halo_plan->resident_text_o_offsets[1] > halo_available_bytes ||
+        halo_plan->resident_text_o_bytes > halo_available_bytes - halo_plan->resident_text_o_offsets[1] ||
+        halo_plan->resident_text_state_offset > halo_available_bytes ||
+        halo_plan->resident_text_state_bytes > halo_available_bytes - halo_plan->resident_text_state_offset) {
+      return -1;
+    }
+    resident_text_q = (__fp16 *) (vtcm + halo_plan->resident_text_q_offset);
+    resident_text_o[0] = (__fp16 *) (vtcm + halo_plan->resident_text_o_offsets[0]);
+    resident_text_o[1] = (__fp16 *) (vtcm + halo_plan->resident_text_o_offsets[1]);
+    resident_text_state = vtcm + halo_plan->resident_text_state_offset;
+  }
+  if (packed_row_reuse_enabled) {
+    if (halo_plan == NULL ||
+        halo_plan->packed_image_row_slot_count != BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS ||
+        halo_plan->packed_image_row_stride == 0 ||
+        (halo_plan->packed_image_row_stride & 1u) != 0 ||
+        halo_plan->packed_image_row_bytes !=
+          BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS * halo_plan->packed_image_row_stride) {
+      return -1;
+    }
+    const size_t packed_row_half_bytes = halo_plan->packed_image_row_stride / 2;
+    for (int slot = 0; slot < BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS; ++slot) {
+      const size_t row_offset = halo_plan->packed_image_row_offsets[slot];
+      if (row_offset > halo_available_bytes ||
+          halo_plan->packed_image_row_stride > halo_available_bytes - row_offset) {
+        return -1;
+      }
+      packed_row_slots[slot].packed_k = (__fp16 *) (vtcm + row_offset);
+      packed_row_slots[slot].packed_v = (__fp16 *) (vtcm + row_offset + packed_row_half_bytes);
+      packed_row_slots[slot].row_id = -1;
+    }
+  }
+  assert(vtcm_cur <= vtcm_limit);
+
+  // qk_scale 用于 attention score：
+  //
+  //   QK^T / sqrt(D)
+  //
+  // 但后面 softmax 用的是 exp2，而不是 exp
+  // 因此这里提前乘上 log2(e)
+  float  qk_scale    = 1.0f / sqrtf(head_dim) * 1.44269504f;
+  __fp16 qk_scale_hf = (__fp16) qk_scale;
+
+  // 初始化 HMX 输出 scale
+  // 0x3c00 是 fp16 1.0
+  hmx_init_column_scales(hmx_output_scales_id, Q6_V_vsplat_R(0x3c00));
+
+  // QK^T 输出时直接乘 qk_scale_hf
+  hmx_init_column_scales(hmx_output_scales_qk, Q6_V_vsplat_R(fp16_to_bits(&qk_scale_hf)));
+
+  // d_tile_vscatter_offsets 用于生成对角矩阵 D tile
+  // offsets 指向 HMX tile layout 中对角线元素的位置
+  static int16_t d_tile_vscatter_offsets[64] __vec_aligned__;
+  for (int i = 0; i < 16; ++i) {
+    d_tile_vscatter_offsets[i * 2 + 0] = i * 136;
+    d_tile_vscatter_offsets[i * 2 + 1] = i * 136 + 6;
+  }
+  const float stable_lse_scale = 1.0f / ((float) qk_scale_hf * sqrtf((float) D));
+  block_sparse_halo_update_scratch_t halo_update_scratch = {
+    .score = s_tile,
+    .probability = p_tile,
+    .diagonal = d_tile,
+    .rowmax = mvec_s_rowmax,
+    .rowsum = mvec_p_rowsum,
+    .row_buffer0 = row_buffer0,
+    .row_buffer1 = row_buffer1,
+  };
+
+  int64_t text_pack_us = 0;
+  uint64_t requested_k_bytes = 0;
+  uint64_t requested_v_bytes = 0;
+  int halo_prefetch_rows = 0;
+  int packed_image_rows = 0;
+  int packed_image_blocks = 0;
+  int image_q_direct_segment_uses = 0;
+  int text_q_image_row_updates = 0;
+  int text_q_image_block_updates = 0;
+  int text_q_image_batches = 0;
+  int image_q_batch_updates = 0;
+  int image_q_segment_updates = 0;
+  int resident_text_segments = 0;
+  int64_t startup_row_pack_us = 0;
+  int64_t boundary_row_pack_us = 0;
+  int64_t text_q_image_update_us = 0;
+  int64_t text_q_resident_update_us = 0;
+  int64_t text_q_init_us = 0;
+  int64_t text_q_store_us = 0;
+  int64_t image_q_normal_us = 0;
+  int64_t image_q_output_us = 0;
+  if (resident_text_enabled) {
+    const int64_t text_pack_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+    hvx_fill_uh(resident_text_k, 0, resident_text_half_bytes);
+    hvx_fill_uh(resident_text_v, 0, resident_text_half_bytes);
+    if (text_tokens > 0) {
+      const __fp16 *text_k = K + (size_t) image_tokens * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+      const __fp16 *text_v = V + (size_t) image_tokens * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+      l2fetch(text_k, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), text_tokens, 1);
+      block_sparse_pack_k_f16(resident_text_k, text_k, (int) kv_ld_stride, text_tokens, D);
+      l2fetch(text_v, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), text_tokens, 1);
+      block_sparse_pack_v_f16(resident_text_v, text_v, (int) kv_ld_stride, text_tokens,
+                              resident_text_tiles * HMX_FP16_TILE_N_COLS, D);
+    }
+    if (halo_trace) {
+      text_pack_us = HAP_perf_get_time_us() - text_pack_begin;
+    }
+  }
+  if (row_text_reuse_enabled) {
+    const int64_t text_q_init_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+    hvx_fill_uh(resident_text_q, 0, halo_plan->resident_text_q_bytes);
+    hvx_fill_uh(resident_text_o[0], 0, halo_plan->resident_text_o_bytes);
+    for (int text_q_block = 0; text_q_block < resident_text_q_blocks; ++text_q_block) {
+      const int n_text_rows = block_sparse_halo_text_q_rows(text_tokens, text_q_block);
+      const int q_token = image_tokens + text_q_block * HMX_FP16_TILE_N_ROWS;
+      const float *raw_text_q = (const float *) Q +
+        (size_t) q_token * q_ld_stride + kv_head_idx * q_ld_blk_sz;
+      __fp16 *packed_text_q = (__fp16 *) ((uint8_t *) resident_text_q +
+        (size_t) text_q_block * qo_tile_size);
+      if (n_text_rows <= 0 ||
+          block_sparse_halo_pack_q_f32(packed_text_q, raw_text_q, q_ld_stride,
+                                       n_text_rows, D) != 0) {
+        return -1;
+      }
+
+      uint8_t *text_state_block = resident_text_state +
+        (size_t) text_q_block * 2 * col_vec_size;
+      hvx_fill_uh(text_state_block, 0xfbff, col_vec_size);
+      hvx_fill_uh(text_state_block + col_vec_size, 0, col_vec_size);
+    }
+    if (halo_trace) {
+      text_q_init_us = HAP_perf_get_time_us() - text_q_init_begin;
+    }
+  }
+
+  int resident_text_o_bank = 0;
+  int text_q_next_pending_row = 0;
+  int last_image_prefetched_row = -1;
+  int packed_last_q_row = -1;
+  if (row_l2_prefetch_enabled) {
+    if (image_block_rows < 2) {
+      return -1;
+    }
+    const int row_tokens = image_block_cols * block_k;
+    const uint64_t row_bytes = (uint64_t) row_tokens * (uint64_t) head_dim * sizeof(__fp16);
+    for (int row = 0; row < 2; ++row) {
+      const int64_t pack_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+      if (block_sparse_halo_pack_image_row(&packed_row_slots[row], K, V, n_kv_heads,
+                                           kv_head_idx, D, image_block_cols, row) != 0) {
+        return -1;
+      }
+      if (halo_trace) {
+        startup_row_pack_us += HAP_perf_get_time_us() - pack_begin;
+      }
+      ++packed_image_rows;
+      packed_image_blocks += image_block_cols;
+    }
+    if (image_block_rows > 2) {
+      block_sparse_halo_l2_prefetch_image_row(K, V, n_kv_heads, kv_head_idx, head_dim,
+                                              block_k, image_block_cols, 2);
+      ++halo_prefetch_rows;
+      requested_k_bytes += row_bytes;
+      requested_v_bytes += row_bytes;
+      last_image_prefetched_row = 2;
+    }
+  }
+
+  block_sparse_halo_row_slot_t dma_row_slots[BLOCK_SPARSE_HALO_RAW_STAGING_SLOTS] = {};
+  _Alignas(64) dma_desc_2d_t dma_desc_storage[BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW];
+  int dma_pending_slot = -1;
+  int dma_pending_row = -1;
+  int dma_last_q_row = -1;
+  uint64_t dma_requested_bytes = 0;
+  int dma_image_query_rows_loaded = 0;
+  int dma_async_rows_loaded = 0;
+  int dma_descriptors_submitted = 0;
+  int64_t dma_submit_us = 0;
+  int64_t dma_overlap_window_us = 0;
+  int64_t dma_exposed_wait_us = 0;
+  int64_t dma_pack_us = 0;
+  int64_t dma_pending_submit_done_us = 0;
+  const int dma_image_blocks = image_tokens / block_k;
+  const uint64_t dma_row_transfer_bytes = userdma_enabled ?
+    (uint64_t) image_block_cols * (uint64_t) block_k * (uint64_t) head_dim * sizeof(__fp16) * 2u : 0;
+  if (userdma_enabled) {
+    if (halo_plan == NULL || halo_plan->image_row_stride == 0 || image_block_rows <= 0 || image_block_cols <= 0 ||
+        halo_plan->image_row_bytes == 0 ||
+        halo_plan->image_row_bytes > (size_t) (vtcm_limit - vtcm)) {
+      return -1;
+    }
+    for (int slot = 0; slot < BLOCK_SPARSE_HALO_RAW_STAGING_SLOTS; ++slot) {
+      dma_row_slots[slot].raw = vtcm + halo_plan->image_row_offsets[slot];
+      dma_row_slots[slot].row_id = -1;
+    }
+    const int startup_rows = smin(image_block_rows, 2);
+    for (int row = 0; row < startup_rows; ++row) {
+      const int64_t pack_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+      if (block_sparse_halo_pack_image_row(&packed_row_slots[row], K, V, n_kv_heads,
+                                           kv_head_idx, D, image_block_cols, row) != 0) {
+        return -1;
+      }
+      if (halo_trace) {
+        startup_row_pack_us += HAP_perf_get_time_us() - pack_begin;
+      }
+      ++packed_image_rows;
+      packed_image_blocks += image_block_cols;
+    }
+  }
+
+#define BLOCK_SPARSE_HALO_CORE_FAIL()                                                              \
+  do {                                                                                             \
+    if (userdma_enabled && dma_pending_slot >= 0) {                                                \
+      block_sparse_halo_row_dma_drain(dma_desc_storage, BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW,      \
+                                      userdma_scope, worker_index,                                 \
+                                      &dma_row_slots[dma_pending_slot].outstanding);                \
+    }                                                                                              \
+    return -1;                                                                                     \
+  } while (0)
+
+  // 外层循环按 Q/O token 方向分块。
+  // row-reuse 模式只在这里处理 image Q；text Q 使用常驻的 Q/O/softmax state，
+  // 在 image row 处理完后统一更新和写回。
+  const int q_loop_tokens = row_text_reuse_enabled ? image_tokens : qo_len;
+  const int q_block_count = (int) ceil_div(q_loop_tokens, blk_sz_r);
+  for (int ir = 0; ir < q_loop_tokens; ir += blk_sz_r) {
+    const size_t n_rows      = smin(q_loop_tokens - ir, blk_sz_r);
+    const size_t n_rows_g    = n_rows * G;
+    const size_t n_row_tiles = ceil_div(n_rows_g, HMX_FP16_TILE_N_ROWS);
+
+    if (row_l2_prefetch_enabled) {
+      const int q_image_block = ir / block_q;
+      const int q_image_row = q_image_block / image_block_cols;
+      if (q_image_row != packed_last_q_row) {
+        const int incoming_row = q_image_row + 1;
+        if (q_image_row > 0 && incoming_row < image_block_rows &&
+            block_sparse_halo_find_packed_row(packed_row_slots, incoming_row) < 0) {
+          const int first_protected_row = q_image_row - 1;
+          const int protected_rows = smin(2, image_block_rows - first_protected_row);
+          const int victim = block_sparse_halo_select_packed_row_victim(
+            packed_row_slots, first_protected_row, protected_rows);
+          const int64_t pack_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+          if (victim < 0 ||
+              (row_text_reuse_enabled &&
+               packed_row_slots[victim].row_id >= text_q_next_pending_row) ||
+              block_sparse_halo_pack_image_row(
+                &packed_row_slots[victim], K, V, n_kv_heads, kv_head_idx, D,
+                image_block_cols, incoming_row) != 0) {
+            BLOCK_SPARSE_HALO_CORE_FAIL();
+          }
+          if (halo_trace) {
+            boundary_row_pack_us += HAP_perf_get_time_us() - pack_begin;
+          }
+          ++packed_image_rows;
+          packed_image_blocks += image_block_cols;
+
+          const int next_prefetch_row = incoming_row + 1;
+          if (next_prefetch_row < image_block_rows &&
+              next_prefetch_row > last_image_prefetched_row) {
+            block_sparse_halo_l2_prefetch_image_row(K, V, n_kv_heads, kv_head_idx, head_dim,
+                                                    block_k, image_block_cols, next_prefetch_row);
+            last_image_prefetched_row = next_prefetch_row;
+            ++halo_prefetch_rows;
+            const uint64_t row_bytes = (uint64_t) image_block_cols * (uint64_t) block_k *
+                                       (uint64_t) head_dim * sizeof(__fp16);
+            requested_k_bytes += row_bytes;
+            requested_v_bytes += row_bytes;
+          }
+
+          if (row_text_reuse_enabled) {
+            block_sparse_halo_text_kv_batch_t batch;
+            const int64_t text_update_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+            if (block_sparse_halo_plan_text_kv_batch(
+                  &batch, packed_row_slots, text_q_next_pending_row, incoming_row,
+                  image_block_rows, false) != 0 ||
+                (batch.row_count > 0 &&
+                 block_sparse_halo_update_resident_text_q_from_packed_batch(
+                   packed_row_slots, &batch, image_block_cols,
+                   resident_text_q, resident_text_o, resident_text_state,
+                   resident_text_q_blocks, text_tokens, qo_tile_size, col_vec_size,
+                   &resident_text_o_bank, &halo_update_scratch,
+                   (int) scratch_blk_sz_c, D, hmx_output_scales_qk,
+                   hmx_output_scales_id, d_tile_vscatter_offsets) != 0)) {
+              BLOCK_SPARSE_HALO_CORE_FAIL();
+            }
+            if (batch.row_count > 0) {
+              text_q_next_pending_row = batch.next_pending_row;
+              text_q_image_row_updates += batch.row_count * resident_text_q_blocks;
+              text_q_image_block_updates +=
+                batch.row_count * resident_text_q_blocks * image_block_cols;
+              ++text_q_image_batches;
+              if (halo_trace) {
+                text_q_image_update_us += HAP_perf_get_time_us() - text_update_begin;
+              }
+            }
+          }
+        }
+        const int first_active_row = q_image_row > 0 ? q_image_row - 1 : 0;
+        const int last_active_row = smin(image_block_rows - 1, q_image_row + 1);
+        for (int row = first_active_row; row <= last_active_row; ++row) {
+          if (block_sparse_halo_find_packed_row(packed_row_slots, row) < 0) {
+            BLOCK_SPARSE_HALO_CORE_FAIL();
+          }
+        }
+        packed_last_q_row = q_image_row;
+      }
+    }
+
+    if (userdma_enabled) {
+      const int q_image_block = ir / block_q;
+      const int q_image_row = q_image_block / image_block_cols;
+      if (q_image_row != dma_last_q_row) {
+        block_sparse_halo_row_schedule_t row_schedule;
+        if (block_sparse_halo_schedule_q_row(&row_schedule, q_image_row, image_block_rows) != 0) {
+          BLOCK_SPARSE_HALO_CORE_FAIL();
+        }
+
+        int completed_row = -1;
+        int completed_packed_slot = -1;
+        if (dma_pending_row >= 0) {
+          if (dma_pending_row != q_image_row + 1 || dma_pending_slot != 0 ||
+              dma_row_slots[0].row_id != dma_pending_row || !dma_row_slots[0].outstanding) {
+            BLOCK_SPARSE_HALO_CORE_FAIL();
+          }
+          completed_row = dma_pending_row;
+          const int64_t wait_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+          if (halo_trace && dma_pending_submit_done_us > 0 && wait_begin >= dma_pending_submit_done_us) {
+            dma_overlap_window_us += wait_begin - dma_pending_submit_done_us;
+          }
+          if (block_sparse_halo_row_dma_wait(
+                dma_desc_storage, BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW,
+                userdma_scope, worker_index, &dma_row_slots[0].outstanding) != DMA_SUBMIT_OK) {
+            BLOCK_SPARSE_HALO_CORE_FAIL();
+          }
+          if (halo_trace) {
+            dma_exposed_wait_us += HAP_perf_get_time_us() - wait_begin;
+          }
+          dma_row_slots[0].ready = true;
+
+          completed_packed_slot = block_sparse_halo_select_packed_row_victim(
+            packed_row_slots, q_image_row - 1, 2);
+          const int64_t pack_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+          if (completed_packed_slot < 0 ||
+              (row_text_reuse_enabled &&
+               packed_row_slots[completed_packed_slot].row_id >= text_q_next_pending_row) ||
+              block_sparse_halo_pack_staged_row(
+                &packed_row_slots[completed_packed_slot], &dma_row_slots[0],
+                image_block_cols, D) != 0) {
+            BLOCK_SPARSE_HALO_CORE_FAIL();
+          }
+          if (halo_trace) {
+            dma_pack_us += HAP_perf_get_time_us() - pack_begin;
+          }
+          ++packed_image_rows;
+          packed_image_blocks += image_block_cols;
+          dma_pending_slot = -1;
+          dma_pending_row = -1;
+          dma_pending_submit_done_us = 0;
+        }
+
+        const int first_active_row = row_schedule.first_active_row;
+        const int last_active_row = first_active_row + row_schedule.active_row_count - 1;
+        for (int row = first_active_row; row <= last_active_row; ++row) {
+          if (block_sparse_halo_find_packed_row(packed_row_slots, row) < 0) {
+            BLOCK_SPARSE_HALO_CORE_FAIL();
+          }
+        }
+
+        const int incoming_row = row_schedule.load_row;
+        if (incoming_row >= 0) {
+          const int64_t submit_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+          if (dma_pending_row >= 0 || dma_row_slots[0].outstanding ||
+              block_sparse_halo_row_dma_load_async(
+                &dma_row_slots[0], dma_desc_storage, K, V, n_kv_heads, kv_head_idx,
+                head_dim, image_block_cols, incoming_row, userdma_scope, worker_index) != 0) {
+            BLOCK_SPARSE_HALO_CORE_FAIL();
+          }
+          dma_pending_submit_done_us = halo_trace ? HAP_perf_get_time_us() : 0;
+          if (halo_trace) {
+            dma_submit_us += dma_pending_submit_done_us - submit_begin;
+          }
+          ++dma_image_query_rows_loaded;
+          ++dma_async_rows_loaded;
+          dma_descriptors_submitted += BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW;
+          dma_requested_bytes += dma_row_transfer_bytes;
+          dma_pending_slot = 0;
+          dma_pending_row = incoming_row;
+        }
+
+        if (completed_row >= 0 && row_text_reuse_enabled) {
+          block_sparse_halo_text_kv_batch_t batch;
+          const int64_t text_update_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+          if (block_sparse_halo_plan_text_kv_batch(
+                &batch, packed_row_slots, text_q_next_pending_row, completed_row,
+                image_block_rows, false) != 0 ||
+              (batch.row_count > 0 &&
+               block_sparse_halo_update_resident_text_q_from_packed_batch(
+                 packed_row_slots, &batch, image_block_cols,
+                 resident_text_q, resident_text_o, resident_text_state,
+                 resident_text_q_blocks, text_tokens, qo_tile_size, col_vec_size,
+                 &resident_text_o_bank, &halo_update_scratch,
+                 (int) scratch_blk_sz_c, D, hmx_output_scales_qk,
+                 hmx_output_scales_id, d_tile_vscatter_offsets) != 0)) {
+            BLOCK_SPARSE_HALO_CORE_FAIL();
+          }
+          if (batch.row_count > 0) {
+            text_q_next_pending_row = batch.next_pending_row;
+            text_q_image_row_updates += batch.row_count * resident_text_q_blocks;
+            text_q_image_block_updates +=
+              batch.row_count * resident_text_q_blocks * image_block_cols;
+            ++text_q_image_batches;
+            if (halo_trace) {
+              text_q_image_update_us += HAP_perf_get_time_us() - text_update_begin;
+            }
+          }
+        }
+        dma_last_q_row = q_image_row;
+      }
+    }
+
+    // load [n_rows * G, D] tile of Q into VTCM
+    {
+      const size_t q_ld_blk_sz_bytes = q_ld_blk_sz * qo_element_size;
+      const size_t q_ld_stride_bytes = q_ld_stride * qo_element_size;
+
+      const uint8_t *q_ld_base = ((uint8_t *) Q) + ir * q_ld_stride_bytes + kv_head_idx * q_ld_blk_sz_bytes;
+
+      l2fetch(q_ld_base, q_ld_stride_bytes, q_ld_blk_sz_bytes, n_rows, 1);
+
+      // Keep only the immediately following Q block hot. The next block is
+      // consumed in the next iteration, while larger row-wide prefetches
+      // would unnecessarily increase L2 pressure on the resident K/V data.
+      const int current_q_block = ir / (int) blk_sz_r;
+      const int next_q_block = block_sparse_halo_next_q_block(current_q_block, q_block_count);
+      if (next_q_block >= 0) {
+        const int next_ir = ir + (int) blk_sz_r;
+        const size_t next_n_rows = smin(q_loop_tokens - next_ir, (int) blk_sz_r);
+        const uint8_t *next_q_ld_base =
+          ((uint8_t *) Q) + next_ir * q_ld_stride_bytes + kv_head_idx * q_ld_blk_sz_bytes;
+        l2fetch(next_q_ld_base, q_ld_stride_bytes, q_ld_blk_sz_bytes, next_n_rows, 1);
+      }
+
+      for (int r = 0; r < n_rows_g; r += 2) {
+        const bool next_row_valid = (r + 1) < n_rows_g;
+
+        int q_idx0 = (r + 0) / G;
+        int h_idx0 = (r + 0) % G;
+        int q_idx1 = (r + 1) / G;
+        int h_idx1 = (r + 1) % G;
+
+        const HVX_Vector *pv_in0 =
+          (const HVX_Vector *) (q_ld_base + q_idx0 * q_ld_stride_bytes + h_idx0 * head_dim * qo_element_size);
+        const HVX_Vector *pv_in1 =
+          (const HVX_Vector *) (q_ld_base + q_idx1 * q_ld_stride_bytes + h_idx1 * head_dim * qo_element_size);
+
+        int r0 = r / HMX_FP16_TILE_N_ROWS;
+        int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+        __fp16 *out_base = q_tile + r0 * HMX_FP16_TILE_N_ROWS * head_dim;
+
+        if (qo_fp32_element) {
+#pragma unroll
+          for (int d = 0; d < D / 32; ++d) {
+            const HVX_Vector v0    = *pv_in0++;
+            const HVX_Vector v1    = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+            const HVX_Vector v_out = hvx_my_wsf_to_vhf(v1, v0);
+
+            HVX_Vector *out_tile = (HVX_Vector *) (out_base + d * HMX_FP16_TILE_N_ELMS);
+            out_tile[r1 / 2]     = v_out;
+          }
+        } else {
+#pragma unroll
+          for (int d = 0; d < D / 64; ++d) {
+            const HVX_Vector     v0 = *pv_in0++;
+            const HVX_Vector     v1 = next_row_valid ? *pv_in1++ : Q6_V_vzero();
+            const HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
+
+            __fp16     *out_dual_tile = out_base + d * HMX_FP16_TILE_N_ELMS * 2;
+            HVX_Vector *pv_out0       = ((HVX_Vector *) out_dual_tile) + r1 / 2;
+            HVX_Vector *pv_out1       = pv_out0 + 16;
+
+            *pv_out0 = Q6_V_lo_W(vp);
+            *pv_out1 = Q6_V_hi_W(vp);
+          }
+        }
+      }
+    }
+
+    __fp16 *o_tile_prev = o_tile0;
+    __fp16 *o_tile_curr = o_tile1;
+
+    int dense_jc = 0;
+    int index_pos = 0;
+    const int index_qb = block_sparse_q_block_for_group_row(block_q, n_q_blocks, n_heads, ir, 0, q_head_base, G);
+    const int32_t *index_row =
+      use_host_index && index_qb >= 0 && index_qb < n_q_blocks ? block_mask + (size_t) index_qb * max_kept_blocks :
+                                                                  NULL;
+    block_sparse_halo_row_t halo_row = {0};
+    const int halo_image_blocks = image_tokens / HMX_FP16_TILE_N_COLS;
+    if (resident_text_enabled) {
+      const int q_blocks_per_head = n_q_blocks / n_heads;
+      if (block_sparse_halo_parse_row(&halo_row, index_row, max_kept_blocks, index_qb, q_blocks_per_head,
+                                      k_blocks_per_head, halo_image_blocks) != 0) {
+        BLOCK_SPARSE_HALO_CORE_FAIL();
+      }
+    }
+    // packed-row + host-index 是融合 image-Q 更新的必要条件：
+    // 当前 Q block 必须能从 block_mask 解析出完整的 halo image row 集合，
+    // 并把这些 segment 连同 text segment 一起提交给稳定更新例程。
+    const bool fuse_image_q =
+      packed_row_reuse_enabled && use_host_index && !halo_row.is_text_query;
+    if (!fuse_image_q) {
+      BLOCK_SPARSE_HALO_CORE_FAIL();
+    }
+    block_sparse_halo_update_segment_t image_q_segments[BLOCK_SPARSE_HALO_MAX_UPDATE_SEGMENTS] = {0};
+    int image_q_segment_count = 0;
+    int image_q_image_segment_count = 0;
+    int image_q_gathered_image_blocks = 0;
+    int image_q_last_image_row = -1;
+    bool image_q_text_seen = false;
+    while (1) {
+      int jc = -1;
+      int index_cols = 0;
+      int raw_row_id = -1;
+      int raw_col_start = -1;
+      int raw_block_count = 0;
+      if (use_host_index) {
+        bool found_index_chunk = false;
+        while (index_row != NULL && index_pos < max_kept_blocks) {
+          const int kb_abs = index_row[index_pos++];
+          if (kb_abs < 0) {
+            break;
+          }
+          if (kb_abs < 0 || kb_abs >= n_k_blocks || kb_abs / k_blocks_per_head != kv_head_idx) {
+            continue;
+          }
+          const int start_block_in_head = kb_abs % k_blocks_per_head;
+          int end_block_in_head = start_block_in_head + 1;
+          while (index_pos < max_kept_blocks) {
+            const int next_kb_abs = index_row[index_pos];
+            if (next_kb_abs < 0 || next_kb_abs >= n_k_blocks || next_kb_abs / k_blocks_per_head != kv_head_idx) {
+              break;
+            }
+            const int next_block_in_head = next_kb_abs % k_blocks_per_head;
+            const int current_cols = (end_block_in_head - start_block_in_head) * block_k;
+            const int merge_max_cols =
+              packed_row_reuse_enabled && start_block_in_head >= dma_image_blocks && text_blk_sz_c > 0 ?
+                (int) text_blk_sz_c : (int) blk_sz_c;
+            if (!block_sparse_halo_can_merge_index_block(
+                  packed_row_reuse_enabled,
+                  start_block_in_head, next_block_in_head, dma_image_blocks,
+                  image_block_cols, current_cols, merge_max_cols)) {
+              break;
+            }
+            ++index_pos;
+            ++end_block_in_head;
+          }
+          jc = start_block_in_head * block_k;
+          index_cols = (end_block_in_head - start_block_in_head) * block_k;
+          if (packed_row_reuse_enabled && start_block_in_head < dma_image_blocks) {
+            raw_row_id = start_block_in_head / image_block_cols;
+            raw_col_start = start_block_in_head % image_block_cols;
+            raw_block_count = index_cols / block_k;
+          }
+          if (jc + index_cols > kv_len) {
+            index_cols = kv_len - jc;
+          }
+          if (index_cols <= 0) {
+            continue;
+          }
+          found_index_chunk = true;
+          break;
+        }
+        if (!found_index_chunk) {
+          break;
+        }
+      } else {
+        if (dense_jc >= kv_len) {
+          break;
+        }
+        jc = dense_jc;
+        dense_jc += blk_sz_c;
+      }
+      const size_t n_real_cols = use_host_index ? (size_t) index_cols : smin(kv_len - jc, blk_sz_c);
+      const bool use_resident_text = resident_text_enabled && jc >= image_tokens;
+      const bool mixed_image_text = resident_text_enabled && jc < image_tokens &&
+                                    jc + (int) n_real_cols > image_tokens;
+      const bool use_packed_row = packed_row_reuse_enabled && raw_row_id >= 0;
+      block_sparse_halo_packed_segment_t packed_segment = {};
+      if (use_packed_row) {
+        const int packed_slot_index = block_sparse_halo_find_packed_row(packed_row_slots, raw_row_id);
+        if (packed_slot_index < 0 || raw_block_count <= 0 || raw_block_count > image_block_cols ||
+            block_sparse_halo_get_packed_segment(
+              &packed_segment, &packed_row_slots[packed_slot_index], raw_col_start,
+              raw_block_count, image_block_cols, D) != 0) {
+          BLOCK_SPARSE_HALO_CORE_FAIL();
+        }
+        ++image_q_direct_segment_uses;
+      }
+      const int resident_text_tile_start = use_resident_text ?
+        (jc - image_tokens) / HMX_FP16_TILE_N_COLS : 0;
+      const __fp16 *active_k_tile = k_tile;
+      const __fp16 *active_v_tile = v_tile;
+      int active_v_tile_stride = (int) n_tiles_per_blk_c;
+
+      // load [Bc, D] tile of K^T into VTCM
+      // K tile 会被转置/重排成 HMX RHS 需要的布局
+      if (use_resident_text) {
+        active_k_tile = resident_text_k +
+          (size_t) resident_text_tile_start * HMX_FP16_TILE_N_COLS * head_dim;
+      } else if (use_packed_row) {
+        active_k_tile = packed_segment.packed_k;
+      } else {
+        const __fp16 *k_ld_base = K + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+        const int k_ddr_cols = mixed_image_text ? image_tokens - jc : (int) n_real_cols;
+
+        l2fetch(k_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), k_ddr_cols, 1);
+        block_sparse_pack_k_f16(k_tile, k_ld_base, (int) kv_ld_stride, k_ddr_cols, D);
+        if (mixed_image_text) {
+          assert(k_ddr_cols == HMX_FP16_TILE_N_COLS);
+          memcpy(k_tile + (size_t) k_ddr_cols * head_dim,
+                 resident_text_k,
+                 (size_t) HMX_FP16_TILE_N_COLS * head_dim * sizeof(__fp16));
+        }
+      }
+
+      // 预取当前 block 对应的 V
+      if (!use_resident_text && !use_packed_row) {
+        const __fp16 *v_ld_base = V + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+        const int v_ddr_cols = mixed_image_text ? image_tokens - jc : (int) n_real_cols;
+        l2fetch(v_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), v_ddr_cols, 0);
+      }
+
+      // load [Bc, D] tile of V into VTCM
+      // 与 K 类似，V 也要重排成 HMX RHS 可直接消费的布局
+      if (use_resident_text) {
+        active_v_tile = resident_text_v + (size_t) resident_text_tile_start * HMX_FP16_TILE_N_ELMS;
+        active_v_tile_stride = resident_text_tiles;
+      } else if (use_packed_row) {
+        active_v_tile = packed_segment.packed_v;
+        active_v_tile_stride = packed_segment.v_tile_stride;
+      } else {
+        const __fp16 *v_ld_base = V + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+        const int v_ddr_cols = mixed_image_text ? image_tokens - jc : (int) n_real_cols;
+        block_sparse_pack_v_f16(v_tile, v_ld_base, (int) kv_ld_stride, v_ddr_cols, (int) blk_sz_c, D);
+        if (mixed_image_text) {
+          const int dst_tile = v_ddr_cols / HMX_FP16_TILE_N_COLS;
+          const int copy_tiles = ceil_div((int) n_real_cols - v_ddr_cols, HMX_FP16_TILE_N_COLS);
+          for (int d = 0; d < D / HMX_FP16_TILE_N_COLS; ++d) {
+            memcpy(v_tile + ((size_t) d * n_tiles_per_blk_c + dst_tile) * HMX_FP16_TILE_N_ELMS,
+                   resident_text_v + (size_t) d * resident_text_tiles * HMX_FP16_TILE_N_ELMS,
+                   (size_t) copy_tiles * HMX_FP16_TILE_SIZE);
+          }
+        }
+      }
+
+      if (fuse_image_q) {
+        if (mixed_image_text || image_q_segment_count >= BLOCK_SPARSE_HALO_MAX_UPDATE_SEGMENTS) {
+          BLOCK_SPARSE_HALO_CORE_FAIL();
+        }
+        if (use_resident_text) {
+          if (image_q_text_seen || jc != image_tokens || resident_text_tile_start != 0 ||
+              n_real_cols != (size_t) text_tokens) {
+            BLOCK_SPARSE_HALO_CORE_FAIL();
+          }
+          image_q_text_seen = true;
+        } else {
+          if (!use_packed_row || image_q_text_seen || raw_row_id <= image_q_last_image_row ||
+              raw_block_count <= 0 || block_k <= 0 || raw_block_count > INT_MAX / block_k ||
+              n_real_cols != (size_t) (raw_block_count * block_k)) {
+            BLOCK_SPARSE_HALO_CORE_FAIL();
+          }
+          image_q_last_image_row = raw_row_id;
+          image_q_gathered_image_blocks += raw_block_count;
+          ++image_q_image_segment_count;
+        }
+        image_q_segments[image_q_segment_count++] = (block_sparse_halo_update_segment_t) {
+          .packed_k = active_k_tile,
+          .packed_v = active_v_tile,
+          .v_tile_stride = active_v_tile_stride,
+          .n_real_cols = (int) n_real_cols,
+        };
+        continue;
+      }
+
+      block_sparse_halo_q_state_t q_state = {
+        .q = q_tile,
+        .o_prev = o_tile_prev,
+        .o_next = o_tile_curr,
+        .m = mvec_m,
+        .l = mvec_l,
+        .n_rows = (int) n_rows_g,
+      };
+      if (block_sparse_halo_update_packed_segment(
+            &q_state, &halo_update_scratch, active_k_tile, active_v_tile, active_v_tile_stride,
+            (int) n_real_cols, (int) scratch_blk_sz_c, D, hmx_output_scales_qk,
+            hmx_output_scales_id, d_tile_vscatter_offsets) != 0) {
+        BLOCK_SPARSE_HALO_CORE_FAIL();
+      }
+      o_tile_prev = q_state.o_prev;
+      o_tile_curr = q_state.o_next;
+
+    }
+
+    if (fuse_image_q) {
+      const int image_q_row = (ir / block_q) / image_block_cols;
+      const int expected_image_segments =
+        1 + (image_q_row > 0 ? 1 : 0) + (image_q_row + 1 < image_block_rows ? 1 : 0);
+      const int expected_text_segments = text_tokens > 0 ? 1 : 0;
+      if (image_q_row < 0 || image_q_row >= image_block_rows ||
+          image_q_image_segment_count != expected_image_segments ||
+          image_q_gathered_image_blocks != halo_row.image_count ||
+          image_q_text_seen != (text_tokens > 0) ||
+          image_q_segment_count != image_q_image_segment_count + expected_text_segments) {
+        BLOCK_SPARSE_HALO_CORE_FAIL();
+      }
+
+      const int64_t image_q_normal_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+      if (block_sparse_halo_stable_normal_packed_segments(
+            q_tile, o_tile0, &halo_update_scratch, image_q_segments, image_q_segment_count,
+            (int) n_rows_g, (int) scratch_blk_sz_c, D, hmx_output_scales_qk,
+            hmx_output_scales_id, d_tile_vscatter_offsets) != 0) {
+        BLOCK_SPARSE_HALO_CORE_FAIL();
+      }
+      if (halo_trace) {
+        image_q_normal_us += HAP_perf_get_time_us() - image_q_normal_begin;
+      }
+      ++image_q_batch_updates;
+      image_q_segment_updates += image_q_segment_count;
+    }
+
+    // 最终归一化：
+    //
+    //   O_i = diag(l_i^{-1}) O_i
+    if (!fuse_image_q) {
+      const HVX_Vector     v_offsets       = vmem(d_tile_vscatter_offsets);
+      const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+
+      HVX_Vector v_content;
+      for (int i = 0; i < n_row_tiles; ++i) {
+        if ((i % 2) == 0) {
+          v_content = hvx_my_inv_vhf(Q6_Vhf_equals_Vqf16(mvec_l[i / 2]));
+        } else {
+          v_content = Q6_V_vror_VR(v_content, 64);
+        }
+
+        __fp16 *out_base = d_tile + i * (n_tiles_per_blk_r + 1) * HMX_FP16_TILE_N_ELMS;
+        Q6_vscatter_QRMVhV(q_32_elems_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
+      }
+
+      hmx_unit_acquire();
+      {
+        hmx_set_output_scales(hmx_output_scales_id);
+        for (int r = 0; r < n_row_tiles; ++r) {
+          for (int c = 0; c < head_dim / 32; ++c) {
+            __fp16 *d_tile_in = d_tile + (r * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+            __fp16 *o_tile_in = o_tile_prev + (c * n_tiles_per_blk_r) * HMX_FP16_TILE_N_ELMS;
+            __fp16 *o_tile_out = o_tile_curr + (r * head_dim / 32 + c) * HMX_FP16_TILE_N_ELMS;
+
+            hmx_dot_fp16(o_tile_out, d_tile_in, o_tile_in, n_row_tiles);
+          }
+        }
+      }
+      hmx_unit_release();
+    }
+
+    // 将当前 Q block 对应的结果从 VTCM 写回外部 O
+    const int64_t image_q_output_begin = fuse_image_q && halo_trace ? HAP_perf_get_time_us() : 0;
+    {
+      const size_t o_st_blk_sz_bytes = o_st_blk_sz * qo_element_size;
+      const size_t o_st_stride_bytes = o_st_stride * qo_element_size;
+
+      uint8_t *o_st_base = ((uint8_t *) O) + ir * o_st_stride_bytes + kv_head_idx * o_st_blk_sz_bytes;
+
+      for (int r = 0; r < n_rows_g; r += 2) {
+        const bool next_row_valid = (r + 1) < n_rows_g;
+
+        int o_idx0 = (r + 0) / G;
+        int h_idx0 = (r + 0) % G;
+        int o_idx1 = (r + 1) / G;
+        int h_idx1 = (r + 1) % G;
+
+        uint8_t *row_out0 = o_st_base + o_idx0 * o_st_stride_bytes + h_idx0 * o_head_dim * qo_element_size;
+        uint8_t *row_out1 = o_st_base + o_idx1 * o_st_stride_bytes + h_idx1 * o_head_dim * qo_element_size;
+
+        HVX_Vector *pv_out0 = (HVX_Vector *) row_out0;
+        HVX_Vector *pv_out1 = (HVX_Vector *) row_out1;
+
+        int r0 = r / HMX_FP16_TILE_N_ROWS;
+        int r1 = r % HMX_FP16_TILE_N_ROWS;
+
+        const __fp16 *in_base = (fuse_image_q ? q_tile : o_tile_curr) +
+          r0 * HMX_FP16_TILE_N_ROWS * head_dim;  // [32, D] row chunk
+
+        // clang-format off
+        if (qo_fp32_element) {
+          #pragma unroll
+          for (int d = 0; d < D / 32; ++d) {
+            const HVX_Vector *in_tile = (const HVX_Vector *) (in_base + d * HMX_FP16_TILE_N_ELMS);
+
+            const HVX_VectorPair vp = hvx_my_vhf_to_wsf(in_tile[r1 / 2]);
+            HVX_Vector v_out0 = Q6_V_lo_W(vp);
+            HVX_Vector v_out1 = Q6_V_hi_W(vp);
+
+            if (with_lse) {
+              vstu_variable(row_out0 + d * 32 * sizeof(float), sizeof(v_out0), v_out0);
+              if (next_row_valid) {
+                vstu_variable(row_out1 + d * 32 * sizeof(float), sizeof(v_out1), v_out1);
+              }
+            } else {
+              *pv_out0++ = v_out0;
+              if (next_row_valid) {
+                *pv_out1++ = v_out1;
+              }
+            }
+          }
+
+          if (with_lse) {
+            const float lse0 = fuse_image_q ?
+              flash_attn_lse_from_f16_state_scaled(mvec_m, mvec_l, r + 0, stable_lse_scale) :
+              flash_attn_lse_from_f16_state(mvec_m, mvec_l, r + 0);
+            memcpy(row_out0 + D * sizeof(float), &lse0, sizeof(lse0));
+            if (next_row_valid) {
+              const float lse1 = fuse_image_q ?
+                flash_attn_lse_from_f16_state_scaled(mvec_m, mvec_l, r + 1, stable_lse_scale) :
+                flash_attn_lse_from_f16_state(mvec_m, mvec_l, r + 1);
+              memcpy(row_out1 + D * sizeof(float), &lse1, sizeof(lse1));
+            }
+          }
+        } else {
+          assert(!with_lse);
+          #pragma unroll
+          for (int d = 0; d < D / 64; ++d) {
+            const __fp16     *in_dual_tile = in_base + d * HMX_FP16_TILE_N_ELMS * 2;
+            const HVX_Vector *pv_in0       = ((const HVX_Vector *) in_dual_tile) + r1 / 2;
+            const HVX_Vector *pv_in1       = pv_in0 + 16;
+
+            const HVX_VectorPair vp = Q6_W_vdeal_VVR(*pv_in1, *pv_in0, -2);
+
+            *pv_out0++ = Q6_V_lo_W(vp);
+            if (next_row_valid) {
+              *pv_out1++ = Q6_V_hi_W(vp);
+            }
+          }
+        }
+        // clang-format on
+      }
+    }
+    if (fuse_image_q && halo_trace) {
+      image_q_output_us += HAP_perf_get_time_us() - image_q_output_begin;
+    }
+  }
+  if (row_text_reuse_enabled) {
+    block_sparse_halo_text_kv_batch_t tail_batch;
+    const int64_t tail_update_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+    if (block_sparse_halo_plan_text_kv_batch(
+          &tail_batch, packed_row_slots, text_q_next_pending_row,
+          image_block_rows - 1, image_block_rows, true) != 0 ||
+        (tail_batch.row_count > 0 &&
+         block_sparse_halo_update_resident_text_q_from_packed_batch(
+           packed_row_slots, &tail_batch, image_block_cols,
+           resident_text_q, resident_text_o, resident_text_state,
+           resident_text_q_blocks, text_tokens, qo_tile_size, col_vec_size,
+           &resident_text_o_bank, &halo_update_scratch,
+           (int) scratch_blk_sz_c, D, hmx_output_scales_qk,
+           hmx_output_scales_id, d_tile_vscatter_offsets) != 0)) {
+      BLOCK_SPARSE_HALO_CORE_FAIL();
+    }
+    if (tail_batch.row_count > 0) {
+      text_q_next_pending_row = tail_batch.next_pending_row;
+      text_q_image_row_updates += tail_batch.row_count * resident_text_q_blocks;
+      text_q_image_block_updates +=
+        tail_batch.row_count * resident_text_q_blocks * image_block_cols;
+      ++text_q_image_batches;
+      if (halo_trace) {
+        text_q_image_update_us += HAP_perf_get_time_us() - tail_update_begin;
+      }
+    }
+    if (text_q_next_pending_row != image_block_rows) {
+      BLOCK_SPARSE_HALO_CORE_FAIL();
+    }
+
+    const int64_t resident_update_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+    if (block_sparse_halo_update_resident_text_q(
+          resident_text_q, resident_text_o, resident_text_state, resident_text_q_blocks,
+          text_tokens, qo_tile_size, col_vec_size, &resident_text_o_bank,
+          &halo_update_scratch, resident_text_k, resident_text_v, resident_text_tiles,
+          text_tokens, (int) scratch_blk_sz_c, D, hmx_output_scales_qk,
+          hmx_output_scales_id, d_tile_vscatter_offsets) != 0) {
+      BLOCK_SPARSE_HALO_CORE_FAIL();
+    }
+    resident_text_segments = text_tokens > 0 ? 1 : 0;
+    if (halo_trace) {
+      text_q_resident_update_us += HAP_perf_get_time_us() - resident_update_begin;
+    }
+
+    const int64_t text_q_store_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+    for (int text_q_block = 0; text_q_block < resident_text_q_blocks; ++text_q_block) {
+      uint8_t *state_block = resident_text_state +
+        (size_t) text_q_block * 2 * col_vec_size;
+      block_sparse_halo_q_state_t text_q_state = {
+        .q = (__fp16 *) ((uint8_t *) resident_text_q + (size_t) text_q_block * qo_tile_size),
+        .o_prev = (__fp16 *) ((uint8_t *) resident_text_o[resident_text_o_bank] +
+                              (size_t) text_q_block * qo_tile_size),
+        .o_next = (__fp16 *) ((uint8_t *) resident_text_o[resident_text_o_bank ^ 1] +
+                              (size_t) text_q_block * qo_tile_size),
+        .m = (HVX_Vector *) state_block,
+        .l = (HVX_Vector *) (state_block + col_vec_size),
+        .n_rows = block_sparse_halo_text_q_rows(text_tokens, text_q_block),
+      };
+      const int q_token = image_tokens + text_q_block * HMX_FP16_TILE_N_ROWS;
+      float *text_o = (float *) O + (size_t) q_token * o_st_stride +
+        (size_t) kv_head_idx * o_st_blk_sz;
+      if (block_sparse_halo_store_resident_text_q(
+            &text_q_state, d_tile, text_o, o_st_stride, D, with_lse,
+            hmx_output_scales_id, d_tile_vscatter_offsets) != 0) {
+        BLOCK_SPARSE_HALO_CORE_FAIL();
+      }
+    }
+    if (halo_trace) {
+      text_q_store_us = HAP_perf_get_time_us() - text_q_store_begin;
+    }
+  }
+  if (userdma_enabled && dma_pending_slot >= 0) {
+    const int64_t wait_begin = halo_trace ? HAP_perf_get_time_us() : 0;
+    if (halo_trace && dma_pending_submit_done_us > 0 && wait_begin >= dma_pending_submit_done_us) {
+      dma_overlap_window_us += wait_begin - dma_pending_submit_done_us;
+    }
+    if (block_sparse_halo_row_dma_wait(dma_desc_storage, BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW,
+                                       userdma_scope, worker_index,
+                                       &dma_row_slots[dma_pending_slot].outstanding) != DMA_SUBMIT_OK) {
+      BLOCK_SPARSE_HALO_CORE_FAIL();
+    }
+    if (halo_trace) {
+      dma_exposed_wait_us += HAP_perf_get_time_us() - wait_begin;
+    }
+    dma_row_slots[dma_pending_slot].ready = true;
+    dma_pending_slot = -1;
+    dma_pending_row = -1;
+    dma_pending_submit_done_us = 0;
+  }
+  if (halo_run_trace != NULL && kv_head_idx == 0 && packed_row_reuse_enabled) {
+    halo_run_trace->image_rows_updated = row_text_reuse_enabled ? text_q_next_pending_row : 0;
+    halo_run_trace->text_q_image_row_updates = text_q_image_row_updates;
+    halo_run_trace->text_q_image_block_updates = text_q_image_block_updates;
+    halo_run_trace->image_q_batch_updates = image_q_batch_updates;
+    halo_run_trace->image_q_segment_updates = image_q_segment_updates;
+  }
+  if (userdma_enabled && halo_trace) {
+    const int dma_image_query_blocks_loaded = dma_image_query_rows_loaded * image_block_cols;
+    FARF(ALWAYS,
+         "mode=HALO_USERDMA_ROWS worker=%d kv_head=%d packed_rows=%llu raw_staging=%llu "
+         "row_stride=%llu resident_text=%llu shared_kv_scratch=%llu descriptors_ddr=%llu available=%llu",
+         worker_index, kv_head_idx, (unsigned long long) halo_plan->packed_image_row_bytes,
+         (unsigned long long) halo_plan->image_row_bytes,
+         (unsigned long long) halo_plan->image_row_stride,
+         (unsigned long long) halo_plan->resident_text_bytes,
+         (unsigned long long) (halo_plan->packed_k_bytes + halo_plan->packed_v_bytes),
+         (unsigned long long) halo_plan->descriptor_bytes,
+         (unsigned long long) (vtcm_limit - vtcm));
+    FARF(ALWAYS,
+         "mode=HALO_USERDMA_ROWS worker=%d kv_head=%d image_query_rows=%d image_query_blocks=%d "
+         "descs=%d bytes=%llu async_rows=%d packed_image_rows=%d packed_image_blocks=%d "
+         "image_q_batches=%d image_q_segments=%d",
+         worker_index, kv_head_idx, dma_image_query_rows_loaded, dma_image_query_blocks_loaded,
+         dma_descriptors_submitted, (unsigned long long) dma_requested_bytes,
+         dma_async_rows_loaded, packed_image_rows, packed_image_blocks,
+         image_q_batch_updates, image_q_segment_updates);
+    FARF(ALWAYS,
+         "mode=HALO_USERDMA_ROWS worker=%d kv_head=%d resident_text_q_blocks=%d "
+         "text_q_image_row_updates=%d text_q_image_block_updates=%d text_q_image_batches=%d "
+         "resident_text_segments=%d "
+         "resident_text_qo_state_bytes=%llu",
+         worker_index, kv_head_idx, resident_text_q_blocks, text_q_image_row_updates,
+         text_q_image_block_updates, text_q_image_batches, resident_text_segments,
+         (unsigned long long) (halo_plan->resident_text_q_bytes +
+                               2 * halo_plan->resident_text_o_bytes +
+                               halo_plan->resident_text_state_bytes));
+    FARF(ALWAYS,
+         "mode=HALO_USERDMA_ROWS worker=%d kv_head=%d submit_us=%lld "
+         "overlap_window_us=%lld wait_us=%lld pack_us=%lld image_q_normal_us=%lld image_q_output_us=%lld "
+         "text_q_image_update_us=%lld text_q_resident_update_us=%lld",
+         worker_index, kv_head_idx, dma_submit_us, dma_overlap_window_us,
+         dma_exposed_wait_us, dma_pack_us, image_q_normal_us, image_q_output_us,
+         text_q_image_update_us, text_q_resident_update_us);
+  } else if (row_l2_prefetch_enabled && halo_trace) {
+    FARF(ALWAYS,
+         "mode=HALO_L2_PACKED_ROWS worker=%d kv_head=%d packed_image_rows=%d packed_image_blocks=%d "
+         "packed_row_slots=%d packed_row_slot_bytes=%llu image_q_direct_segments=%d "
+         "image_q_batches=%d image_q_segments=%d raw_prefetch_rows=%d "
+         "requested_k_bytes=%llu requested_v_bytes=%llu",
+         worker_index, kv_head_idx, packed_image_rows, packed_image_blocks,
+         halo_plan->packed_image_row_slot_count, (unsigned long long) halo_plan->packed_image_row_stride,
+         image_q_direct_segment_uses, image_q_batch_updates, image_q_segment_updates, halo_prefetch_rows,
+         requested_k_bytes, requested_v_bytes);
+    FARF(ALWAYS,
+         "mode=HALO_L2_PACKED_ROWS worker=%d kv_head=%d text_q_blocks=%d "
+         "text_q_image_row_updates=%d text_q_image_block_updates=%d text_q_image_batches=%d "
+         "resident_text_segments=%d "
+         "resident_text_kv_bytes=%llu resident_text_qo_state_bytes=%llu",
+         worker_index, kv_head_idx, resident_text_q_blocks, text_q_image_row_updates,
+         text_q_image_block_updates, text_q_image_batches, resident_text_segments,
+         (unsigned long long) halo_plan->resident_text_bytes,
+         (unsigned long long) (halo_plan->resident_text_q_bytes +
+                               2 * halo_plan->resident_text_o_bytes +
+                               halo_plan->resident_text_state_bytes));
+    FARF(ALWAYS,
+         "mode=HALO_L2_PACKED_ROWS worker=%d kv_head=%d text_kv_pack_us=%lld "
+         "startup_row_pack_us=%lld boundary_row_pack_us=%lld image_q_normal_us=%lld image_q_output_us=%lld "
+         "text_q_image_update_us=%lld text_q_resident_update_us=%lld "
+         "text_q_init_us=%lld text_q_store_us=%lld",
+         worker_index, kv_head_idx, text_pack_us, startup_row_pack_us, boundary_row_pack_us,
+         image_q_normal_us, image_q_output_us, text_q_image_update_us, text_q_resident_update_us,
+         text_q_init_us, text_q_store_us);
+  }
+#undef BLOCK_SPARSE_HALO_CORE_FAIL
+  return 0;
+}
+
+int block_sparse_flash_attn_f16_core_halo_l2(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
+                                             __fp16 *restrict O, const __fp16 *restrict Q,
+                                             const __fp16 *restrict K, const __fp16 *restrict V,
+                                             const int32_t *restrict block_mask, int qo_len, int kv_len, int n_heads,
+                                             int n_kv_heads, int head_dim, int block_q, int block_k, int n_q_blocks,
+                                             int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse,
+                                             int worker_index, const block_sparse_halo_plan_t *halo_plan,
+                                             int image_tokens, int text_tokens, int image_block_rows,
+                                             int image_block_cols, bool resident_text_enabled,
+                                             bool halo_trace,
+                                             block_sparse_halo_run_trace_t *halo_run_trace) {
+  if (halo_plan == NULL || !resident_text_enabled ||
+      halo_plan->packed_image_row_slot_count != BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS ||
+      halo_plan->packed_image_row_stride == 0 || halo_plan->image_row_stride != 0) {
+    return -1;
+  }
+  return block_sparse_flash_attn_f16_core_halo_rows(
+    kv_head_idx, vtcm, vtcm_limit, O, Q, K, V, block_mask, qo_len, kv_len, n_heads, n_kv_heads, head_dim,
+    block_q, block_k, n_q_blocks, n_k_blocks, mask_format, max_kept_blocks, with_lse, worker_index, halo_plan,
+    image_tokens, text_tokens, image_block_rows, image_block_cols, resident_text_enabled, false,
+    BLOCK_SPARSE_HALO_USERDMA_UNKNOWN, halo_trace, halo_run_trace);
+}
+
+int block_sparse_flash_attn_f16_core_halo_userdma(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
+                                             __fp16 *restrict O, const __fp16 *restrict Q,
+                                             const __fp16 *restrict K, const __fp16 *restrict V,
+                                             const int32_t *restrict block_mask, int qo_len, int kv_len, int n_heads,
+                                             int n_kv_heads, int head_dim, int block_q, int block_k, int n_q_blocks,
+                                             int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse,
+                                             int worker_index, const block_sparse_halo_plan_t *halo_plan,
+                                             int image_tokens, int text_tokens, int image_block_rows,
+                                             int image_block_cols, int userdma_scope, bool halo_trace,
+                                             block_sparse_halo_run_trace_t *halo_run_trace) {
+  if (halo_plan == NULL || userdma_scope != BLOCK_SPARSE_HALO_USERDMA_PER_WORKER ||
+      halo_plan->image_row_stride == 0 || halo_plan->image_row_bytes == 0) {
+    return -1;
+  }
+  return block_sparse_flash_attn_f16_core_halo_rows(
+    kv_head_idx, vtcm, vtcm_limit, O, Q, K, V, block_mask, qo_len, kv_len, n_heads, n_kv_heads, head_dim,
+    block_q, block_k, n_q_blocks, n_k_blocks, mask_format, max_kept_blocks, with_lse, worker_index, halo_plan,
+    image_tokens, text_tokens, image_block_rows, image_block_cols, true, true, userdma_scope, halo_trace,
+    halo_run_trace);
+}
+
 int block_sparse_flash_attn_f16_core_full_k(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
                                              __fp16 *restrict O, const __fp16 *restrict Q,
                                              const __fp16 *restrict K, const __fp16 *restrict V,
@@ -2578,13 +6369,6 @@ int block_sparse_flash_attn_f16_core_full_k(int kv_head_idx, uint8_t *vtcm, uint
   // QK^T 输出时直接乘 qk_scale_hf
   hmx_init_column_scales(hmx_output_scales_qk, Q6_V_vsplat_R(fp16_to_bits(&qk_scale_hf)));
 
-  // transpose_vscatter_indices_base 用于 K tile 转置/重排
-  // vscatter 会把连续读入的 K row 写到 HMX RHS operand 需要的位置
-  static int32_t transpose_vscatter_indices_base[32] __vec_aligned__;
-  for (int i = 0; i < 32; ++i) {
-    transpose_vscatter_indices_base[i] = i * 128;
-  }
-
   // d_tile_vscatter_offsets 用于生成对角矩阵 D tile
   // offsets 指向 HMX tile layout 中对角线元素的位置
   static int16_t d_tile_vscatter_offsets[64] __vec_aligned__;
@@ -2596,28 +6380,9 @@ int block_sparse_flash_attn_f16_core_full_k(int kv_head_idx, uint8_t *vtcm, uint
   hvx_fill_uh(packed_k, 0, full_k_tile_size);
   {
     const __fp16 *k_ld_base = K + kv_head_idx * kv_ld_blk_sz;
-    const size_t n_k_tiles  = ceil_div(kv_len, HMX_FP16_TILE_N_COLS);
-    const HVX_Vector v_step = Q6_V_vsplat_R(4);
-    const HVX_Vector v_offsets_base = vmem(transpose_vscatter_indices_base);
 
     l2fetch(k_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), kv_len, 1);
-    for (int k_tile_idx = 0; k_tile_idx < n_k_tiles; ++k_tile_idx) {
-      __fp16 *out_base = packed_k + k_tile_idx * HMX_FP16_TILE_N_COLS * head_dim;
-      HVX_Vector v_offsets = v_offsets_base;
-      for (int r1 = 0; r1 < HMX_FP16_TILE_N_COLS; ++r1) {
-        const int r = k_tile_idx * HMX_FP16_TILE_N_COLS + r1;
-        if (r >= kv_len) {
-          break;
-        }
-        const HVX_Vector *pv_in = (const HVX_Vector *) (k_ld_base + r * kv_ld_stride);
-#pragma unroll
-        for (int d = 0; d < D / 64; ++d) {
-          __fp16 *out_dual_tile = out_base + d * HMX_FP16_TILE_N_ELMS * 2;
-          Q6_vscatter_RMVwV((size_t) out_dual_tile, HMX_FP16_TILE_SIZE * 2 - 1, v_offsets, *pv_in++);
-        }
-        v_offsets = Q6_Vw_vadd_VwVw(v_offsets, v_step);
-      }
-    }
+    block_sparse_pack_k_f16(packed_k, k_ld_base, (int) kv_ld_stride, kv_len, D);
   }
 
   // 外层循环：按 Q/O token 方向分块
@@ -2926,34 +6691,7 @@ int block_sparse_flash_attn_f16_core_full_k(int kv_head_idx, uint8_t *vtcm, uint
       // 与 K 类似，V 也要重排成 HMX RHS 可直接消费的布局
       {
         const __fp16 *v_ld_base = V + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
-
-        for (int r = 0; r < n_real_cols; r += 2) {
-          const bool next_row_valid = (r + 1) < n_real_cols;
-
-          const HVX_Vector *pv_in0 = (const HVX_Vector *) (v_ld_base + (r + 0) * kv_ld_stride);
-          const HVX_Vector *pv_in1 = (const HVX_Vector *) (v_ld_base + (r + 1) * kv_ld_stride);
-
-#pragma unroll
-          for (int c = 0; c < D; c += 64) {
-            const HVX_Vector     v0 = *pv_in0++;
-            const HVX_Vector     v1 = next_row_valid ? *pv_in1++ : Q6_V_vzero();
-            const HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
-
-            int r0 = r / HMX_FP16_TILE_N_ROWS;
-            int r1 = r % HMX_FP16_TILE_N_ROWS;
-            int c0 = c / HMX_FP16_TILE_N_COLS;
-
-            int     tile_idx0  = (c0 + 0) * n_tiles_per_blk_c + r0;
-            int     tile_idx1  = (c0 + 1) * n_tiles_per_blk_c + r0;
-            __fp16 *tile_base0 = v_tile + tile_idx0 * HMX_FP16_TILE_N_ELMS;
-            __fp16 *tile_base1 = v_tile + tile_idx1 * HMX_FP16_TILE_N_ELMS;
-
-            HVX_Vector *pv_out0 = ((HVX_Vector *) tile_base0) + r1 / 2;
-            HVX_Vector *pv_out1 = ((HVX_Vector *) tile_base1) + r1 / 2;
-            *pv_out0            = Q6_V_lo_W(vp);
-            *pv_out1            = Q6_V_hi_W(vp);
-          }
-        }
+        block_sparse_pack_v_f16(v_tile, v_ld_base, (int) kv_ld_stride, (int) n_real_cols, (int) blk_sz_c, D);
       }
 
       // 复用 mvec_s_rowmax 这块 buffer，
@@ -3315,13 +7053,6 @@ int block_sparse_flash_attn_f16_core_full_kv(int kv_head_idx, uint8_t *vtcm, uin
   // QK^T 输出时直接乘 qk_scale_hf
   hmx_init_column_scales(hmx_output_scales_qk, Q6_V_vsplat_R(fp16_to_bits(&qk_scale_hf)));
 
-  // transpose_vscatter_indices_base 用于 K tile 转置/重排
-  // vscatter 会把连续读入的 K row 写到 HMX RHS operand 需要的位置
-  static int32_t transpose_vscatter_indices_base[32] __vec_aligned__;
-  for (int i = 0; i < 32; ++i) {
-    transpose_vscatter_indices_base[i] = i * 128;
-  }
-
   // d_tile_vscatter_offsets 用于生成对角矩阵 D tile
   // offsets 指向 HMX tile layout 中对角线元素的位置
   static int16_t d_tile_vscatter_offsets[64] __vec_aligned__;
@@ -3335,54 +7066,14 @@ int block_sparse_flash_attn_f16_core_full_kv(int kv_head_idx, uint8_t *vtcm, uin
   {
     const __fp16 *k_ld_base = K + kv_head_idx * kv_ld_blk_sz;
     const __fp16 *v_ld_base = V + kv_head_idx * kv_ld_blk_sz;
-    const size_t n_k_tiles  = ceil_div(kv_len, HMX_FP16_TILE_N_COLS);
-    const HVX_Vector v_step = Q6_V_vsplat_R(4);
-    const HVX_Vector v_offsets_base = vmem(transpose_vscatter_indices_base);
+    const int padded_kv_len = ceil_div(kv_len, HMX_FP16_TILE_N_COLS) * HMX_FP16_TILE_N_COLS;
 
     l2fetch(k_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), kv_len, 1);
-    for (int k_tile_idx = 0; k_tile_idx < n_k_tiles; ++k_tile_idx) {
-      __fp16 *out_base = packed_k + k_tile_idx * HMX_FP16_TILE_N_COLS * head_dim;
-      HVX_Vector v_offsets = v_offsets_base;
-      for (int r1 = 0; r1 < HMX_FP16_TILE_N_COLS; ++r1) {
-        const int r = k_tile_idx * HMX_FP16_TILE_N_COLS + r1;
-        if (r >= kv_len) {
-          break;
-        }
-        const HVX_Vector *pv_in = (const HVX_Vector *) (k_ld_base + r * kv_ld_stride);
-#pragma unroll
-        for (int d = 0; d < D / 64; ++d) {
-          __fp16 *out_dual_tile = out_base + d * HMX_FP16_TILE_N_ELMS * 2;
-          Q6_vscatter_RMVwV((size_t) out_dual_tile, HMX_FP16_TILE_SIZE * 2 - 1, v_offsets, *pv_in++);
-        }
-        v_offsets = Q6_Vw_vadd_VwVw(v_offsets, v_step);
-      }
-    }
+    block_sparse_pack_k_f16(packed_k, k_ld_base, (int) kv_ld_stride, kv_len, D);
 
     l2fetch(v_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), kv_len, 1);
-    for (int r = 0; r < kv_len; r += 2) {
-      const bool next_row_valid = (r + 1) < kv_len;
-      const HVX_Vector *pv_in0 = (const HVX_Vector *) (v_ld_base + (r + 0) * kv_ld_stride);
-      const HVX_Vector *pv_in1 = (const HVX_Vector *) (v_ld_base + (r + 1) * kv_ld_stride);
-#pragma unroll
-      for (int c = 0; c < D; c += 64) {
-        const HVX_Vector v0 = *pv_in0++;
-        const HVX_Vector v1 = next_row_valid ? *pv_in1++ : Q6_V_vzero();
-        const HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
-        const int k_tile_idx = r / HMX_FP16_TILE_N_ROWS;
-        const int row_in_tile = r % HMX_FP16_TILE_N_ROWS;
-        const int d_tile_idx = c / HMX_FP16_TILE_N_COLS;
-        __fp16 *tile_base0 =
-          packed_v + ((d_tile_idx + 0) * n_k_tiles + k_tile_idx) * HMX_FP16_TILE_N_ELMS;
-        __fp16 *tile_base1 =
-          packed_v + ((d_tile_idx + 1) * n_k_tiles + k_tile_idx) * HMX_FP16_TILE_N_ELMS;
-        HVX_Vector *pv_out0 = ((HVX_Vector *) tile_base0) + row_in_tile / 2;
-        HVX_Vector *pv_out1 = ((HVX_Vector *) tile_base1) + row_in_tile / 2;
-        *pv_out0 = Q6_V_lo_W(vp);
-        *pv_out1 = Q6_V_hi_W(vp);
-      }
-    }
+    block_sparse_pack_v_f16(packed_v, v_ld_base, (int) kv_ld_stride, kv_len, padded_kv_len, D);
   }
-
   // 外层循环：按 Q/O token 方向分块
   for (int ir = 0; ir < qo_len; ir += blk_sz_r) {
     const size_t n_rows        = smin(qo_len - ir, blk_sz_r);
@@ -3444,7 +7135,6 @@ int block_sparse_flash_attn_f16_core_full_kv(int kv_head_idx, uint8_t *vtcm, uin
         }
       }
     }
-
     // 初始化 online softmax 状态
     hvx_fill_uh(mvec_m, 0xfbff, col_vec_size);
     hvx_fill_uh(mvec_l, 0, col_vec_size);
@@ -3746,7 +7436,6 @@ int block_sparse_flash_attn_f16_core_full_kv(int kv_head_idx, uint8_t *vtcm, uin
         swap_ptr(&o_tile_curr, &o_tile_prev);
       }
     }
-
     // 最终归一化：
     //
     //   O_i = diag(l_i^{-1}) O_i
@@ -3891,23 +7580,52 @@ static void block_sparse_flash_attn_worker(void *data, int worker_index) {
     }
 
     int kv_head_idx = task_id;
-    block_sparse_fa_plan_t plan;
     const int G = s->n_heads / s->n_kv_heads;
     const bool fast_path = s->mask_format == 1 && s->max_kept_blocks > 0 && G == 1 &&
                            s->block_q == HMX_FP16_TILE_N_ROWS && s->block_k == HMX_FP16_TILE_N_COLS;
-    const bool use_full_kv =
-      fast_path && block_sparse_fa_find_mode_plan(&plan, BLOCK_SPARSE_FA_FULL_KV, G, s->head_dim, s->kv_len,
-                                                  s->vtcm_size_per_thread);
-    const bool use_full_k =
-      !use_full_kv && fast_path && block_sparse_fa_find_mode_plan(&plan, BLOCK_SPARSE_FA_FULL_K, G, s->head_dim,
-                                                                  s->kv_len, s->vtcm_size_per_thread);
-    if (!use_full_kv && !use_full_k &&
-        !block_sparse_fa_find_mode_plan(&plan, BLOCK_SPARSE_FA_CHUNKED, G, s->head_dim, s->kv_len,
-                                        s->vtcm_size_per_thread)) {
+    const bool halo_path_requested = s->halo_l2_enabled || s->halo_userdma_enabled;
+    bool halo_head_valid = true;
+    if (halo_path_requested) {
+      const int q_blocks_per_head = s->n_q_blocks / s->n_heads;
+      const int k_blocks_per_head = s->n_k_blocks / s->n_kv_heads;
+      const int image_blocks = s->image_tokens / s->block_k;
+      halo_head_valid = block_sparse_halo_validate_kv_head_rows(
+        s->block_mask, kv_head_idx, s->n_kv_heads, q_blocks_per_head,
+        k_blocks_per_head, s->max_kept_blocks, image_blocks,
+        s->image_block_rows, s->image_block_cols) == 0;
+      if (!halo_head_valid) {
+        worker_pool_atomic_inc_return(&(s->halo_fallback_count));
+      }
+    }
+    const bool halo_l2_enabled = s->halo_l2_enabled && halo_head_valid;
+    const bool halo_userdma_enabled = s->halo_userdma_enabled && halo_head_valid;
+    const bool halo_force_chunked = s->halo_force_chunked || (halo_path_requested && !halo_head_valid);
+
+    block_sparse_fa_plan_t plan = {0};
+    int plan_result = 0;
+    if (halo_l2_enabled || halo_userdma_enabled) {
+      if (s->halo_plan.blk_sz_c == 0) {
+        plan_result = -1;
+      }
+      plan.mode = BLOCK_SPARSE_FA_CHUNKED;
+      plan.blk_sz_c = s->halo_plan.blk_sz_c;
+      plan.required_bytes = s->halo_plan.required_bytes;
+    } else if (halo_force_chunked) {
+      plan_result = block_sparse_fa_select_halo_fallback_plan(
+        &plan, fast_path, G, s->head_dim, s->kv_len, s->vtcm_size_per_thread);
+    } else {
+      plan_result = block_sparse_fa_select_plan(
+        &plan, fast_path, G, s->head_dim, s->kv_len, s->vtcm_size_per_thread);
+    }
+    if (plan_result != 0) {
       worker_pool_atomic_inc_return(&(s->error_count));
       continue;
     }
-    const char *mode_name = use_full_kv ? "FULL_KV" : (use_full_k ? "FULL_K" : "CHUNKED");
+    const bool use_full_kv = plan.mode == BLOCK_SPARSE_FA_FULL_KV;
+    const bool use_full_k = plan.mode == BLOCK_SPARSE_FA_FULL_K;
+    const char *mode_name = halo_l2_enabled ? "HALO_L2_PACKED_ROWS" :
+                            (halo_userdma_enabled ? "HALO_USERDMA_ROWS" :
+                            (use_full_kv ? "FULL_KV" : (use_full_k ? "FULL_K" : "CHUNKED")));
     if (kv_head_idx == 0) {
       FARF(ALWAYS, "block_sparse_fa worker=%d kv_head=%d mode=%s Br=32 Bc=%u required=%u available=%u",
            worker_index, kv_head_idx, mode_name, (unsigned int) plan.blk_sz_c,
@@ -3924,6 +7642,18 @@ static void block_sparse_flash_attn_worker(void *data, int worker_index) {
         kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->block_mask, s->qo_len, s->kv_len, s->n_heads,
         s->n_kv_heads, s->head_dim, s->block_q, s->block_k, s->n_q_blocks, s->n_k_blocks, s->mask_format,
         s->max_kept_blocks, s->with_lse, worker_index);
+    } else if (halo_l2_enabled) {
+      result = block_sparse_flash_attn_f16_core_halo_l2(
+        kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->block_mask, s->qo_len, s->kv_len, s->n_heads,
+        s->n_kv_heads, s->head_dim, s->block_q, s->block_k, s->n_q_blocks, s->n_k_blocks, s->mask_format,
+        s->max_kept_blocks, s->with_lse, worker_index, &s->halo_plan, s->image_tokens, s->text_tokens,
+        s->image_block_rows, s->image_block_cols, true, s->halo_trace, s->halo_run_trace);
+    } else if (halo_userdma_enabled) {
+      result = block_sparse_flash_attn_f16_core_halo_userdma(
+        kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->block_mask, s->qo_len, s->kv_len, s->n_heads,
+        s->n_kv_heads, s->head_dim, s->block_q, s->block_k, s->n_q_blocks, s->n_k_blocks, s->mask_format,
+        s->max_kept_blocks, s->with_lse, worker_index, &s->halo_plan, s->image_tokens, s->text_tokens,
+        s->image_block_rows, s->image_block_cols, s->userdma_scope, s->halo_trace, s->halo_run_trace);
     } else {
       result = block_sparse_flash_attn_f16_core_chunked(
         kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->block_mask, s->qo_len, s->kv_len, s->n_heads,
@@ -3943,12 +7673,23 @@ static void block_sparse_flash_attn_worker(void *data, int worker_index) {
 int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K,
                             const __fp16 *restrict V, const int32_t *restrict block_mask, int qo_len, int kv_len,
                             int n_heads, int n_kv_heads, int head_dim, int block_q, int block_k, int n_q_blocks,
-                            int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse) {
+                            int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse, int sparse_policy,
+                            int image_tokens, int text_tokens, int image_block_rows, int image_block_cols,
+                            int halo_kv_load_mode, bool halo_trace,
+                            block_sparse_halo_run_trace_t *halo_run_trace) {
+  if (halo_run_trace != NULL) {
+    halo_run_trace->exec_mode = -1;
+    halo_run_trace->image_rows_updated = 0;
+    halo_run_trace->text_q_image_row_updates = 0;
+    halo_run_trace->text_q_image_block_updates = 0;
+    halo_run_trace->image_q_batch_updates = 0;
+    halo_run_trace->image_q_segment_updates = 0;
+  }
   if (head_dim % 64 != 0) {
     FARF(ALWAYS, "block sparse FA not supported: head_dim=%d", head_dim);
     return -1;
   }
-  if (n_heads % n_kv_heads != 0) {
+  if (n_heads <= 0 || n_kv_heads <= 0 || n_heads % n_kv_heads != 0) {
     FARF(ALWAYS, "block sparse FA not supported: n_heads=%d n_kv_heads=%d", n_heads, n_kv_heads);
     return -1;
   }
@@ -3986,6 +7727,45 @@ int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const 
     return -1;
   }
 
+  const bool halo_loader_requested = sparse_policy == 1 && halo_kv_load_mode != 0;
+  block_sparse_halo_plan_t halo_plan = {0};
+  const bool halo_geometry_valid = halo_loader_requested &&
+    block_sparse_halo_validate_shape(block_mask, qo_len, kv_len, n_heads, n_kv_heads, head_dim, block_q, block_k,
+                                     n_q_blocks, n_k_blocks, mask_format, max_kept_blocks, sparse_policy,
+                                     image_tokens, text_tokens, image_block_rows, image_block_cols) == 0;
+  const bool halo_l2_geometry_valid = halo_geometry_valid && image_block_rows >= 2 && text_tokens > 0;
+  block_sparse_halo_plan_t dma_preflight_plan = {0};
+  const bool dma_preflight_valid = halo_kv_load_mode != 2 ||
+    (halo_geometry_valid &&
+     block_sparse_halo_select_plan(&dma_preflight_plan, 2, head_dim, text_tokens, image_block_cols,
+                                   vtcm_size_per_thread) == 0 &&
+     block_sparse_halo_dma_preflight(K, V, vtcm_base, vtcm_size_per_thread, vtcm_slice_count,
+                                     n_kv_heads, head_dim, image_tokens, &dma_preflight_plan) == 0);
+  const int userdma_scope = dma_preflight_valid && halo_geometry_valid && halo_kv_load_mode == 2 ?
+    block_sparse_halo_probe_userdma_scope() : BLOCK_SPARSE_HALO_USERDMA_UNKNOWN;
+  const int halo_exec_mode = block_sparse_halo_select_execution(
+    &halo_plan, halo_loader_requested ? halo_kv_load_mode : 0,
+    halo_kv_load_mode == 1 ? halo_l2_geometry_valid : halo_geometry_valid,
+    dma_preflight_valid, userdma_scope,
+    head_dim, text_tokens, image_block_cols, vtcm_size_per_thread);
+  if (halo_exec_mode < 0) {
+    return -1;
+  }
+  const bool halo_l2_enabled = halo_exec_mode == BLOCK_SPARSE_HALO_EXEC_L2_PREFETCH;
+  const bool halo_userdma_enabled = halo_exec_mode == BLOCK_SPARSE_HALO_EXEC_USERDMA_ROWS;
+  const bool halo_force_chunked = halo_exec_mode == BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
+  if (halo_run_trace != NULL) {
+    halo_run_trace->exec_mode = halo_exec_mode;
+  }
+  if (halo_force_chunked) {
+    FARF(ALWAYS,
+         "block_sparse_fa halo loader fallback=FULL_KV_OR_FULL_K_OR_CHUNKED policy=%d loader=%d "
+         "geometry=%d dma_preflight=%d "
+         "userdma_scope=%d available=%u",
+         sparse_policy, halo_kv_load_mode, halo_geometry_valid ? 1 : 0, dma_preflight_valid ? 1 : 0, userdma_scope,
+         (unsigned int) vtcm_size_per_thread);
+  }
+
   block_sparse_fa_task_state_t state;
   state.O          = O;
   state.Q          = Q;
@@ -4003,10 +7783,24 @@ int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const 
   state.n_k_blocks = n_k_blocks;
   state.mask_format = mask_format;
   state.max_kept_blocks = max_kept_blocks;
+  state.sparse_policy = sparse_policy;
+  state.image_tokens = image_tokens;
+  state.text_tokens = text_tokens;
+  state.image_block_rows = image_block_rows;
+  state.image_block_cols = image_block_cols;
+  state.halo_kv_load_mode = halo_kv_load_mode;
+  state.halo_trace = halo_trace;
+  state.halo_l2_enabled = halo_l2_enabled;
+  state.halo_userdma_enabled = halo_userdma_enabled;
+  state.halo_force_chunked = halo_force_chunked;
+  state.userdma_scope = userdma_scope;
+  state.halo_run_trace = halo_run_trace;
+  state.halo_plan = halo_plan;
   state.with_lse = with_lse;
 
   state.task_id              = 0;
   state.error_count          = 0;
+  state.halo_fallback_count  = 0;
   state.n_tasks              = n_kv_heads;
   state.vtcm_base            = vtcm_base;
   state.acquired_vtcm_size   = acquired_vtcm_size;
@@ -4017,7 +7811,7 @@ int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const 
   job.fptr = block_sparse_flash_attn_worker;
   job.dptr = &state;
 
-  int64_t t0 = HAP_perf_get_time_us();
+  const int64_t worker_begin_us = HAP_perf_get_time_us();
 
   worker_pool_synctoken_init(&(state.sync_ctx), n_jobs);
   for (int i = 0; i < n_jobs; ++i) {
@@ -4030,12 +7824,22 @@ int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const 
   }
   worker_pool_synctoken_wait(&(state.sync_ctx));
 
+  if (state.halo_fallback_count != 0 && halo_run_trace != NULL) {
+    halo_run_trace->exec_mode = BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
+    halo_run_trace->image_rows_updated = 0;
+    halo_run_trace->text_q_image_row_updates = 0;
+    halo_run_trace->text_q_image_block_updates = 0;
+    halo_run_trace->image_q_batch_updates = 0;
+    halo_run_trace->image_q_segment_updates = 0;
+  }
+
   if (state.error_count != 0) {
     FARF(ERROR, "%s: worker errors=%u", __func__, state.error_count);
     return -1;
   }
 
-  int64_t elapsed_us = HAP_perf_get_time_us() - t0;
+  const int64_t worker_end_us = HAP_perf_get_time_us();
+  const int64_t elapsed_us = worker_end_us - worker_begin_us;
   FARF(ALWAYS,
        "%s: %lld us, qo_len=%d kv_len=%d n_heads=%d n_kv_heads=%d head_dim=%d block_q=%d block_k=%d",
        __func__, elapsed_us, qo_len, kv_len, n_heads, n_kv_heads, head_dim, block_q, block_k);

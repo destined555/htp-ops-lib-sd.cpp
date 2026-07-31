@@ -101,33 +101,54 @@ static void msg_receiver_loop(void *param) {
       }
     }
 
-    for (int i = 0; i < msg_hdr->n_reqs; ++i) {
-      struct RequestHeader *req_hdr = message_header_get_request_ptr(msg_hdr, i);
-      switch (req_hdr->type) {
-        case REQUEST_TYPE_OP_COMPUTE:
-          {
-            // TODO(hzx): use separate thread (pool) to execute op
-            struct OpComputeRequest *compute_req = (struct OpComputeRequest *) req_hdr->data;
+    size_t message_bytes = sizeof(struct MessageHeader);
+    if (!message_header_validate_layout(msg_hdr, chan->max_msg_size, &message_bytes)) {
+      FARF(ERROR, "%s: invalid message layout: n_reqs=%d max=%u", __func__,
+           msg_hdr->n_reqs, (unsigned int) chan->max_msg_size);
+    } else {
+      for (int i = 0; i < msg_hdr->n_reqs; ++i) {
+        const size_t wire_req_size =
+          (size_t) msg_hdr->req_offsets[i + 1] - (size_t) msg_hdr->req_offsets[i];
+        const size_t req_data_size = wire_req_size - sizeof(struct RequestHeader);
+        struct RequestHeader *req_hdr = message_header_get_request_ptr(msg_hdr, i);
+        switch (req_hdr->type) {
+          case REQUEST_TYPE_OP_COMPUTE:
+            {
+              // TODO(hzx): use separate thread (pool) to execute op
+              struct OpComputeRequest *compute_req = (struct OpComputeRequest *) req_hdr->data;
 
-            req_hdr->state = execute_op_simple(compute_req);
-          }
-          break;
-        case REQUEST_TYPE_RPCMEM_MAP:
-          {
-            struct RpcmemMapRequest *map_req = (struct RpcmemMapRequest *) req_hdr->data;
-            for (int j = 0; j < map_req->n_puts; ++j) {
-              mmap_manager_put_map(map_req->fds[j]);
+              req_hdr->state = execute_op_simple(compute_req, req_data_size);
             }
-            req_hdr->state = 0;
-          }
-          break;
-        default:
-          break;
+            break;
+          case REQUEST_TYPE_RPCMEM_MAP:
+            {
+              if (req_data_size < sizeof(struct RpcmemMapRequest)) {
+                req_hdr->state = -1;
+                break;
+              }
+              struct RpcmemMapRequest *map_req = (struct RpcmemMapRequest *) req_hdr->data;
+              const size_t available_fds =
+                (req_data_size - sizeof(struct RpcmemMapRequest)) / sizeof(int32_t);
+              if (map_req->n_puts < 0 || map_req->n_gets < 0 ||
+                  (size_t) map_req->n_puts > available_fds ||
+                  (size_t) map_req->n_gets > available_fds - (size_t) map_req->n_puts) {
+                req_hdr->state = -1;
+                break;
+              }
+              for (int j = 0; j < map_req->n_puts; ++j) {
+                mmap_manager_put_map(map_req->fds[j]);
+              }
+              req_hdr->state = 0;
+            }
+            break;
+          default:
+            break;
+        }
       }
     }
 
     // first payload cache flush
-    qurt_mem_cache_clean((qurt_addr_t) msg_hdr, message_total_size(msg_hdr), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    qurt_mem_cache_clean((qurt_addr_t) msg_hdr, message_bytes, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 
     asm volatile("barrier" ::: "memory");
 
@@ -139,7 +160,7 @@ static void msg_receiver_loop(void *param) {
     asm volatile("memd_rl(%0):at = %1" ::"r"(d_ptr), "r"(d_val) : "memory");
 
     // flush cache
-    qurt_mem_cache_clean((qurt_addr_t) msg_hdr, message_total_size(msg_hdr), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+    qurt_mem_cache_clean((qurt_addr_t) msg_hdr, message_bytes, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 
     // TODO(hzx): estimate host's job completion time and sleep
     qurt_sleep(SLEEP_TIME_US);
@@ -453,14 +474,18 @@ bail:
 void internal_op_tests();
 
 // FastRPC interface
-AEEResult htp_ops_test_ops(remote_handle64 handle) {
+AEEResult htp_ops_test_ops(remote_handle64 handle, int32_t *userdma_scope) {
   const AEEResult guard_result = require_backend_initialized(__func__);
   if (guard_result != AEE_SUCCESS) {
     return guard_result;
   }
+  if (userdma_scope == NULL) {
+    return AEE_EBADPARM;
+  }
   FARF(ALWAYS, "Op Tests!");
 
   internal_op_tests();
+  *userdma_scope = block_sparse_halo_probe_userdma_scope();
 
   return 0;
 }

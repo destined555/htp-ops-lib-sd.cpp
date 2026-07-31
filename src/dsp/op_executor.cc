@@ -2,6 +2,7 @@
 
 #include <qurt_memory.h>
 
+#include <cstring>
 #include <vector>
 
 #include "dsp/mmap_mgr.h"
@@ -16,6 +17,22 @@ namespace {
 
 size_t align_up_size(size_t v, size_t a) {
   return ((v + a - 1) / a) * a;
+}
+
+bool checked_size_add(size_t a, size_t b, size_t *result) {
+  if (result == nullptr || a > SIZE_MAX - b) {
+    return false;
+  }
+  *result = a + b;
+  return true;
+}
+
+bool checked_size_mul(size_t a, size_t b, size_t *result) {
+  if (result == nullptr || (a != 0 && b > SIZE_MAX / a)) {
+    return false;
+  }
+  *result = a * b;
+  return true;
 }
 
 size_t ggml_super_block_size(enum ggml_type type) {
@@ -46,6 +63,14 @@ enum ggml_type matmul_op_to_weight_type(enum HtpOpsIndex op) {
   }
 }
 
+constexpr size_t kBlockSparseAttnLegacyPayloadSize = offsetof(BlockSparseAttnParams, sparse_policy);
+static_assert(kBlockSparseAttnLegacyPayloadSize == 92);
+static_assert(offsetof(BlockSparseAttnParams, elapsed_us) + sizeof(int32_t) ==
+              kBlockSparseAttnLegacyPayloadSize);
+constexpr size_t kBlockSparseAttnHaloV1PayloadSize =
+  offsetof(BlockSparseAttnParams, halo_image_q_batch_updates);
+static_assert(kBlockSparseAttnHaloV1PayloadSize == 136);
+
 }  // namespace
 
 extern "C" {
@@ -53,7 +78,58 @@ extern "C" {
 #define IN_PTR(i)  std::get<0>(in_bufs[i])
 #define OUT_PTR(i) std::get<0>(out_bufs[i])
 
-int execute_op_simple(struct OpComputeRequest *req) {
+int block_sparse_attn_buffer_sizes(const struct BlockSparseAttnParams *params,
+                                   struct BlockSparseAttnBufferSizes *sizes) {
+  if (params == nullptr || sizes == nullptr || params->qo_len <= 0 || params->kv_len <= 0 ||
+      params->n_heads <= 0 || params->n_kv_heads <= 0 || params->head_dim <= 0 ||
+      params->n_q_blocks <= 0 || params->n_k_blocks <= 0 ||
+      (params->mask_format != 0 && params->mask_format != 1) ||
+      (params->mask_format == 1 && params->max_kept_blocks <= 0)) {
+    return -1;
+  }
+
+  size_t q_elements;
+  size_t q_size;
+  size_t o_head_dim;
+  size_t o_elements;
+  size_t o_size;
+  size_t kv_elements;
+  size_t kv_size;
+  size_t block_mask_elements;
+  size_t block_mask_size;
+  const size_t mask_row_width = params->mask_format == 1 ?
+    (size_t) params->max_kept_blocks : (size_t) params->n_k_blocks;
+  if (!checked_size_mul((size_t) params->qo_len, (size_t) params->n_heads, &q_elements) ||
+      !checked_size_mul(q_elements, (size_t) params->head_dim, &q_elements) ||
+      !checked_size_mul(q_elements, sizeof(float), &q_size) ||
+      !checked_size_add((size_t) params->head_dim, params->with_lse != 0 ? 1u : 0u, &o_head_dim) ||
+      !checked_size_mul((size_t) params->qo_len, (size_t) params->n_heads, &o_elements) ||
+      !checked_size_mul(o_elements, o_head_dim, &o_elements) ||
+      !checked_size_mul(o_elements, sizeof(float), &o_size) ||
+      !checked_size_mul((size_t) params->kv_len, (size_t) params->n_kv_heads, &kv_elements) ||
+      !checked_size_mul(kv_elements, (size_t) params->head_dim, &kv_elements) ||
+      !checked_size_mul(kv_elements, sizeof(__fp16), &kv_size) ||
+      !checked_size_mul((size_t) params->n_q_blocks, mask_row_width, &block_mask_elements) ||
+      !checked_size_mul(block_mask_elements, sizeof(int32_t), &block_mask_size)) {
+    return -1;
+  }
+
+  *sizes = {
+    .q = q_size,
+    .o = o_size,
+    .kv = kv_size,
+    .block_mask = block_mask_size,
+  };
+  return 0;
+}
+
+int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
+  if (req == nullptr || req_size < sizeof(OpComputeRequest)) {
+    return -1;
+  }
+
+  const size_t payload_size = req_size - sizeof(OpComputeRequest);
+
   // using FatPointer = std::pair<uint8_t *, size_t>;
   using Buffer = std::tuple<uint8_t *, size_t, bool>;
   std::vector<Buffer> in_bufs, out_bufs;
@@ -84,6 +160,9 @@ int execute_op_simple(struct OpComputeRequest *req) {
   switch (req->op) {
     case HTP_OPS_RMS_NORM_F32:
       {
+        if (payload_size < sizeof(RmsNormF32Params)) {
+          return -1;
+        }
         auto   params = reinterpret_cast<RmsNormF32Params *>(req->payload);
         size_t size   = params->ne0 * params->ne1 * sizeof(float);
 
@@ -98,6 +177,9 @@ int execute_op_simple(struct OpComputeRequest *req) {
 
     case HTP_OPS_MAT_MUL_PERMUTED_W16A32:
       {
+        if (payload_size < sizeof(MatMulParams)) {
+          return -1;
+        }
         auto params = reinterpret_cast<MatMulParams *>(req->payload);
         int  m = params->m, k = params->k, n = params->n;
 
@@ -119,6 +201,9 @@ int execute_op_simple(struct OpComputeRequest *req) {
     case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
     case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL:
       {
+        if (payload_size < sizeof(MatMulParams)) {
+          return -1;
+        }
         auto   weight_type      = matmul_op_to_weight_type(static_cast<HtpOpsIndex>(req->op));
         size_t super_block_size = ggml_super_block_size(weight_type);
 
@@ -154,6 +239,9 @@ int execute_op_simple(struct OpComputeRequest *req) {
 
     case HTP_OPS_FLASH_ATTN_QO_F32_KV_F16:
       {
+        if (payload_size < sizeof(FlashAttnParams)) {
+          return -1;
+        }
         auto params = reinterpret_cast<FlashAttnParams *>(req->payload);
 
         int qo_len     = params->qo_len;
@@ -209,7 +297,18 @@ int execute_op_simple(struct OpComputeRequest *req) {
 
     case HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16:
       {
-        auto params = reinterpret_cast<BlockSparseAttnParams *>(req->payload);
+        const bool legacy_payload = payload_size == kBlockSparseAttnLegacyPayloadSize;
+        const bool halo_v1_payload = payload_size == kBlockSparseAttnHaloV1PayloadSize;
+        if (!legacy_payload && !halo_v1_payload && payload_size < sizeof(BlockSparseAttnParams)) {
+          return -1;
+        }
+
+        BlockSparseAttnParams decoded_params = {};
+        const size_t decoded_size = legacy_payload ? kBlockSparseAttnLegacyPayloadSize :
+                                    (halo_v1_payload ? kBlockSparseAttnHaloV1PayloadSize :
+                                                       sizeof(decoded_params));
+        memcpy(&decoded_params, req->payload, decoded_size);
+        auto *params = &decoded_params;
 
         int qo_len     = params->qo_len;
         int kv_len     = params->kv_len;
@@ -220,26 +319,46 @@ int execute_op_simple(struct OpComputeRequest *req) {
         int max_kept_blocks = params->max_kept_blocks;
         bool with_lse = params->with_lse != 0;
 
-        size_t q_size         = qo_len * n_heads * head_dim * sizeof(float);
-        size_t o_size         = qo_len * n_heads * (head_dim + (with_lse ? 1 : 0)) * sizeof(float);
-        size_t kv_size        = kv_len * n_kv_heads * head_dim * sizeof(__fp16);
-        size_t block_mask_len =
-          mask_format == 1 ? params->n_q_blocks * max_kept_blocks : params->n_q_blocks * params->n_k_blocks;
+        BlockSparseAttnBufferSizes buffer_sizes = {};
+        if (block_sparse_attn_buffer_sizes(params, &buffer_sizes) != 0) {
+          return -1;
+        }
 
-        add_buffer(out_bufs, params->o, o_size);
-        add_buffer(in_bufs, params->q, q_size);
-        add_buffer(in_bufs, params->k, kv_size);
-        add_buffer(in_bufs, params->v, kv_size);
-        add_buffer(in_bufs, params->block_mask, block_mask_len * sizeof(int32_t));
+        add_buffer(out_bufs, params->o, buffer_sizes.o);
+        add_buffer(in_bufs, params->q, buffer_sizes.q);
+        add_buffer(in_bufs, params->k, buffer_sizes.kv);
+        add_buffer(in_bufs, params->v, buffer_sizes.kv);
+        add_buffer(in_bufs, params->block_mask, buffer_sizes.block_mask);
 
         validate_in_bufs();
+        block_sparse_halo_run_trace_t halo_run_trace = {};
         const int64_t t0 = HAP_perf_get_qtimer_count();
         ret = block_sparse_flash_attn((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1),
                                       (__fp16 *) IN_PTR(2), (const int32_t *) IN_PTR(3), qo_len, kv_len, n_heads,
                                       n_kv_heads, head_dim, params->block_q, params->block_k, params->n_q_blocks,
-                                      params->n_k_blocks, mask_format, max_kept_blocks, with_lse);
+                                      params->n_k_blocks, mask_format, max_kept_blocks, with_lse,
+                                      params->sparse_policy, params->image_tokens, params->text_tokens,
+                                      params->image_block_rows, params->image_block_cols,
+                                      params->halo_kv_load_mode, params->halo_trace != 0,
+                                      params->halo_trace != 0 ? &halo_run_trace : NULL);
         const int64_t elapsed_us = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
-        params->elapsed_us = (int32_t) elapsed_us;
+        auto *wire_params = reinterpret_cast<BlockSparseAttnParams *>(req->payload);
+        wire_params->elapsed_us = (int32_t) elapsed_us;
+        if (!legacy_payload) {
+          wire_params->halo_exec_mode = params->halo_trace != 0 ? halo_run_trace.exec_mode : -1;
+          wire_params->halo_image_rows_updated =
+            params->halo_trace != 0 ? halo_run_trace.image_rows_updated : 0;
+          wire_params->halo_text_q_image_row_updates =
+            params->halo_trace != 0 ? halo_run_trace.text_q_image_row_updates : 0;
+          wire_params->halo_text_q_image_block_updates =
+            params->halo_trace != 0 ? halo_run_trace.text_q_image_block_updates : 0;
+        }
+        if (!legacy_payload && !halo_v1_payload) {
+          wire_params->halo_image_q_batch_updates =
+            params->halo_trace != 0 ? halo_run_trace.image_q_batch_updates : 0;
+          wire_params->halo_image_q_segment_updates =
+            params->halo_trace != 0 ? halo_run_trace.image_q_segment_updates : 0;
+        }
         FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=block_sparse elapsed_us=%lld", elapsed_us);
         validate_out_bufs();
       }
@@ -247,6 +366,9 @@ int execute_op_simple(struct OpComputeRequest *req) {
 
     case HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16:
       {
+        if (payload_size < sizeof(BlockSparseScoreParams)) {
+          return -1;
+        }
         auto params = reinterpret_cast<BlockSparseScoreParams *>(req->payload);
 
         int head_dim   = params->head_dim;

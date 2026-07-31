@@ -41,6 +41,53 @@ struct OpComputeRequest {
   uint8_t  payload[0];
 } __attribute__((packed));
 
+static inline int message_header_validate_layout(const struct MessageHeader *h, size_t capacity,
+                                                 size_t *total_size) {
+  if (h == NULL || total_size == NULL ||
+      capacity < sizeof(struct MessageHeader) + sizeof(int32_t)) {
+    return 0;
+  }
+
+  const int32_t n_reqs = h->n_reqs;
+  if (n_reqs < 0) {
+    return 0;
+  }
+
+  const size_t offset_count = (size_t) n_reqs + 1;
+  const size_t max_offset_count =
+    (capacity - sizeof(struct MessageHeader)) / sizeof(int32_t);
+  if (offset_count > max_offset_count) {
+    return 0;
+  }
+
+  const size_t header_size =
+    sizeof(struct MessageHeader) + offset_count * sizeof(int32_t);
+  const int32_t first_wire_offset = h->req_offsets[0];
+  if (first_wire_offset < 0) {
+    return 0;
+  }
+
+  size_t begin = (size_t) first_wire_offset;
+  if (begin < header_size || begin > capacity) {
+    return 0;
+  }
+
+  for (int32_t i = 0; i < n_reqs; ++i) {
+    const int32_t end_wire_offset = h->req_offsets[i + 1];
+    if (end_wire_offset < 0) {
+      return 0;
+    }
+    const size_t end = (size_t) end_wire_offset;
+    if (end < begin || end > capacity || end - begin < sizeof(struct RequestHeader)) {
+      return 0;
+    }
+    begin = end;
+  }
+
+  *total_size = begin;
+  return 1;
+}
+
 static inline size_t message_header_size(const struct MessageHeader *h) {
   return sizeof(struct MessageHeader) + (h->n_reqs + 1) * sizeof(int32_t);
 }
