@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.14.3)
 project(htp_ops C CXX ASM)
 # cmake_policy(SET CMP0115 OLD)
 
+option(HTP_OPS_QUIET_BENCH "Disable DSP FARF logging for unbiased benchmarks" OFF)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
@@ -79,6 +81,9 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/rms_norm.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/mm_benchmark.c
     )
+    if(HTP_OPS_QUIET_BENCH)
+        target_compile_definitions(htp_ops_skel PRIVATE HTP_OPS_QUIET_BENCH)
+    endif()
     build_idl(include/htp_ops.idl htp_ops_skel)
 
     # Enable HMX inline assembly

@@ -284,6 +284,11 @@ AEEResult htp_ops_close(remote_handle64 handle) {
 
 // FastRPC interface
 AEEResult htp_ops_init_backend(remote_handle64 handle) {
+#ifdef HTP_OPS_QUIET_BENCH
+  // FARF logging is asynchronous but still adds DSP/RPC pressure to short graphs.
+  // Keep it disabled only in the explicitly requested benchmark build.
+  HAP_setFARFRuntimeLoggingParams(0, NULL, 0);
+#endif
   FARF(ALWAYS, "init_backend called");
 
   if (!backend_opened) {

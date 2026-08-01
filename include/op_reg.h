@@ -23,6 +23,8 @@ enum HtpOpsIndex {
   HTP_OPS_FLASH_ATTN_QO_F32_KV_F16,
   HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16,
   HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16,
+  HTP_OPS_QKV_MUL_RMS_PACKED_W16A32,
+  HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16,
   HTP_OPS_COUNT,
 };
 
@@ -46,6 +48,29 @@ struct MatMulParams {
   int32_t k;
   int32_t n;
 } __attribute__((packed));
+
+struct QkvMulRmsPackedParams {
+  struct RpcmemBufAddr q;
+  struct RpcmemBufAddr k_out;
+  struct RpcmemBufAddr v;
+  struct RpcmemBufAddr activation;
+  struct RpcmemBufAddr weight;
+  struct RpcmemBufAddr bias;
+  struct RpcmemBufAddr q_norm;
+  struct RpcmemBufAddr k_norm;
+  int32_t tokens;
+  int32_t input_dim;
+  int32_t n_heads;
+  int32_t head_dim;
+  int32_t elapsed_us;
+} __attribute__((packed));
+
+#ifdef __cplusplus
+static_assert(sizeof(QkvMulRmsPackedParams) == 84);
+#else
+_Static_assert(sizeof(struct QkvMulRmsPackedParams) == 84,
+               "unexpected QKV MUL payload size");
+#endif
 
 struct FlashAttnParams {
   struct RpcmemBufAddr o;
@@ -99,6 +124,7 @@ struct BlockSparseAttnParams {
 
 enum HtpHaloExecTraceMode {
   HTP_HALO_EXEC_TRACE_USERDMA_ROWS = 2,
+  HTP_HALO_EXEC_TRACE_CHUNKED_FALLBACK = 3,
 };
 
 #ifdef __cplusplus

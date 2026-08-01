@@ -19,6 +19,11 @@ int hvx_rms_norm_f32(float *restrict dst, const float *restrict src, int ne0, in
 
 int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *activation, const __fp16 *permuted_weight, int m,
                                 int k, int n);
+int hmx_qkv_mul_rms_packed_w16a32(
+    __fp16 *restrict q, __fp16 *restrict k_out, __fp16 *restrict v,
+    const float *restrict activation, const __fp16 *restrict permuted_weight,
+    const float *restrict bias, const float *restrict q_norm, const float *restrict k_norm,
+    int tokens, int input_dim, int n_heads, int head_dim);
 int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *activation, const uint8_t *permuted_weight,
                                      int m, int k, int n, enum ggml_type weight_type);
 
@@ -42,6 +47,8 @@ typedef struct {
 #define BLOCK_SPARSE_HALO_DMA_BANKS 2
 #define BLOCK_SPARSE_HALO_DMA_DESCS_PER_BANK (2 * BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS)
 #define BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW 2
+#define BLOCK_SPARSE_HALO_PACKED_DMA_DESCS_PER_ROW 3
+#define BLOCK_SPARSE_HALO_MAX_DMA_DESCS_PER_ROW BLOCK_SPARSE_HALO_PACKED_DMA_DESCS_PER_ROW
 #define BLOCK_SPARSE_HALO_ROW_SLOTS 4
 #define BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS 3
 #define BLOCK_SPARSE_HALO_RAW_STAGING_SLOTS 1
@@ -212,6 +219,14 @@ int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const 
                             int n_k_blocks, int mask_format, int max_kept_blocks, bool with_lse, int sparse_policy,
                             int image_tokens, int text_tokens, int image_block_rows, int image_block_cols,
                             int halo_kv_load_mode, bool halo_trace, block_sparse_halo_run_trace_t *halo_run_trace);
+int block_sparse_flash_attn_packed(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K,
+                                   const __fp16 *restrict V, const int32_t *restrict block_mask,
+                                   int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
+                                   int block_q, int block_k, int n_q_blocks, int n_k_blocks,
+                                   int mask_format, int max_kept_blocks, bool with_lse, int sparse_policy,
+                                   int image_tokens, int text_tokens, int image_block_rows, int image_block_cols,
+                                   int halo_kv_load_mode, bool halo_trace,
+                                   block_sparse_halo_run_trace_t *halo_run_trace);
 
 int block_sparse_flash_attn_f16_core_halo_l2(
     int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, __fp16 *restrict O, const __fp16 *restrict Q,
@@ -325,6 +340,10 @@ int block_sparse_halo_dma_preflight(const void *k_base, const void *v_base, cons
                                     size_t vtcm_slice_size, unsigned int vtcm_slice_count,
                                     int n_kv_heads, int head_dim, int image_tokens,
                                     const block_sparse_halo_plan_t *plan);
+int block_sparse_packed_qk_tile_offset(size_t *offset, int head, int token_tile, int dim_tile,
+                                       int token_tiles, int head_dim);
+int block_sparse_packed_v_tile_offset(size_t *offset, int head, int token_tile, int dim_tile,
+                                      int token_tiles, int head_dim);
 int block_sparse_halo_init_dma_banks(block_sparse_halo_dma_bank_t *banks[BLOCK_SPARSE_HALO_DMA_BANKS],
                                      dma_desc_2d_t *external_descs[BLOCK_SPARSE_HALO_DMA_BANKS],
                                      void *vtcm, size_t vtcm_bytes, const block_sparse_halo_plan_t *plan);

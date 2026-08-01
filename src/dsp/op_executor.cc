@@ -13,6 +13,8 @@
 #include <HAP_farf.h>
 #include <HAP_perf.h>
 
+#include "dsp/hmx_utils.h"
+
 namespace {
 
 size_t align_up_size(size_t v, size_t a) {
@@ -197,6 +199,61 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
       }
       break;
 
+    case HTP_OPS_QKV_MUL_RMS_PACKED_W16A32:
+      {
+        if (payload_size < sizeof(QkvMulRmsPackedParams)) {
+          return -1;
+        }
+        auto params = reinterpret_cast<QkvMulRmsPackedParams *>(req->payload);
+        if (params->tokens <= 0 || params->input_dim <= 0 || params->n_heads != 24 ||
+            params->head_dim != 64 || params->input_dim % 32 != 0) {
+          return -1;
+        }
+
+        const size_t padded_tokens = align_up_size((size_t) params->tokens, 32);
+        const size_t head_tile_elems =
+          (padded_tokens / 32) * ((size_t) params->head_dim / 32) * HMX_FP16_TILE_N_ELMS;
+        size_t qkv_size = 0;
+        size_t activation_size = 0;
+        size_t weight_cols = 0;
+        size_t weight_size = 0;
+        size_t bias_size = 0;
+        const bool sizes_ok =
+          checked_size_mul((size_t) params->n_heads, head_tile_elems, &qkv_size) &&
+          checked_size_mul((size_t) params->tokens, (size_t) params->input_dim, &activation_size) &&
+          checked_size_mul((size_t) params->n_heads, (size_t) params->head_dim, &weight_cols) &&
+          checked_size_mul(weight_cols, 3, &weight_cols) &&
+          checked_size_mul((size_t) params->input_dim, weight_cols, &weight_size) &&
+          checked_size_mul(weight_size, sizeof(__fp16), &weight_size) &&
+          checked_size_mul(weight_cols, sizeof(float), &bias_size) &&
+          checked_size_mul(activation_size, sizeof(float), &activation_size);
+        if (!sizes_ok) {
+          return -1;
+        }
+
+        add_buffer(out_bufs, params->q, qkv_size * sizeof(__fp16));
+        add_buffer(out_bufs, params->k_out, qkv_size * sizeof(__fp16));
+        add_buffer(out_bufs, params->v, qkv_size * sizeof(__fp16));
+        add_buffer(in_bufs, params->activation, activation_size);
+        add_buffer(in_bufs, params->weight, weight_size);
+        add_buffer(in_bufs, params->bias, bias_size);
+        add_buffer(in_bufs, params->q_norm, (size_t) params->head_dim * sizeof(float));
+        add_buffer(in_bufs, params->k_norm, (size_t) params->head_dim * sizeof(float));
+
+        validate_in_bufs();
+        // The message-channel receiver owns the HMX execution lock for its loop.
+        const int64_t t0 = HAP_perf_get_qtimer_count();
+        ret = hmx_qkv_mul_rms_packed_w16a32(
+          (__fp16 *) OUT_PTR(0), (__fp16 *) OUT_PTR(1), (__fp16 *) OUT_PTR(2),
+          (const float *) IN_PTR(0), (const __fp16 *) IN_PTR(1), (const float *) IN_PTR(2),
+          (const float *) IN_PTR(3), (const float *) IN_PTR(4), params->tokens, params->input_dim,
+          params->n_heads, params->head_dim);
+        params->elapsed_us = (int32_t) HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+        FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=qkv_mul_rms_packed elapsed_us=%d", params->elapsed_us);
+        validate_out_bufs();
+      }
+      break;
+
     case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:
     case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
     case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL:
@@ -296,10 +353,13 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
       break;
 
     case HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16:
+    case HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16:
       {
+        const bool input_packed = req->op == HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16;
         const bool legacy_payload = payload_size == kBlockSparseAttnLegacyPayloadSize;
         const bool halo_v1_payload = payload_size == kBlockSparseAttnHaloV1PayloadSize;
-        if (!legacy_payload && !halo_v1_payload && payload_size < sizeof(BlockSparseAttnParams)) {
+        if ((!legacy_payload && !halo_v1_payload && payload_size < sizeof(BlockSparseAttnParams)) ||
+            (input_packed && payload_size < sizeof(BlockSparseAttnParams))) {
           return -1;
         }
 
@@ -323,6 +383,25 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
         if (block_sparse_attn_buffer_sizes(params, &buffer_sizes) != 0) {
           return -1;
         }
+        if (input_packed) {
+          if (qo_len != kv_len || n_heads != 24 || n_kv_heads != 24 || head_dim != 64 ||
+              params->block_q != 32 || params->block_k != 32 || mask_format != 1 ||
+              params->sparse_policy != HTP_SPARSE_POLICY_STATIC_HALO ||
+              (params->halo_kv_load_mode != HTP_HALO_KV_LOAD_L2_PREFETCH &&
+               params->halo_kv_load_mode != HTP_HALO_KV_LOAD_USERDMA_AB)) {
+            return -1;
+          }
+          const size_t padded_tokens = align_up_size((size_t) qo_len, 32);
+          size_t packed_elements = 0;
+          size_t packed_size = 0;
+          if (!checked_size_mul(padded_tokens, (size_t) n_heads, &packed_elements) ||
+              !checked_size_mul(packed_elements, (size_t) head_dim, &packed_elements) ||
+              !checked_size_mul(packed_elements, sizeof(__fp16), &packed_size)) {
+            return -1;
+          }
+          buffer_sizes.q = packed_size;
+          buffer_sizes.kv = packed_size;
+        }
 
         add_buffer(out_bufs, params->o, buffer_sizes.o);
         add_buffer(in_bufs, params->q, buffer_sizes.q);
@@ -333,14 +412,23 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
         validate_in_bufs();
         block_sparse_halo_run_trace_t halo_run_trace = {};
         const int64_t t0 = HAP_perf_get_qtimer_count();
-        ret = block_sparse_flash_attn((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1),
-                                      (__fp16 *) IN_PTR(2), (const int32_t *) IN_PTR(3), qo_len, kv_len, n_heads,
-                                      n_kv_heads, head_dim, params->block_q, params->block_k, params->n_q_blocks,
-                                      params->n_k_blocks, mask_format, max_kept_blocks, with_lse,
-                                      params->sparse_policy, params->image_tokens, params->text_tokens,
-                                      params->image_block_rows, params->image_block_cols,
-                                      params->halo_kv_load_mode, params->halo_trace != 0,
-                                      params->halo_trace != 0 ? &halo_run_trace : NULL);
+        ret = input_packed ?
+          block_sparse_flash_attn_packed(
+            (__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
+            (const int32_t *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim,
+            params->block_q, params->block_k, params->n_q_blocks, params->n_k_blocks,
+            mask_format, max_kept_blocks, with_lse, params->sparse_policy, params->image_tokens,
+            params->text_tokens, params->image_block_rows, params->image_block_cols,
+            params->halo_kv_load_mode, params->halo_trace != 0,
+            params->halo_trace != 0 ? &halo_run_trace : NULL) :
+          block_sparse_flash_attn(
+            (__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
+            (const int32_t *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim,
+            params->block_q, params->block_k, params->n_q_blocks, params->n_k_blocks,
+            mask_format, max_kept_blocks, with_lse, params->sparse_policy, params->image_tokens,
+            params->text_tokens, params->image_block_rows, params->image_block_cols,
+            params->halo_kv_load_mode, params->halo_trace != 0,
+            params->halo_trace != 0 ? &halo_run_trace : NULL);
         const int64_t elapsed_us = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
         auto *wire_params = reinterpret_cast<BlockSparseAttnParams *>(req->payload);
         wire_params->elapsed_us = (int32_t) elapsed_us;
@@ -359,7 +447,8 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
           wire_params->halo_image_q_segment_updates =
             params->halo_trace != 0 ? halo_run_trace.image_q_segment_updates : 0;
         }
-        FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=block_sparse elapsed_us=%lld", elapsed_us);
+        FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=%s elapsed_us=%lld",
+             input_packed ? "block_sparse_packed" : "block_sparse", elapsed_us);
         validate_out_bufs();
       }
       break;

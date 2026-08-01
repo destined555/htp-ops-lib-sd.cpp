@@ -70,6 +70,8 @@ static_assert(offsetof(BlockSparseAttnParams, elapsed_us) + sizeof(int32_t) ==
 constexpr size_t kBlockSparseAttnHaloV1PayloadSize =
   offsetof(BlockSparseAttnParams, halo_image_q_batch_updates);
 static_assert(kBlockSparseAttnHaloV1PayloadSize == 136);
+static_assert(HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16 ==
+              HTP_OPS_QKV_MUL_RMS_PACKED_W16A32 + 1);
 
 template <size_t PayloadSize>
 struct alignas(8) SparseExecutorTestRequest {
@@ -1571,6 +1573,31 @@ void test_block_sparse_halo_raw_row_pack_contracts() {
   worker_pool_synctoken_wait(&state.sync);
 }
 
+void test_block_sparse_packed_layout_contracts() {
+  constexpr int token_tiles = 7;
+  constexpr int head_dim = 64;
+  constexpr size_t tile_elems = 32 * 32;
+  constexpr size_t head_elems = token_tiles * (head_dim / 32) * tile_elems;
+  size_t offset = 0;
+
+  OP_TEST_ASSERT(block_sparse_packed_qk_tile_offset(
+                   &offset, 2, 3, 1, token_tiles, head_dim) == 0);
+  OP_TEST_ASSERT(offset == 2 * head_elems + (3 * 2 + 1) * tile_elems);
+
+  OP_TEST_ASSERT(block_sparse_packed_v_tile_offset(
+                   &offset, 2, 3, 1, token_tiles, head_dim) == 0);
+  OP_TEST_ASSERT(offset == 2 * head_elems + (1 * token_tiles + 3) * tile_elems);
+
+  OP_TEST_ASSERT(block_sparse_packed_qk_tile_offset(
+                   &offset, -1, 0, 0, token_tiles, head_dim) == -1);
+  OP_TEST_ASSERT(block_sparse_packed_qk_tile_offset(
+                   &offset, 0, token_tiles, 0, token_tiles, head_dim) == -1);
+  OP_TEST_ASSERT(block_sparse_packed_v_tile_offset(
+                   &offset, 0, 0, head_dim / 32, token_tiles, head_dim) == -1);
+  OP_TEST_ASSERT(block_sparse_packed_v_tile_offset(
+                   &offset, 0, 0, 0, token_tiles, 48) == -1);
+}
+
 void test_block_sparse_halo_userdma_scope() {
   const int ok[2] = {DMA_SUBMIT_OK, DMA_SUBMIT_OK};
   const int busy[2] = {DMA_SUBMIT_OK, DMA_SUBMIT_BUSY};
@@ -1868,6 +1895,7 @@ void internal_op_tests() {
   test_block_sparse_halo_update_segment_plan_contracts();
   test_block_sparse_halo_fused_scratch_contracts();
   test_block_sparse_halo_raw_row_pack_contracts();
+  test_block_sparse_packed_layout_contracts();
   test_block_sparse_halo_userdma_scope();
   test_block_sparse_attn_buffer_size_contracts();
   test_op_executor_sparse_payload_boundaries();
