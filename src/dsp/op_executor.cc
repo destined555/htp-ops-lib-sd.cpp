@@ -125,6 +125,36 @@ int block_sparse_attn_buffer_sizes(const struct BlockSparseAttnParams *params,
   return 0;
 }
 
+int qkv_mul_rms_packed_dual_buffer_sizes(const struct QkvMulRmsPackedDualParams *params,
+                                         struct QkvMulRmsPackedBufferSizes *sizes) {
+  if (params == nullptr || sizes == nullptr || params->image_tokens <= 0 || params->text_tokens <= 0 ||
+      params->image_tokens % 32 != 0 ||
+      params->input_dim <= 0 || params->input_dim % 32 != 0 || params->n_heads != 24 ||
+      params->head_dim != 64) {
+    return -1;
+  }
+  const size_t image_tokens = (size_t) params->image_tokens;
+  const size_t text_tokens = (size_t) params->text_tokens;
+  const size_t combined_tokens = image_tokens + text_tokens;
+  const size_t token_tiles = (combined_tokens + 31u) / 32u;
+  size_t qkv_elements = 0;
+  size_t weight_cols = 0;
+  if (!checked_size_mul(token_tiles, (size_t) params->n_heads, &qkv_elements) ||
+      !checked_size_mul(qkv_elements, (size_t) params->head_dim / 32u * 1024u, &qkv_elements) ||
+      !checked_size_mul(qkv_elements, sizeof(__fp16), &sizes->qkv_bytes) ||
+      !checked_size_mul(combined_tokens, (size_t) params->input_dim, &sizes->activation_bytes) ||
+      !checked_size_mul(sizes->activation_bytes, sizeof(float), &sizes->activation_bytes) ||
+      !checked_size_mul((size_t) params->input_dim, (size_t) params->n_heads * params->head_dim * 3u, &weight_cols) ||
+      !checked_size_mul(weight_cols, sizeof(__fp16), &sizes->weight_bytes) ||
+      !checked_size_mul((size_t) params->n_heads * params->head_dim * 3u, sizeof(float), &sizes->bias_bytes) ||
+      !checked_size_mul((size_t) params->head_dim, sizeof(float), &sizes->norm_bytes)) {
+    return -1;
+  }
+  sizes->combined_tokens = combined_tokens;
+  sizes->token_tiles = token_tiles;
+  return 0;
+}
+
 int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
   if (req == nullptr || req_size < sizeof(OpComputeRequest)) {
     return -1;
@@ -250,6 +280,51 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
           params->n_heads, params->head_dim);
         params->elapsed_us = (int32_t) HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
         FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=qkv_mul_rms_packed elapsed_us=%d", params->elapsed_us);
+        validate_out_bufs();
+      }
+      break;
+
+    case HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_W16A32:
+      {
+        if (payload_size < sizeof(QkvMulRmsPackedDualParams)) {
+          return -1;
+        }
+        auto params = reinterpret_cast<QkvMulRmsPackedDualParams *>(req->payload);
+        QkvMulRmsPackedBufferSizes sizes = {};
+        if (qkv_mul_rms_packed_dual_buffer_sizes(params, &sizes) != 0) {
+          return -1;
+        }
+        add_buffer(out_bufs, params->q, sizes.qkv_bytes);
+        add_buffer(out_bufs, params->k_out, sizes.qkv_bytes);
+        add_buffer(out_bufs, params->v, sizes.qkv_bytes);
+        add_buffer(in_bufs, params->image_activation,
+                   (size_t) params->image_tokens * params->input_dim * sizeof(float));
+        add_buffer(in_bufs, params->image_weight, sizes.weight_bytes);
+        if (params->image_bias.fd >= 0) add_buffer(in_bufs, params->image_bias, sizes.bias_bytes);
+        else in_bufs.push_back({ nullptr, sizes.bias_bytes, false });
+        add_buffer(in_bufs, params->image_q_norm, sizes.norm_bytes);
+        add_buffer(in_bufs, params->image_k_norm, sizes.norm_bytes);
+        add_buffer(in_bufs, params->text_activation,
+                   (size_t) params->text_tokens * params->input_dim * sizeof(float));
+        add_buffer(in_bufs, params->text_weight, sizes.weight_bytes);
+        if (params->text_bias.fd >= 0) add_buffer(in_bufs, params->text_bias, sizes.bias_bytes);
+        else in_bufs.push_back({ nullptr, sizes.bias_bytes, false });
+        add_buffer(in_bufs, params->text_q_norm, sizes.norm_bytes);
+        add_buffer(in_bufs, params->text_k_norm, sizes.norm_bytes);
+        validate_in_bufs();
+        const int64_t t0 = HAP_perf_get_qtimer_count();
+        static float zero_bias[3 * 24 * 64] __attribute__((aligned(128))) = {};
+        ret = hmx_qkv_mul_rms_packed_dual_w16a32(
+            (__fp16 *) OUT_PTR(0), (__fp16 *) OUT_PTR(1), (__fp16 *) OUT_PTR(2),
+            (const float *) IN_PTR(0), (const __fp16 *) IN_PTR(1),
+            params->image_bias.fd >= 0 ? (const float *) IN_PTR(2) : zero_bias,
+            (const float *) IN_PTR(3), (const float *) IN_PTR(4), params->image_tokens,
+            (const float *) IN_PTR(5), (const __fp16 *) IN_PTR(6),
+            params->text_bias.fd >= 0 ? (const float *) IN_PTR(7) : zero_bias,
+            (const float *) IN_PTR(8), (const float *) IN_PTR(9), params->text_tokens,
+            params->input_dim, params->n_heads, params->head_dim);
+        params->elapsed_us = (int32_t) HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+        FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=qkv_mul_rms_packed_dual elapsed_us=%d", params->elapsed_us);
         validate_out_bufs();
       }
       break;

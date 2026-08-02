@@ -1075,6 +1075,7 @@ typedef struct {
   int           n_cols;
   int           q_cols;
   int           token_tiles;
+  int           output_token_offset;
   int           head_dim;
 } qkv_postprocess_task_state_t;
 
@@ -1100,7 +1101,8 @@ static void qkv_postprocess_worker(void *data, int worker_index) {
     const int col = (task_id % heads_in_chunk) * state->head_dim;
     const int rows_in_tile = smin(
       state->n_rows - row_tile * HMX_FP16_TILE_N_ROWS, HMX_FP16_TILE_N_ROWS);
-    const int token_tile = (int) (state->mr / HMX_FP16_TILE_N_ROWS) + row_tile;
+    const int token_tile = (state->output_token_offset + (int) state->mr) /
+                             HMX_FP16_TILE_N_ROWS + row_tile;
     const int global_col = (int) state->nc + col;
     const bool is_q = global_col < state->q_cols;
     const bool is_k = global_col >= state->q_cols && global_col < 2 * state->q_cols;
@@ -1144,11 +1146,12 @@ static void qkv_postprocess_worker(void *data, int worker_index) {
   worker_pool_synctoken_jobdone(&state->sync_ctx);
 }
 
-int hmx_qkv_mul_rms_packed_w16a32(
+static int hmx_qkv_mul_rms_packed_w16a32_impl(
     __fp16 *restrict q, __fp16 *restrict k_out, __fp16 *restrict v,
     const float *restrict activation, const __fp16 *restrict permuted_weight,
     const float *restrict bias, const float *restrict q_norm, const float *restrict k_norm,
-    int tokens, int input_dim, int n_heads, int head_dim) {
+    int tokens, int input_dim, int n_heads, int head_dim,
+    int output_token_tiles, int output_token_offset) {
   if (q == NULL || k_out == NULL || v == NULL || activation == NULL || permuted_weight == NULL ||
       bias == NULL || q_norm == NULL || k_norm == NULL || tokens <= 0 || input_dim <= 0 ||
       n_heads != 24 || head_dim != 64 || input_dim % 32 != 0) {
@@ -1165,7 +1168,11 @@ int hmx_qkv_mul_rms_packed_w16a32(
   }
 
   const int token_tiles = ceil_div(tokens, HMX_FP16_TILE_N_ROWS);
-  const size_t head_tile_elems = (size_t) token_tiles * (size_t) (head_dim / HMX_FP16_TILE_N_COLS) *
+  if (output_token_tiles < token_tiles || output_token_offset < 0 ||
+      output_token_offset % HMX_FP16_TILE_N_ROWS != 0) {
+    return -1;
+  }
+  const size_t head_tile_elems = (size_t) output_token_tiles * (size_t) (head_dim / HMX_FP16_TILE_N_COLS) *
                                  HMX_FP16_TILE_N_ELMS;
   enum { ROW_CHUNK = HMX_FP16_TILE_N_ROWS };
   uint8_t *vtcm_ptr = (uint8_t *) vtcm_manager_get_vtcm_base();
@@ -1245,7 +1252,8 @@ int hmx_qkv_mul_rms_packed_w16a32(
       state.n_col_tiles = n_col_tiles;
       state.n_cols = n_cols;
       state.q_cols = q_cols;
-      state.token_tiles = token_tiles;
+      state.token_tiles = output_token_tiles;
+      state.output_token_offset = output_token_offset;
       state.head_dim = head_dim;
       const worker_pool_job_t job = { .fptr = qkv_postprocess_worker, .dptr = &state };
       worker_pool_synctoken_init(&state.sync_ctx, n_postprocess_workers);
@@ -1263,6 +1271,40 @@ int hmx_qkv_mul_rms_packed_w16a32(
     }
   }
   return 0;
+}
+
+int hmx_qkv_mul_rms_packed_w16a32(
+    __fp16 *restrict q, __fp16 *restrict k_out, __fp16 *restrict v,
+    const float *restrict activation, const __fp16 *restrict permuted_weight,
+    const float *restrict bias, const float *restrict q_norm, const float *restrict k_norm,
+    int tokens, int input_dim, int n_heads, int head_dim) {
+  return hmx_qkv_mul_rms_packed_w16a32_impl(
+      q, k_out, v, activation, permuted_weight, bias, q_norm, k_norm,
+      tokens, input_dim, n_heads, head_dim, ceil_div(tokens, HMX_FP16_TILE_N_ROWS), 0);
+}
+
+int hmx_qkv_mul_rms_packed_dual_w16a32(
+    __fp16 *restrict q, __fp16 *restrict k_out, __fp16 *restrict v,
+    const float *image_activation, const __fp16 *image_weight, const float *image_bias,
+    const float *image_q_norm, const float *image_k_norm, int image_tokens,
+    const float *text_activation, const __fp16 *text_weight, const float *text_bias,
+    const float *text_q_norm, const float *text_k_norm, int text_tokens,
+    int input_dim, int n_heads, int head_dim) {
+  if (image_tokens <= 0 || text_tokens <= 0) {
+    return -1;
+  }
+  const int output_token_tiles = ceil_div(image_tokens + text_tokens, HMX_FP16_TILE_N_ROWS);
+  if (hmx_qkv_mul_rms_packed_w16a32_impl(
+          q, k_out, v, image_activation, image_weight, image_bias,
+          image_q_norm, image_k_norm, image_tokens, input_dim, n_heads, head_dim,
+          output_token_tiles, 0) != 0) {
+    return -1;
+  }
+  return hmx_qkv_mul_rms_packed_w16a32_impl(
+      q, k_out, v, text_activation, text_weight, text_bias,
+      text_q_norm, text_k_norm, text_tokens, input_dim, n_heads, head_dim,
+      output_token_tiles,
+      (image_tokens + HMX_FP16_TILE_N_ROWS - 1) / HMX_FP16_TILE_N_ROWS * HMX_FP16_TILE_N_ROWS);
 }
 
 extern worker_pool_context_t hmx_worker_pool_ctx;

@@ -72,6 +72,36 @@ constexpr size_t kBlockSparseAttnHaloV1PayloadSize =
 static_assert(kBlockSparseAttnHaloV1PayloadSize == 136);
 static_assert(HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16 ==
               HTP_OPS_QKV_MUL_RMS_PACKED_W16A32 + 1);
+static_assert(sizeof(QkvMulRmsPackedDualParams) == 128);
+
+void test_qkv_mul_rms_packed_dual_contracts() {
+  QkvMulRmsPackedDualParams params = {};
+  params.image_tokens = 256;
+  params.text_tokens = 4096;
+  params.input_dim = 1536;
+  params.n_heads = 24;
+  params.head_dim = 64;
+
+  QkvMulRmsPackedBufferSizes sizes = {};
+  OP_TEST_ASSERT(qkv_mul_rms_packed_dual_buffer_sizes(&params, &sizes) == 0);
+  OP_TEST_ASSERT(sizes.combined_tokens == 4352);
+  OP_TEST_ASSERT(sizes.token_tiles == 136);
+  OP_TEST_ASSERT(sizes.qkv_bytes == size_t(24) * 136u * 4096u);
+  OP_TEST_ASSERT(sizes.activation_bytes == size_t(4096) * 1536u * sizeof(float));
+  OP_TEST_ASSERT(sizes.weight_bytes == size_t(1536) * 4608u * sizeof(__fp16));
+  OP_TEST_ASSERT(sizes.bias_bytes == size_t(4608) * sizeof(float));
+  OP_TEST_ASSERT(sizes.norm_bytes == size_t(64) * sizeof(float));
+
+  params.image_tokens = 0;
+  OP_TEST_ASSERT(qkv_mul_rms_packed_dual_buffer_sizes(&params, &sizes) != 0);
+  params.image_tokens = 255;
+  OP_TEST_ASSERT(qkv_mul_rms_packed_dual_buffer_sizes(&params, &sizes) != 0);
+  params.image_tokens = 256;
+  params.n_heads = 16;
+  OP_TEST_ASSERT(qkv_mul_rms_packed_dual_buffer_sizes(&params, &sizes) != 0);
+
+  FARF(ALWAYS, "qkv_mul_rms_packed_dual_contracts: PASS");
+}
 
 template <size_t PayloadSize>
 struct alignas(8) SparseExecutorTestRequest {
@@ -1886,6 +1916,7 @@ void internal_op_tests();
 void internal_op_tests() {
   using namespace internal;
 
+  test_qkv_mul_rms_packed_dual_contracts();
   test_block_sparse_fa_select_plan();
   test_block_sparse_halo_contracts();
   test_block_sparse_halo_row_ring_contracts();

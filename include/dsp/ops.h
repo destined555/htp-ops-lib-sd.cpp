@@ -24,6 +24,13 @@ int hmx_qkv_mul_rms_packed_w16a32(
     const float *restrict activation, const __fp16 *restrict permuted_weight,
     const float *restrict bias, const float *restrict q_norm, const float *restrict k_norm,
     int tokens, int input_dim, int n_heads, int head_dim);
+int hmx_qkv_mul_rms_packed_dual_w16a32(
+    __fp16 *restrict q, __fp16 *restrict k_out, __fp16 *restrict v,
+    const float *image_activation, const __fp16 *image_weight, const float *image_bias,
+    const float *image_q_norm, const float *image_k_norm, int image_tokens,
+    const float *text_activation, const __fp16 *text_weight, const float *text_bias,
+    const float *text_q_norm, const float *text_k_norm, int text_tokens,
+    int input_dim, int n_heads, int head_dim);
 int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *activation, const uint8_t *permuted_weight,
                                      int m, int k, int n, enum ggml_type weight_type);
 

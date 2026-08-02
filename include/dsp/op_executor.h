@@ -16,6 +16,8 @@ extern "C" {
 
 int block_sparse_attn_buffer_sizes(const struct BlockSparseAttnParams *params,
                                    struct BlockSparseAttnBufferSizes *sizes);
+int qkv_mul_rms_packed_dual_buffer_sizes(const struct QkvMulRmsPackedDualParams *params,
+                                         struct QkvMulRmsPackedBufferSizes *sizes);
 int execute_op_simple(struct OpComputeRequest *req, size_t req_size);
 
 #ifdef __cplusplus

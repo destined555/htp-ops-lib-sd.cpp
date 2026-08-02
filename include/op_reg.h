@@ -25,6 +25,7 @@ enum HtpOpsIndex {
   HTP_OPS_BLOCK_SPARSE_SCORE_QO_F32_KM_F16,
   HTP_OPS_QKV_MUL_RMS_PACKED_W16A32,
   HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16,
+  HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_W16A32,
   HTP_OPS_COUNT,
 };
 
@@ -65,8 +66,41 @@ struct QkvMulRmsPackedParams {
   int32_t elapsed_us;
 } __attribute__((packed));
 
+struct QkvMulRmsPackedDualParams {
+  struct RpcmemBufAddr q;
+  struct RpcmemBufAddr k_out;
+  struct RpcmemBufAddr v;
+  struct RpcmemBufAddr image_activation;
+  struct RpcmemBufAddr image_weight;
+  struct RpcmemBufAddr image_bias;
+  struct RpcmemBufAddr image_q_norm;
+  struct RpcmemBufAddr image_k_norm;
+  struct RpcmemBufAddr text_activation;
+  struct RpcmemBufAddr text_weight;
+  struct RpcmemBufAddr text_bias;
+  struct RpcmemBufAddr text_q_norm;
+  struct RpcmemBufAddr text_k_norm;
+  int32_t image_tokens;
+  int32_t text_tokens;
+  int32_t input_dim;
+  int32_t n_heads;
+  int32_t head_dim;
+  int32_t elapsed_us;
+} __attribute__((packed));
+
+struct QkvMulRmsPackedBufferSizes {
+  size_t combined_tokens;
+  size_t token_tiles;
+  size_t qkv_bytes;
+  size_t activation_bytes;
+  size_t weight_bytes;
+  size_t bias_bytes;
+  size_t norm_bytes;
+};
+
 #ifdef __cplusplus
 static_assert(sizeof(QkvMulRmsPackedParams) == 84);
+static_assert(sizeof(QkvMulRmsPackedDualParams) == 128);
 #else
 _Static_assert(sizeof(struct QkvMulRmsPackedParams) == 84,
                "unexpected QKV MUL payload size");
