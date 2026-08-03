@@ -87,7 +87,7 @@ void test_qkv_mul_rms_packed_dual_contracts() {
   OP_TEST_ASSERT(sizes.combined_tokens == 4352);
   OP_TEST_ASSERT(sizes.token_tiles == 136);
   OP_TEST_ASSERT(sizes.qkv_bytes == size_t(24) * 136u * 4096u);
-  OP_TEST_ASSERT(sizes.activation_bytes == size_t(4096) * 1536u * sizeof(float));
+  OP_TEST_ASSERT(sizes.activation_bytes == size_t(4352) * 1536u * sizeof(float));
   OP_TEST_ASSERT(sizes.weight_bytes == size_t(1536) * 4608u * sizeof(__fp16));
   OP_TEST_ASSERT(sizes.bias_bytes == size_t(4608) * sizeof(float));
   OP_TEST_ASSERT(sizes.norm_bytes == size_t(64) * sizeof(float));
@@ -793,8 +793,8 @@ void test_block_sparse_halo_contracts() {
                    BLOCK_SPARSE_HALO_USERDMA_UNKNOWN, 64, resident_text_tokens, grid_w, 276992) ==
                  BLOCK_SPARSE_HALO_EXEC_L2_PREFETCH);
   OP_TEST_ASSERT(block_sparse_halo_select_execution(&selected_plan, 1, true, true,
-                   BLOCK_SPARSE_HALO_USERDMA_UNKNOWN, 64, 0, grid_w, 248320) ==
-                 BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK);
+                   BLOCK_SPARSE_HALO_USERDMA_UNKNOWN, 64, 0, grid_w, 276992) ==
+                 BLOCK_SPARSE_HALO_EXEC_L2_PREFETCH);
   OP_TEST_ASSERT(block_sparse_halo_select_execution(&selected_plan, 0, false, true,
                    BLOCK_SPARSE_HALO_USERDMA_UNKNOWN, 64, text_tokens, 0) ==
                  BLOCK_SPARSE_HALO_EXEC_BASELINE);
@@ -858,6 +858,40 @@ void test_block_sparse_halo_contracts() {
                                                 std::numeric_limits<size_t>::max()) == -1);
 
   FARF(ALWAYS, "block_sparse_halo_contracts: PASS");
+}
+
+void test_block_sparse_halo_image_only_contracts() {
+  constexpr int image_block_cols = 9;
+  constexpr size_t unlimited = std::numeric_limits<size_t>::max();
+
+  for (int head_dim : {64, 128}) {
+    block_sparse_halo_plan_t plan = {};
+    OP_TEST_ASSERT(block_sparse_halo_select_plan(&plan, 1, head_dim, 0, image_block_cols, unlimited) == 0);
+    OP_TEST_ASSERT(plan.required_bytes > 0);
+    OP_TEST_ASSERT(plan.resident_text_bytes == 0);
+    OP_TEST_ASSERT(plan.resident_text_q_bytes == 0);
+    OP_TEST_ASSERT(plan.resident_text_o_bytes == 0);
+    OP_TEST_ASSERT(plan.resident_text_state_bytes == 0);
+    OP_TEST_ASSERT(plan.packed_image_row_slot_count == BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS);
+
+    block_sparse_halo_plan_t selected = {};
+    OP_TEST_ASSERT(block_sparse_halo_select_execution(
+                     &selected, 1, true, true, BLOCK_SPARSE_HALO_USERDMA_UNKNOWN,
+                     head_dim, 0, image_block_cols, plan.required_bytes) == BLOCK_SPARSE_HALO_EXEC_L2_PREFETCH);
+    OP_TEST_ASSERT(selected.required_bytes == plan.required_bytes);
+
+    block_sparse_halo_plan_t dma_selected = {};
+    OP_TEST_ASSERT(block_sparse_halo_select_execution(
+                     &dma_selected, 2, true, true, BLOCK_SPARSE_HALO_USERDMA_PER_WORKER,
+                     head_dim, 0, image_block_cols, unlimited) == BLOCK_SPARSE_HALO_EXEC_USERDMA_ROWS);
+    OP_TEST_ASSERT(dma_selected.required_bytes > 0);
+    OP_TEST_ASSERT(dma_selected.resident_text_bytes == 0);
+    OP_TEST_ASSERT(dma_selected.resident_text_q_bytes == 0);
+    OP_TEST_ASSERT(dma_selected.resident_text_o_bytes == 0);
+    OP_TEST_ASSERT(dma_selected.resident_text_state_bytes == 0);
+  }
+
+  FARF(ALWAYS, "block_sparse_halo_image_only_contracts: PASS");
 }
 
 void test_block_sparse_halo_row_ring_contracts() {
@@ -1919,6 +1953,7 @@ void internal_op_tests() {
   test_qkv_mul_rms_packed_dual_contracts();
   test_block_sparse_fa_select_plan();
   test_block_sparse_halo_contracts();
+  test_block_sparse_halo_image_only_contracts();
   test_block_sparse_halo_row_ring_contracts();
   test_block_sparse_halo_text_kv_batch_contracts();
   test_block_sparse_halo_text_kv_batch_cadence();

@@ -1709,12 +1709,9 @@ int block_sparse_halo_select_execution(block_sparse_halo_plan_t *plan, int halo_
     return BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
   }
   if (halo_kv_load_mode == 1) {
-    // The packed-row worker needs resident protected text state and two
-    // startup image rows. Keep these valid inputs on the normal fallback
-    // path instead of entering a worker that cannot initialize its state.
-    if (text_tokens <= 0) {
-      return BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
-    }
+    // The packed-row worker also supports image-only attention. In that
+    // mode the plan omits all resident text buffers and only keeps the
+    // packed image-row ring.
     return block_sparse_halo_select_plan(plan, 1, head_dim, text_tokens, image_block_cols, available_bytes) == 0 ?
       BLOCK_SPARSE_HALO_EXEC_L2_PREFETCH : BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
   }
@@ -6449,10 +6446,11 @@ static int block_sparse_flash_attn_f16_core_halo_rows(int kv_head_idx, uint8_t *
   }
   if (userdma_enabled && halo_trace) {
     const int dma_image_query_blocks_loaded = dma_image_query_rows_loaded * image_block_cols;
+    const char *trace_mode = text_tokens == 0 ? "IMAGE_ONLY_USERDMA" : "HALO_USERDMA_ROWS";
     FARF(ALWAYS,
-         "mode=HALO_USERDMA_ROWS worker=%d kv_head=%d packed_rows=%llu raw_staging=%llu "
+         "mode=%s worker=%d kv_head=%d packed_rows=%llu raw_staging=%llu "
          "row_stride=%llu resident_text=%llu shared_kv_scratch=%llu descriptors_ddr=%llu available=%llu",
-         worker_index, kv_head_idx, (unsigned long long) halo_plan->packed_image_row_bytes,
+         trace_mode, worker_index, kv_head_idx, (unsigned long long) halo_plan->packed_image_row_bytes,
          (unsigned long long) halo_plan->image_row_bytes,
          (unsigned long long) halo_plan->image_row_stride,
          (unsigned long long) halo_plan->resident_text_bytes,
@@ -6460,57 +6458,58 @@ static int block_sparse_flash_attn_f16_core_halo_rows(int kv_head_idx, uint8_t *
          (unsigned long long) halo_plan->descriptor_bytes,
          (unsigned long long) (vtcm_limit - vtcm));
     FARF(ALWAYS,
-         "mode=HALO_USERDMA_ROWS worker=%d kv_head=%d image_query_rows=%d image_query_blocks=%d "
+         "mode=%s worker=%d kv_head=%d image_query_rows=%d image_query_blocks=%d "
          "descs=%d bytes=%llu async_rows=%d packed_image_rows=%d packed_image_blocks=%d "
          "image_q_batches=%d image_q_segments=%d",
-         worker_index, kv_head_idx, dma_image_query_rows_loaded, dma_image_query_blocks_loaded,
+         trace_mode, worker_index, kv_head_idx, dma_image_query_rows_loaded, dma_image_query_blocks_loaded,
          dma_descriptors_submitted, (unsigned long long) dma_requested_bytes,
          dma_async_rows_loaded, packed_image_rows, packed_image_blocks,
          image_q_batch_updates, image_q_segment_updates);
     FARF(ALWAYS,
-         "mode=HALO_USERDMA_ROWS worker=%d kv_head=%d resident_text_q_blocks=%d "
+         "mode=%s worker=%d kv_head=%d resident_text_q_blocks=%d "
          "text_q_image_row_updates=%d text_q_image_block_updates=%d text_q_image_batches=%d "
          "resident_text_segments=%d "
          "resident_text_qo_state_bytes=%llu",
-         worker_index, kv_head_idx, resident_text_q_blocks, text_q_image_row_updates,
+         trace_mode, worker_index, kv_head_idx, resident_text_q_blocks, text_q_image_row_updates,
          text_q_image_block_updates, text_q_image_batches, resident_text_segments,
          (unsigned long long) (halo_plan->resident_text_q_bytes +
                                2 * halo_plan->resident_text_o_bytes +
                                halo_plan->resident_text_state_bytes));
     FARF(ALWAYS,
-         "mode=HALO_USERDMA_ROWS worker=%d kv_head=%d submit_us=%lld "
+         "mode=%s worker=%d kv_head=%d submit_us=%lld "
          "overlap_window_us=%lld wait_us=%lld pack_us=%lld image_q_normal_us=%lld image_q_output_us=%lld "
          "text_q_image_update_us=%lld text_q_resident_update_us=%lld",
-         worker_index, kv_head_idx, dma_submit_us, dma_overlap_window_us,
+         trace_mode, worker_index, kv_head_idx, dma_submit_us, dma_overlap_window_us,
          dma_exposed_wait_us, dma_pack_us, image_q_normal_us, image_q_output_us,
          text_q_image_update_us, text_q_resident_update_us);
   } else if (row_l2_prefetch_enabled && halo_trace) {
+    const char *trace_mode = text_tokens == 0 ? "IMAGE_ONLY_L2" : "HALO_L2_PACKED_ROWS";
     FARF(ALWAYS,
-         "mode=HALO_L2_PACKED_ROWS worker=%d kv_head=%d packed_image_rows=%d packed_image_blocks=%d "
+         "mode=%s worker=%d kv_head=%d packed_image_rows=%d packed_image_blocks=%d "
          "packed_row_slots=%d packed_row_slot_bytes=%llu image_q_direct_segments=%d "
          "image_q_batches=%d image_q_segments=%d raw_prefetch_rows=%d "
          "requested_k_bytes=%llu requested_v_bytes=%llu",
-         worker_index, kv_head_idx, packed_image_rows, packed_image_blocks,
+         trace_mode, worker_index, kv_head_idx, packed_image_rows, packed_image_blocks,
          halo_plan->packed_image_row_slot_count, (unsigned long long) halo_plan->packed_image_row_stride,
          image_q_direct_segment_uses, image_q_batch_updates, image_q_segment_updates, halo_prefetch_rows,
          requested_k_bytes, requested_v_bytes);
     FARF(ALWAYS,
-         "mode=HALO_L2_PACKED_ROWS worker=%d kv_head=%d text_q_blocks=%d "
+         "mode=%s worker=%d kv_head=%d text_q_blocks=%d "
          "text_q_image_row_updates=%d text_q_image_block_updates=%d text_q_image_batches=%d "
          "resident_text_segments=%d "
          "resident_text_kv_bytes=%llu resident_text_qo_state_bytes=%llu",
-         worker_index, kv_head_idx, resident_text_q_blocks, text_q_image_row_updates,
+         trace_mode, worker_index, kv_head_idx, resident_text_q_blocks, text_q_image_row_updates,
          text_q_image_block_updates, text_q_image_batches, resident_text_segments,
          (unsigned long long) halo_plan->resident_text_bytes,
          (unsigned long long) (halo_plan->resident_text_q_bytes +
                                2 * halo_plan->resident_text_o_bytes +
                                halo_plan->resident_text_state_bytes));
     FARF(ALWAYS,
-         "mode=HALO_L2_PACKED_ROWS worker=%d kv_head=%d text_kv_pack_us=%lld "
+         "mode=%s worker=%d kv_head=%d text_kv_pack_us=%lld "
          "startup_row_pack_us=%lld boundary_row_pack_us=%lld image_q_normal_us=%lld image_q_output_us=%lld "
          "text_q_image_update_us=%lld text_q_resident_update_us=%lld "
          "text_q_init_us=%lld text_q_store_us=%lld",
-         worker_index, kv_head_idx, text_pack_us, startup_row_pack_us, boundary_row_pack_us,
+         trace_mode, worker_index, kv_head_idx, text_pack_us, startup_row_pack_us, boundary_row_pack_us,
          image_q_normal_us, image_q_output_us, text_q_image_update_us, text_q_resident_update_us,
          text_q_init_us, text_q_store_us);
   }
@@ -8171,7 +8170,7 @@ static int block_sparse_flash_attn_impl(
     block_sparse_halo_validate_shape(block_mask, qo_len, kv_len, n_heads, n_kv_heads, head_dim, block_q, block_k,
                                      n_q_blocks, n_k_blocks, mask_format, max_kept_blocks, sparse_policy,
                                      image_tokens, text_tokens, image_block_rows, image_block_cols) == 0;
-  const bool halo_l2_geometry_valid = halo_geometry_valid && image_block_rows >= 2 && text_tokens > 0;
+  const bool halo_l2_geometry_valid = halo_geometry_valid && image_block_rows >= 2;
   block_sparse_halo_plan_t dma_preflight_plan = {0};
   const bool dma_preflight_valid = halo_kv_load_mode != 2 ||
     (halo_geometry_valid && input_packed) ||
