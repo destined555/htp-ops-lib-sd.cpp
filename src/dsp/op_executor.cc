@@ -21,6 +21,10 @@ size_t align_up_size(size_t v, size_t a) {
   return ((v + a - 1) / a) * a;
 }
 
+bool packed_head_dim_supported(int head_dim) {
+  return head_dim == 64 || head_dim == 128;
+}
+
 bool checked_size_add(size_t a, size_t b, size_t *result) {
   if (result == nullptr || a > SIZE_MAX - b) {
     return false;
@@ -130,7 +134,7 @@ int qkv_mul_rms_packed_dual_buffer_sizes(const struct QkvMulRmsPackedDualParams 
   if (params == nullptr || sizes == nullptr || params->image_tokens <= 0 || params->text_tokens <= 0 ||
       params->image_tokens % 32 != 0 ||
       params->input_dim <= 0 || params->input_dim % 32 != 0 || params->n_heads != 24 ||
-      params->head_dim != 64) {
+      !packed_head_dim_supported(params->head_dim)) {
     return -1;
   }
   const size_t image_tokens = (size_t) params->image_tokens;
@@ -236,7 +240,7 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
         }
         auto params = reinterpret_cast<QkvMulRmsPackedParams *>(req->payload);
         if (params->tokens <= 0 || params->input_dim <= 0 || params->n_heads != 24 ||
-            params->head_dim != 64 || params->input_dim % 32 != 0) {
+            !packed_head_dim_supported(params->head_dim) || params->input_dim % 32 != 0) {
           return -1;
         }
 
@@ -313,7 +317,7 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
         add_buffer(in_bufs, params->text_k_norm, sizes.norm_bytes);
         validate_in_bufs();
         const int64_t t0 = HAP_perf_get_qtimer_count();
-        static float zero_bias[3 * 24 * 64] __attribute__((aligned(128))) = {};
+        static float zero_bias[3 * 24 * 128] __attribute__((aligned(128))) = {};
         ret = hmx_qkv_mul_rms_packed_dual_w16a32(
             (__fp16 *) OUT_PTR(0), (__fp16 *) OUT_PTR(1), (__fp16 *) OUT_PTR(2),
             (const float *) IN_PTR(0), (const __fp16 *) IN_PTR(1),
@@ -325,6 +329,122 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
             params->input_dim, params->n_heads, params->head_dim);
         params->elapsed_us = (int32_t) HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
         FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=qkv_mul_rms_packed_dual elapsed_us=%d", params->elapsed_us);
+        validate_out_bufs();
+      }
+      break;
+
+    case HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32:
+      {
+        if (payload_size < sizeof(QkvMulRmsPackedRopeParams)) {
+          return -1;
+        }
+        auto params = reinterpret_cast<QkvMulRmsPackedRopeParams *>(req->payload);
+        if (params->tokens <= 0 || params->input_dim <= 0 || params->n_heads != 24 ||
+            !packed_head_dim_supported(params->head_dim) || params->input_dim % 32 != 0 ||
+            params->rope_token_offset < 0 || params->rope_token_count <= 0) {
+          return -1;
+        }
+        const size_t padded_tokens = align_up_size((size_t) params->tokens, 32);
+        const size_t head_tile_elems = (padded_tokens / 32) *
+          ((size_t) params->head_dim / 32) * HMX_FP16_TILE_N_ELMS;
+        size_t qkv_size = 0, activation_size = 0, weight_cols = 0, weight_size = 0, bias_size = 0;
+        if (!checked_size_mul((size_t) params->n_heads, head_tile_elems, &qkv_size) ||
+            !checked_size_mul((size_t) params->tokens, (size_t) params->input_dim, &activation_size) ||
+            !checked_size_mul((size_t) params->n_heads, (size_t) params->head_dim * 3u, &weight_cols) ||
+            !checked_size_mul((size_t) params->input_dim, weight_cols, &weight_size) ||
+            !checked_size_mul(weight_size, sizeof(__fp16), &weight_size) ||
+            !checked_size_mul(weight_cols, sizeof(float), &bias_size) ||
+            !checked_size_mul(activation_size, sizeof(float), &activation_size)) {
+          return -1;
+        }
+        const size_t rope_pairs = (size_t) params->head_dim / 2u;
+        size_t rope_size = 0;
+        if (!checked_size_mul((size_t) params->rope_token_count, rope_pairs * 4u, &rope_size) ||
+            !checked_size_mul(rope_size, sizeof(float), &rope_size)) {
+          return -1;
+        }
+        add_buffer(out_bufs, params->q, qkv_size * sizeof(__fp16));
+        add_buffer(out_bufs, params->k_out, qkv_size * sizeof(__fp16));
+        add_buffer(out_bufs, params->v, qkv_size * sizeof(__fp16));
+        add_buffer(in_bufs, params->activation, activation_size);
+        add_buffer(in_bufs, params->weight, weight_size);
+        if (params->bias.fd >= 0) add_buffer(in_bufs, params->bias, bias_size);
+        else in_bufs.push_back({ nullptr, bias_size, false });
+        add_buffer(in_bufs, params->q_norm, (size_t) params->head_dim * sizeof(float));
+        add_buffer(in_bufs, params->k_norm, (size_t) params->head_dim * sizeof(float));
+        add_buffer(in_bufs, params->rope_pe, rope_size);
+        validate_in_bufs();
+        const int64_t t0 = HAP_perf_get_qtimer_count();
+        static float zero_bias[3 * 24 * 128] __attribute__((aligned(128))) = {};
+        ret = hmx_qkv_mul_rms_packed_rope_w16a32(
+          (__fp16 *) OUT_PTR(0), (__fp16 *) OUT_PTR(1), (__fp16 *) OUT_PTR(2),
+          (const float *) IN_PTR(0), (const __fp16 *) IN_PTR(1),
+          params->bias.fd >= 0 ? (const float *) IN_PTR(2) : zero_bias,
+          (const float *) IN_PTR(3), (const float *) IN_PTR(4), (const float *) IN_PTR(5),
+          params->rope_token_offset, params->rope_token_count, params->tokens,
+          params->input_dim, params->n_heads, params->head_dim);
+        params->elapsed_us = (int32_t) HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+        FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=qkv_mul_rms_packed_rope elapsed_us=%d", params->elapsed_us);
+        validate_out_bufs();
+      }
+      break;
+
+    case HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32:
+      {
+        if (payload_size < sizeof(QkvMulRmsPackedDualRopeParams)) {
+          return -1;
+        }
+        auto params = reinterpret_cast<QkvMulRmsPackedDualRopeParams *>(req->payload);
+        QkvMulRmsPackedDualParams base = {};
+        base.image_tokens = params->image_tokens;
+        base.text_tokens = params->text_tokens;
+        base.input_dim = params->input_dim;
+        base.n_heads = params->n_heads;
+        base.head_dim = params->head_dim;
+        QkvMulRmsPackedBufferSizes sizes = {};
+        if (qkv_mul_rms_packed_dual_buffer_sizes(&base, &sizes) != 0 ||
+            params->image_rope_token_offset < 0 || params->text_rope_token_offset < 0) {
+          return -1;
+        }
+        const size_t rope_tokens = (size_t) std::max(
+          params->image_rope_token_offset + params->image_tokens,
+          params->text_rope_token_offset + params->text_tokens);
+        size_t rope_size = 0;
+        if (!checked_size_mul(rope_tokens, (size_t) params->head_dim / 2u * 4u, &rope_size) ||
+            !checked_size_mul(rope_size, sizeof(float), &rope_size)) {
+          return -1;
+        }
+        add_buffer(out_bufs, params->q, sizes.qkv_bytes);
+        add_buffer(out_bufs, params->k_out, sizes.qkv_bytes);
+        add_buffer(out_bufs, params->v, sizes.qkv_bytes);
+        add_buffer(in_bufs, params->image_activation, (size_t) params->image_tokens * params->input_dim * sizeof(float));
+        add_buffer(in_bufs, params->image_weight, sizes.weight_bytes);
+        if (params->image_bias.fd >= 0) add_buffer(in_bufs, params->image_bias, sizes.bias_bytes);
+        else in_bufs.push_back({ nullptr, sizes.bias_bytes, false });
+        add_buffer(in_bufs, params->image_q_norm, sizes.norm_bytes);
+        add_buffer(in_bufs, params->image_k_norm, sizes.norm_bytes);
+        add_buffer(in_bufs, params->text_activation, (size_t) params->text_tokens * params->input_dim * sizeof(float));
+        add_buffer(in_bufs, params->text_weight, sizes.weight_bytes);
+        if (params->text_bias.fd >= 0) add_buffer(in_bufs, params->text_bias, sizes.bias_bytes);
+        else in_bufs.push_back({ nullptr, sizes.bias_bytes, false });
+        add_buffer(in_bufs, params->text_q_norm, sizes.norm_bytes);
+        add_buffer(in_bufs, params->text_k_norm, sizes.norm_bytes);
+        add_buffer(in_bufs, params->rope_pe, rope_size);
+        validate_in_bufs();
+        const int64_t t0 = HAP_perf_get_qtimer_count();
+        static float zero_bias[3 * 24 * 128] __attribute__((aligned(128))) = {};
+        ret = hmx_qkv_mul_rms_packed_dual_rope_w16a32(
+          (__fp16 *) OUT_PTR(0), (__fp16 *) OUT_PTR(1), (__fp16 *) OUT_PTR(2),
+          (const float *) IN_PTR(0), (const __fp16 *) IN_PTR(1),
+          params->image_bias.fd >= 0 ? (const float *) IN_PTR(2) : zero_bias,
+          (const float *) IN_PTR(3), (const float *) IN_PTR(4), params->image_tokens,
+          (const float *) IN_PTR(5), (const __fp16 *) IN_PTR(6),
+          params->text_bias.fd >= 0 ? (const float *) IN_PTR(7) : zero_bias,
+          (const float *) IN_PTR(8), (const float *) IN_PTR(9), params->text_tokens,
+          (const float *) IN_PTR(10), params->image_rope_token_offset,
+          params->text_rope_token_offset, params->input_dim, params->n_heads, params->head_dim);
+        params->elapsed_us = (int32_t) HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+        FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=qkv_mul_rms_packed_dual_rope elapsed_us=%d", params->elapsed_us);
         validate_out_bufs();
       }
       break;
@@ -459,7 +579,7 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
           return -1;
         }
         if (input_packed) {
-          if (qo_len != kv_len || n_heads != 24 || n_kv_heads != 24 || head_dim != 64 ||
+          if (qo_len != kv_len || n_heads != 24 || n_kv_heads != 24 || !packed_head_dim_supported(head_dim) ||
               params->block_q != 32 || params->block_k != 32 || mask_format != 1 ||
               params->sparse_policy != HTP_SPARSE_POLICY_STATIC_HALO ||
               (params->halo_kv_load_mode != HTP_HALO_KV_LOAD_L2_PREFETCH &&

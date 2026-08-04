@@ -859,6 +859,13 @@ int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activ
     }
   }
 
+  static int matmul_debug_once = 0;
+  if (m == 768 && k == 3072 && (n == 9216 || n == 27648) &&
+      __atomic_exchange_n(&matmul_debug_once, 1, __ATOMIC_ACQ_REL) == 0) {
+    FARF(ALWAYS, "QKV_DEBUG matmul_raw q0=%g q1=%g q2=%g q3=%g q4=%g q5=%g q6=%g q7=%g",
+         dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7]);
+  }
+
   // FARF(ALWAYS, "%s: m = %d, k = %d, n = %d", __func__, m, k, n);
   // FARF(ALWAYS, "    activation load: %lld us", HAP_perf_qtimer_count_to_us(activation_load_time));
   // FARF(ALWAYS, "    weight     load: %lld us", HAP_perf_qtimer_count_to_us(weight_load_time));
@@ -893,6 +900,10 @@ static void qkv_pack_q_tile(__fp16 *dst, const float *src, int n_rows, int head_
       out_tile[r / 2] = hvx_my_wsf_to_vhf(v1, v0);
     }
   }
+}
+
+static inline bool qkv_supported_head_dim(int head_dim) {
+  return head_dim == 64 || head_dim == 128;
 }
 
 static void qkv_pack_k_tile(__fp16 *dst, const __fp16 *src, int n_rows, int head_dim) {
@@ -985,26 +996,26 @@ static inline HVX_Vector qkv_rsqrt_vsf(HVX_Vector x) {
 }
 
 static void qkv_rms_bias(float *rows, int n_rows, int head_dim, const float *bias, const float *gamma) {
-  assert(head_dim == 64);
+  assert(qkv_supported_head_dim(head_dim));
   assert(is_aligned(rows, VLEN) && is_aligned(bias, VLEN) && is_aligned(gamma, VLEN));
   const HVX_Vector *bias_vec = (const HVX_Vector *) bias;
   const HVX_Vector *gamma_vec = (const HVX_Vector *) gamma;
-  const HVX_Vector v_bias0 = bias_vec[0];
-  const HVX_Vector v_bias1 = bias_vec[1];
-  const HVX_Vector v_gamma0 = gamma_vec[0];
-  const HVX_Vector v_gamma1 = gamma_vec[1];
   float inverse_scales[32] __attribute__((aligned(VLEN)));
   for (int r = 0; r < n_rows; ++r) {
     float *row = rows + (size_t) r * head_dim;
-    HVX_Vector v0 = ((const HVX_Vector *) row)[0];
-    HVX_Vector v1 = ((const HVX_Vector *) row)[1];
-    v0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v0, v_bias0));
-    v1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v1, v_bias1));
-    const HVX_Vector v_sum = Q6_Vqf32_vadd_Vqf32Vqf32(
-      Q6_Vqf32_vmpy_VsfVsf(v0, v0), Q6_Vqf32_vmpy_VsfVsf(v1, v1));
+    HVX_Vector v_sum = Q6_V_vzero();
+    HVX_Vector *row_vec = (HVX_Vector *) row;
+    for (int d = 0; d < head_dim / 64; ++d) {
+      HVX_Vector v0 = row_vec[d * 2 + 0];
+      HVX_Vector v1 = row_vec[d * 2 + 1];
+      v0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v0, bias_vec[d * 2 + 0]));
+      v1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v1, bias_vec[d * 2 + 1]));
+      v_sum = Q6_Vqf32_vadd_Vqf32Vqf32(v_sum, Q6_Vqf32_vmpy_VsfVsf(v0, v0));
+      v_sum = Q6_Vqf32_vadd_Vqf32Vqf32(v_sum, Q6_Vqf32_vmpy_VsfVsf(v1, v1));
+      row_vec[d * 2 + 0] = v0;
+      row_vec[d * 2 + 1] = v1;
+    }
     inverse_scales[r] = qkv_reduce_sum(v_sum) / (float) head_dim + 1.0e-6f;
-    ((HVX_Vector *) row)[0] = v0;
-    ((HVX_Vector *) row)[1] = v1;
   }
   for (int r = n_rows; r < 32; ++r) {
     inverse_scales[r] = 1.0f;
@@ -1012,44 +1023,76 @@ static void qkv_rms_bias(float *rows, int n_rows, int head_dim, const float *bia
   vmem(inverse_scales) = qkv_rsqrt_vsf(vmem(inverse_scales));
   for (int r = 0; r < n_rows; ++r) {
     float *row = rows + (size_t) r * head_dim;
-    HVX_Vector v0 = ((const HVX_Vector *) row)[0];
-    HVX_Vector v1 = ((const HVX_Vector *) row)[1];
     const HVX_Vector v_inv = Q6_V_vsplat_R(*(const int32_t *) &inverse_scales[r]);
-    v0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v0, v_inv));
-    v1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v1, v_inv));
-    v0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v0, v_gamma0));
-    v1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v1, v_gamma1));
-    ((HVX_Vector *) row)[0] = v0;
-    ((HVX_Vector *) row)[1] = v1;
+    HVX_Vector *row_vec = (HVX_Vector *) row;
+    for (int d = 0; d < head_dim / 64; ++d) {
+      HVX_Vector v0 = row_vec[d * 2 + 0];
+      HVX_Vector v1 = row_vec[d * 2 + 1];
+      v0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v0, v_inv));
+      v1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v1, v_inv));
+      v0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v0, gamma_vec[d * 2 + 0]));
+      v1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(v1, gamma_vec[d * 2 + 1]));
+      row_vec[d * 2 + 0] = v0;
+      row_vec[d * 2 + 1] = v1;
+    }
+  }
+}
+
+static void qkv_apply_rope(float *rows, int n_rows, int head_dim,
+                           const float *pe, int token_offset, int token_count) {
+  if (pe == NULL || token_offset < 0 || token_count <= 0) {
+    return;
+  }
+  const size_t pair_stride = (size_t) (head_dim / 2) * 4;
+  for (int r = 0; r < n_rows; ++r) {
+    const int token = token_offset + r;
+    if (token >= token_count) {
+      break;
+    }
+    const float *token_pe = pe + (size_t) token * pair_stride;
+    float *row = rows + (size_t) r * head_dim;
+    for (int d = 0; d < head_dim / 2; ++d) {
+      const float x0 = row[2 * d + 0];
+      const float x1 = row[2 * d + 1];
+      const float *matrix = token_pe + (size_t) d * 4;
+      row[2 * d + 0] = x0 * matrix[0] + x1 * matrix[1];
+      row[2 * d + 1] = x0 * matrix[2] + x1 * matrix[3];
+    }
   }
 }
 
 static void qkv_cast_f32_to_f16(__fp16 *dst, const float *src, int n_rows, int head_dim) {
-  assert(head_dim == 64);
+  assert(qkv_supported_head_dim(head_dim));
   assert(is_aligned(dst, VLEN) && is_aligned(src, VLEN));
   for (int r = 0; r < HMX_FP16_TILE_N_ROWS; ++r) {
-    HVX_Vector out = Q6_V_vzero();
-    if (r < n_rows) {
-      const HVX_Vector *in = (const HVX_Vector *) (src + (size_t) r * head_dim);
-      out = Q6_Vh_vdeal_Vh(hvx_my_wsf_to_vhf(in[1], in[0]));
+    HVX_Vector *out = (HVX_Vector *) (dst + (size_t) r * head_dim);
+    for (int d = 0; d < head_dim / 64; ++d) {
+      HVX_Vector value = Q6_V_vzero();
+      if (r < n_rows) {
+        const HVX_Vector *in = (const HVX_Vector *) (src + (size_t) r * head_dim);
+        value = Q6_Vh_vdeal_Vh(hvx_my_wsf_to_vhf(in[d * 2 + 1], in[d * 2 + 0]));
+      }
+      out[d] = value;
     }
-    ((HVX_Vector *) (dst + (size_t) r * head_dim))[0] = out;
   }
 }
 
 static void qkv_bias_cast(__fp16 *dst, const float *src, int n_rows, int head_dim, const float *bias) {
-  assert(head_dim == 64);
+  assert(qkv_supported_head_dim(head_dim));
   assert(is_aligned(dst, VLEN) && is_aligned(src, VLEN) && is_aligned(bias, VLEN));
   const HVX_Vector *bias_vec = (const HVX_Vector *) bias;
   for (int r = 0; r < HMX_FP16_TILE_N_ROWS; ++r) {
-    HVX_Vector out = Q6_V_vzero();
-    if (r < n_rows) {
-      const HVX_Vector *in = (const HVX_Vector *) (src + (size_t) r * head_dim);
-      const HVX_Vector v0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(in[0], bias_vec[0]));
-      const HVX_Vector v1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(in[1], bias_vec[1]));
-      out = Q6_Vh_vdeal_Vh(hvx_my_wsf_to_vhf(v1, v0));
+    HVX_Vector *out = (HVX_Vector *) (dst + (size_t) r * head_dim);
+    for (int d = 0; d < head_dim / 64; ++d) {
+      HVX_Vector value = Q6_V_vzero();
+      if (r < n_rows) {
+        const HVX_Vector *in = (const HVX_Vector *) (src + (size_t) r * head_dim);
+        const HVX_Vector v0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(in[d * 2 + 0], bias_vec[d * 2 + 0]));
+        const HVX_Vector v1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(in[d * 2 + 1], bias_vec[d * 2 + 1]));
+        value = Q6_Vh_vdeal_Vh(hvx_my_wsf_to_vhf(v1, v0));
+      }
+      out[d] = value;
     }
-    ((HVX_Vector *) (dst + (size_t) r * head_dim))[0] = out;
   }
 }
 
@@ -1077,6 +1120,9 @@ typedef struct {
   int           token_tiles;
   int           output_token_offset;
   int           head_dim;
+  const float  *rope_pe;
+  int           rope_token_offset;
+  int           rope_token_count;
 } qkv_postprocess_task_state_t;
 
 static void qkv_postprocess_worker(void *data, int worker_index) {
@@ -1085,7 +1131,7 @@ static void qkv_postprocess_worker(void *data, int worker_index) {
     worker_pool_synctoken_jobdone(&state->sync_ctx);
     return;
   }
-  const size_t raw_stride = HMX_FP16_TILE_N_ROWS * 64;
+  const size_t raw_stride = (size_t) HMX_FP16_TILE_N_ROWS * (size_t) state->head_dim;
   float *raw = state->raw_scratch + (size_t) worker_index * raw_stride;
   __fp16 *raw16 = state->raw16_scratch + (size_t) worker_index * raw_stride;
   __fp16 *vtcm_pack = state->pack_scratch +
@@ -1114,11 +1160,20 @@ static void qkv_postprocess_worker(void *data, int worker_index) {
        (size_t) col / HMX_FP16_TILE_N_COLS) * HMX_FP16_TILE_N_ELMS;
     transfer_output_chunk_fp16_to_fp32(
       raw, output_tile, rows_in_tile, state->head_dim, state->head_dim);
+    static int qkv_debug_once = 0;
+    if (state->mr == 0 && state->nc == 0 &&
+        __atomic_exchange_n(&qkv_debug_once, 1, __ATOMIC_ACQ_REL) == 0) {
+      FARF(ALWAYS, "QKV_DEBUG packed_raw q0=%g q1=%g q2=%g q3=%g q4=%g q5=%g q6=%g q7=%g",
+           raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+    }
     const float *segment_bias = state->bias + global_col;
 
     if (is_q || is_k) {
       qkv_rms_bias(raw, rows_in_tile, state->head_dim, segment_bias,
                    is_q ? state->q_norm : state->k_norm);
+      qkv_apply_rope(raw, rows_in_tile, state->head_dim, state->rope_pe,
+                     state->rope_token_offset + (int) state->mr + row_tile * HMX_FP16_TILE_N_ROWS,
+                     state->rope_token_count);
       if (is_k) {
         qkv_cast_f32_to_f16(raw16, raw, rows_in_tile, state->head_dim);
       }
@@ -1151,10 +1206,11 @@ static int hmx_qkv_mul_rms_packed_w16a32_impl(
     const float *restrict activation, const __fp16 *restrict permuted_weight,
     const float *restrict bias, const float *restrict q_norm, const float *restrict k_norm,
     int tokens, int input_dim, int n_heads, int head_dim,
-    int output_token_tiles, int output_token_offset) {
+    int output_token_tiles, int output_token_offset,
+    const float *rope_pe, int rope_token_offset, int rope_token_count) {
   if (q == NULL || k_out == NULL || v == NULL || activation == NULL || permuted_weight == NULL ||
       bias == NULL || q_norm == NULL || k_norm == NULL || tokens <= 0 || input_dim <= 0 ||
-      n_heads != 24 || head_dim != 64 || input_dim % 32 != 0) {
+      n_heads != 24 || !qkv_supported_head_dim(head_dim) || input_dim % 32 != 0) {
     return -1;
   }
   if (!is_aligned(q, VLEN) || !is_aligned(k_out, VLEN) || !is_aligned(v, VLEN) ||
@@ -1180,7 +1236,7 @@ static int hmx_qkv_mul_rms_packed_w16a32_impl(
   __fp16 *vtcm_activation = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, ACTIVATION_AREA_SIZE);
   __fp16 *vtcm_output = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, OUTPUT_AREA_SIZE);
   __fp16 *vtcm_scales = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
-  const size_t postprocess_rows = (size_t) num_workers * ROW_CHUNK * 64;
+  const size_t postprocess_rows = (size_t) num_workers * ROW_CHUNK * (size_t) head_dim;
   float *raw_scratch = (float *) vtcm_seq_alloc(&vtcm_ptr, postprocess_rows * sizeof(float));
   __fp16 *raw16_scratch = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, postprocess_rows * sizeof(__fp16));
   const size_t pack_tile_bytes = (size_t) (head_dim / HMX_FP16_TILE_N_COLS) * HMX_FP16_TILE_N_ELMS *
@@ -1255,6 +1311,9 @@ static int hmx_qkv_mul_rms_packed_w16a32_impl(
       state.token_tiles = output_token_tiles;
       state.output_token_offset = output_token_offset;
       state.head_dim = head_dim;
+      state.rope_pe = rope_pe;
+      state.rope_token_offset = rope_token_offset;
+      state.rope_token_count = rope_token_count;
       const worker_pool_job_t job = { .fptr = qkv_postprocess_worker, .dptr = &state };
       worker_pool_synctoken_init(&state.sync_ctx, n_postprocess_workers);
       int submit_failed = 0;
@@ -1280,7 +1339,8 @@ int hmx_qkv_mul_rms_packed_w16a32(
     int tokens, int input_dim, int n_heads, int head_dim) {
   return hmx_qkv_mul_rms_packed_w16a32_impl(
       q, k_out, v, activation, permuted_weight, bias, q_norm, k_norm,
-      tokens, input_dim, n_heads, head_dim, ceil_div(tokens, HMX_FP16_TILE_N_ROWS), 0);
+      tokens, input_dim, n_heads, head_dim, ceil_div(tokens, HMX_FP16_TILE_N_ROWS), 0,
+      NULL, 0, 0);
 }
 
 int hmx_qkv_mul_rms_packed_dual_w16a32(
@@ -1297,14 +1357,55 @@ int hmx_qkv_mul_rms_packed_dual_w16a32(
   if (hmx_qkv_mul_rms_packed_w16a32_impl(
           q, k_out, v, image_activation, image_weight, image_bias,
           image_q_norm, image_k_norm, image_tokens, input_dim, n_heads, head_dim,
-          output_token_tiles, 0) != 0) {
+          output_token_tiles, 0, NULL, 0, 0) != 0) {
     return -1;
   }
   return hmx_qkv_mul_rms_packed_w16a32_impl(
       q, k_out, v, text_activation, text_weight, text_bias,
       text_q_norm, text_k_norm, text_tokens, input_dim, n_heads, head_dim,
       output_token_tiles,
-      (image_tokens + HMX_FP16_TILE_N_ROWS - 1) / HMX_FP16_TILE_N_ROWS * HMX_FP16_TILE_N_ROWS);
+      (image_tokens + HMX_FP16_TILE_N_ROWS - 1) / HMX_FP16_TILE_N_ROWS * HMX_FP16_TILE_N_ROWS,
+      NULL, 0, 0);
+}
+
+int hmx_qkv_mul_rms_packed_rope_w16a32(
+    __fp16 *restrict q, __fp16 *restrict k_out, __fp16 *restrict v,
+    const float *restrict activation, const __fp16 *restrict permuted_weight,
+    const float *restrict bias, const float *restrict q_norm, const float *restrict k_norm,
+    const float *restrict rope_pe, int rope_token_offset, int rope_token_count,
+    int tokens, int input_dim, int n_heads, int head_dim) {
+  return hmx_qkv_mul_rms_packed_w16a32_impl(
+      q, k_out, v, activation, permuted_weight, bias, q_norm, k_norm,
+      tokens, input_dim, n_heads, head_dim, ceil_div(tokens, HMX_FP16_TILE_N_ROWS), 0,
+      rope_pe, rope_token_offset, rope_token_count);
+}
+
+int hmx_qkv_mul_rms_packed_dual_rope_w16a32(
+    __fp16 *restrict q, __fp16 *restrict k_out, __fp16 *restrict v,
+    const float *image_activation, const __fp16 *image_weight, const float *image_bias,
+    const float *image_q_norm, const float *image_k_norm, int image_tokens,
+    const float *text_activation, const __fp16 *text_weight, const float *text_bias,
+    const float *text_q_norm, const float *text_k_norm, int text_tokens,
+    const float *rope_pe, int image_rope_token_offset, int text_rope_token_offset,
+    int input_dim, int n_heads, int head_dim) {
+  if (image_tokens <= 0 || text_tokens <= 0) {
+    return -1;
+  }
+  const int output_token_tiles = ceil_div(image_tokens + text_tokens, HMX_FP16_TILE_N_ROWS);
+  if (hmx_qkv_mul_rms_packed_w16a32_impl(
+          q, k_out, v, image_activation, image_weight, image_bias,
+          image_q_norm, image_k_norm, image_tokens, input_dim, n_heads, head_dim,
+          output_token_tiles, 0, rope_pe, image_rope_token_offset,
+          image_tokens + text_tokens) != 0) {
+    return -1;
+  }
+  return hmx_qkv_mul_rms_packed_w16a32_impl(
+      q, k_out, v, text_activation, text_weight, text_bias,
+      text_q_norm, text_k_norm, text_tokens, input_dim, n_heads, head_dim,
+      output_token_tiles,
+      (image_tokens + HMX_FP16_TILE_N_ROWS - 1) / HMX_FP16_TILE_N_ROWS * HMX_FP16_TILE_N_ROWS,
+      rope_pe, text_rope_token_offset,
+      image_tokens + text_tokens);
 }
 
 extern worker_pool_context_t hmx_worker_pool_ctx;

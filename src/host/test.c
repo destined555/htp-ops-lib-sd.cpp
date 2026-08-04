@@ -479,6 +479,19 @@ static int env_positive_int(const char *name, int fallback) {
   return (int) parsed;
 }
 
+static int env_nonnegative_int(const char *name, int fallback) {
+  const char *value = getenv(name);
+  if (value == NULL || *value == '\0') {
+    return fallback;
+  }
+  char *end = NULL;
+  long parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0 || parsed > INT32_MAX) {
+    return fallback;
+  }
+  return (int) parsed;
+}
+
 static int env_enabled(const char *name) {
   const char *value = getenv(name);
   return value != NULL && strcmp(value, "0") != 0;
@@ -493,10 +506,8 @@ static float qkv_bench_activation_value(int row, int col) {
 }
 
 static int test_qkv_mul_channel(void *chan) {
-  enum {
-    N_HEADS = 24,
-    HEAD_DIM = 64,
-  };
+  enum { N_HEADS = 24 };
+  const int HEAD_DIM = env_positive_int("HTP_QKV_HEAD_DIM", 64);
   const int tokens = env_positive_int("HTP_QKV_TOKENS", 32);
   const int input_dim = env_positive_int("HTP_QKV_INPUT_DIM", 1536);
   if (input_dim % 32 != 0) {
@@ -533,6 +544,8 @@ static int test_qkv_mul_channel(void *chan) {
   __fp16 *k = NULL;
   __fp16 *v = NULL;
   float *weight_ref = NULL;
+  float *q_raw = NULL;
+  float *k_raw = NULL;
   int result = -1;
 
   if (alloc_shared_mem_buf((void **) &tensor_data, &tensor_fd, tensor_size) != 0) {
@@ -636,8 +649,11 @@ static int test_qkv_mul_channel(void *chan) {
   float expected_v1 = 0.0f;
   float q_sum = 0.0f;
   float k_sum = 0.0f;
-  float q_raw[HEAD_DIM];
-  float k_raw[HEAD_DIM];
+  q_raw = (float *) malloc((size_t) HEAD_DIM * sizeof(float));
+  k_raw = (float *) malloc((size_t) HEAD_DIM * sizeof(float));
+  if (q_raw == NULL || k_raw == NULL) {
+    goto cleanup;
+  }
   for (int d = 0; d < HEAD_DIM; ++d) {
     float q_value = bias[d];
     float k_value = bias[N_HEADS * HEAD_DIM + d];
@@ -680,6 +696,8 @@ static int test_qkv_mul_channel(void *chan) {
            nonzero_outputs && reference_match ? 0 : -1;
 
 cleanup:
+  if (q_raw) free(q_raw);
+  if (k_raw) free(k_raw);
   if (weight_ref) free(weight_ref);
   if (tensor_data) free_shared_mem_buf(tensor_data, tensor_fd, tensor_size);
   fprintf(stderr, result == 0 ? "%s passed\n" : "%s failed\n", __func__);
@@ -745,6 +763,197 @@ static float packed_v_value(const __fp16 *packed, int tokens, int head_dim,
   const size_t in_tile = (size_t) ((token % 32) & ~1) * 32 +
     (dim % 32) * 2 + (token & 1);
   return (float) packed[tile + in_tile];
+}
+
+static int run_qkv_rope_request(void *chan, enum HtpOpsIndex op,
+                                const void *params, size_t params_size,
+                                void *returned, size_t returned_size);
+
+/* Keep this producer-only check independent from sparse attention.  It catches
+ * packed RoPE/indexing errors before the attention consumer can hide them. */
+static int test_qkv_rope_channel(void *chan) {
+  enum { N_HEADS = 24, TOKENS = 64, INPUT_DIM = 1536 };
+  const int head_dim = env_positive_int("HTP_QKV_ROPE_HEAD_DIM", 128);
+  const int dual = env_enabled("HTP_QKV_ROPE_DUAL");
+  if ((head_dim != 64 && head_dim != 128) || INPUT_DIM % 32 != 0) {
+    return -1;
+  }
+  const int output_cols = 3 * N_HEADS * head_dim;
+  const size_t token_tiles = (TOKENS + 31) / 32;
+  const size_t head_tile_elems = token_tiles * (head_dim / 32) * 1024;
+  const size_t qkv_bytes = (size_t) N_HEADS * head_tile_elems * sizeof(__fp16);
+  const size_t activation_bytes = (size_t) TOKENS * INPUT_DIM * sizeof(float);
+  const size_t weight_bytes = (size_t) INPUT_DIM * output_cols * sizeof(__fp16);
+  const size_t bias_bytes = (size_t) output_cols * sizeof(float);
+  const size_t norm_bytes = (size_t) head_dim * sizeof(float);
+  const size_t rope_bytes = (size_t) TOKENS * (head_dim / 2) * 4 * sizeof(float);
+  size_t activation_offset = 0;
+  size_t weight_offset = align_up(activation_offset + activation_bytes, 128);
+  size_t bias_offset = align_up(weight_offset + weight_bytes, 128);
+  size_t q_norm_offset = align_up(bias_offset + bias_bytes, 128);
+  size_t k_norm_offset = align_up(q_norm_offset + norm_bytes, 128);
+  size_t rope_offset = align_up(k_norm_offset + norm_bytes, 128);
+  size_t q_offset = align_up(rope_offset + rope_bytes, 128);
+  size_t k_offset = align_up(q_offset + qkv_bytes, 128);
+  size_t v_offset = align_up(k_offset + qkv_bytes, 128);
+  size_t total_bytes = align_up(v_offset + qkv_bytes, 128);
+  uint8_t *data = NULL;
+  int fd = -1;
+  float *weight_ref = NULL;
+  int result = -1;
+  if (alloc_shared_mem_buf((void **) &data, &fd, total_bytes) != 0) {
+    return -1;
+  }
+  float *activation = (float *) (data + activation_offset);
+  __fp16 *weight = (__fp16 *) (data + weight_offset);
+  float *bias = (float *) (data + bias_offset);
+  float *q_norm = (float *) (data + q_norm_offset);
+  float *k_norm = (float *) (data + k_norm_offset);
+  float *rope_pe = (float *) (data + rope_offset);
+  __fp16 *q = (__fp16 *) (data + q_offset);
+  __fp16 *k = (__fp16 *) (data + k_offset);
+  __fp16 *v = (__fp16 *) (data + v_offset);
+  weight_ref = (float *) malloc((size_t) INPUT_DIM * output_cols * sizeof(float));
+  if (weight_ref == NULL) {
+    goto cleanup;
+  }
+  for (int t = 0; t < TOKENS; ++t) {
+    for (int c = 0; c < INPUT_DIM; ++c) {
+      activation[(size_t) t * INPUT_DIM + c] = qkv_bench_activation_value(t, c);
+    }
+  }
+  for (int c = 0; c < output_cols; ++c) {
+    bias[c] = (float) ((c % 19) - 9) * 0.007f;
+  }
+  for (int d = 0; d < head_dim; ++d) {
+    q_norm[d] = 0.9f + (float) (d % 11) * 0.013f;
+    k_norm[d] = 1.1f - (float) (d % 7) * 0.009f;
+  }
+  for (int t = 0; t < TOKENS; ++t) {
+    for (int d = 0; d < head_dim / 2; ++d) {
+      const float angle = 0.013f * (float) (t + 1) * (float) (d + 1);
+      float *m = rope_pe + ((size_t) t * (head_dim / 2) + d) * 4;
+      m[0] = cosf(angle);
+      m[1] = -sinf(angle);
+      m[2] = sinf(angle);
+      m[3] = cosf(angle);
+    }
+  }
+  for (int r = 0; r < INPUT_DIM; ++r) {
+    for (int c = 0; c < output_cols; ++c) {
+      const float value = qkv_bench_weight_value(r, c);
+      weight_ref[(size_t) r * output_cols + c] = value;
+      const int r0 = r / 32;
+      const int r1 = r % 32;
+      const int c0 = c / 32;
+      const int c1 = c % 32;
+      __fp16 *tile = weight + (size_t) (c0 * (INPUT_DIM / 32) + r0) * 1024;
+      tile[(r1 & ~1) * 32 + c1 * 2 + (r1 & 1)] = (__fp16) value;
+    }
+  }
+  memset(q, 0, qkv_bytes);
+  memset(k, 0, qkv_bytes);
+  memset(v, 0, qkv_bytes);
+  struct QkvMulRmsPackedRopeParams params = {
+    .q = { fd, (int32_t) q_offset }, .k_out = { fd, (int32_t) k_offset },
+    .v = { fd, (int32_t) v_offset }, .activation = { fd, (int32_t) activation_offset },
+    .weight = { fd, (int32_t) weight_offset }, .bias = { fd, (int32_t) bias_offset },
+    .q_norm = { fd, (int32_t) q_norm_offset }, .k_norm = { fd, (int32_t) k_norm_offset },
+    .rope_pe = { fd, (int32_t) rope_offset }, .tokens = TOKENS,
+    .input_dim = INPUT_DIM, .n_heads = N_HEADS, .head_dim = head_dim,
+    .rope_token_offset = 0, .rope_token_count = TOKENS, .elapsed_us = -1,
+  };
+  struct QkvMulRmsPackedRopeParams returned = {};
+  struct QkvMulRmsPackedDualRopeParams dual_params = {
+    .q = { fd, (int32_t) q_offset }, .k_out = { fd, (int32_t) k_offset },
+    .v = { fd, (int32_t) v_offset },
+    .image_activation = { fd, (int32_t) activation_offset },
+    .image_weight = { fd, (int32_t) weight_offset },
+    .image_bias = { fd, (int32_t) bias_offset },
+    .image_q_norm = { fd, (int32_t) q_norm_offset },
+    .image_k_norm = { fd, (int32_t) k_norm_offset },
+    .text_activation = { fd, (int32_t) (activation_offset + 32u * INPUT_DIM * sizeof(float)) },
+    .text_weight = { fd, (int32_t) weight_offset },
+    .text_bias = { fd, (int32_t) bias_offset },
+    .text_q_norm = { fd, (int32_t) q_norm_offset },
+    .text_k_norm = { fd, (int32_t) k_norm_offset },
+    .rope_pe = { fd, (int32_t) rope_offset }, .image_tokens = 32, .text_tokens = 32,
+    .input_dim = INPUT_DIM, .n_heads = N_HEADS, .head_dim = head_dim,
+    .image_rope_token_offset = 0, .text_rope_token_offset = 32, .elapsed_us = -1,
+  };
+  struct QkvMulRmsPackedDualRopeParams dual_returned = {};
+  const int state = dual ?
+    run_qkv_rope_request(chan, HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32,
+                         &dual_params, sizeof(dual_params), &dual_returned, sizeof(dual_returned)) :
+    run_qkv_rope_request(chan, HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32,
+                         &params, sizeof(params), &returned, sizeof(returned));
+  const int dsp_us = dual ? dual_returned.elapsed_us : returned.elapsed_us;
+  float max_q = 0.0f, max_k = 0.0f, max_v = 0.0f;
+  for (int t = 0; t < TOKENS; ++t) {
+    for (int h = 0; h < N_HEADS; ++h) {
+      float q_raw[128];
+      float k_raw[128];
+      float q_sum = 0.0f;
+      float k_sum = 0.0f;
+      for (int d = 0; d < head_dim; ++d) {
+        float qv = bias[h * head_dim + d];
+        float kv = bias[N_HEADS * head_dim + h * head_dim + d];
+        float vv = bias[2 * N_HEADS * head_dim + h * head_dim + d];
+        const int source_t = t;
+        for (int c = 0; c < INPUT_DIM; ++c) {
+          qv += activation[(size_t) source_t * INPUT_DIM + c] *
+                weight_ref[(size_t) c * output_cols + h * head_dim + d];
+          kv += activation[(size_t) source_t * INPUT_DIM + c] *
+                weight_ref[(size_t) c * output_cols + N_HEADS * head_dim + h * head_dim + d];
+          vv += activation[(size_t) source_t * INPUT_DIM + c] *
+                weight_ref[(size_t) c * output_cols + 2 * N_HEADS * head_dim + h * head_dim + d];
+        }
+        q_raw[d] = qv;
+        k_raw[d] = kv;
+        q_sum += qv * qv;
+        k_sum += kv * kv;
+        (void) vv;
+      }
+      const float q_inv = 1.0f / sqrtf(q_sum / head_dim + 1.0e-6f);
+      const float k_inv = 1.0f / sqrtf(k_sum / head_dim + 1.0e-6f);
+      for (int d = 0; d < head_dim; ++d) {
+        q_raw[d] *= q_inv * q_norm[d];
+        k_raw[d] *= k_inv * k_norm[d];
+      }
+      for (int d = 0; d < head_dim / 2; ++d) {
+        const float x0 = q_raw[2 * d], x1 = q_raw[2 * d + 1];
+        const float *m = rope_pe + ((size_t) t * (head_dim / 2) + d) * 4;
+        q_raw[2 * d] = x0 * m[0] + x1 * m[1];
+        q_raw[2 * d + 1] = x0 * m[2] + x1 * m[3];
+        const float y0 = k_raw[2 * d], y1 = k_raw[2 * d + 1];
+        k_raw[2 * d] = y0 * m[0] + y1 * m[1];
+        k_raw[2 * d + 1] = y0 * m[2] + y1 * m[3];
+      }
+      for (int d = 0; d < head_dim; ++d) {
+        const float q_err = fabsf((float) packed_q_value(q, TOKENS, head_dim, t, h, d) - (float) (__fp16) q_raw[d]);
+        const float k_err = fabsf((float) packed_k_value(k, TOKENS, head_dim, t, h, d) - (float) (__fp16) k_raw[d]);
+        float v_ref = bias[2 * N_HEADS * head_dim + h * head_dim + d];
+        for (int c = 0; c < INPUT_DIM; ++c) {
+          const int source_t = t;
+          v_ref += activation[(size_t) source_t * INPUT_DIM + c] *
+                   weight_ref[(size_t) c * output_cols + 2 * N_HEADS * head_dim + h * head_dim + d];
+        }
+        const float v_err = fabsf((float) packed_v_value(v, TOKENS, head_dim, t, h, d) - (float) (__fp16) v_ref);
+        if (q_err > max_q) max_q = q_err;
+        if (k_err > max_k) max_k = k_err;
+        if (v_err > max_v) max_v = v_err;
+      }
+    }
+  }
+  fprintf(stderr, "qkv_rope: mode=%s state=%d dsp_us=%d max_q=%g max_k=%g max_v=%g\n",
+          dual ? "dual" : "single", state, dsp_us, max_q, max_k, max_v);
+  result = state == 0 && dsp_us >= 0 && max_q <= 0.03f &&
+           max_k <= 0.03f && max_v <= 0.03f ? 0 : -1;
+cleanup:
+  if (weight_ref != NULL) free(weight_ref);
+  if (data != NULL) free_shared_mem_buf(data, fd, total_bytes);
+  fprintf(stderr, result == 0 ? "%s passed\n" : "%s failed\n", __func__);
+  return result;
 }
 
 static void fill_static_halo_index(int32_t *index, int blocks_per_head, int max_kept,
@@ -830,6 +1039,34 @@ static int run_qkv_request(void *chan, const struct QkvMulRmsPackedParams *param
   return computed->state;
 }
 
+static int run_qkv_rope_request(void *chan, enum HtpOpsIndex op,
+                                const void *params, size_t params_size,
+                                void *returned, size_t returned_size) {
+  struct MessageHeader *msg = (struct MessageHeader *) chan;
+  const struct RequestHeader req_hdr = { .state = 0, .type = REQUEST_TYPE_OP_COMPUTE };
+  const struct OpComputeRequest compute_req = { .op = op };
+  const size_t req_size = sizeof(req_hdr) + sizeof(compute_req) + params_size;
+  msg->state.d = 0;
+  msg->n_reqs = 1;
+  msg->req_offsets[0] = (int32_t) message_header_size(msg);
+  msg->req_offsets[1] = msg->req_offsets[0] + (int32_t) req_size;
+  uint8_t *p = (uint8_t *) message_header_get_request_ptr(msg, 0);
+  memcpy(p, &req_hdr, sizeof(req_hdr));
+  p += sizeof(req_hdr);
+  memcpy(p, &compute_req, sizeof(compute_req));
+  p += sizeof(compute_req);
+  memcpy(p, params, params_size);
+  msg->state.v[0] = 1;
+  while (msg->state.v[1] != 1) {
+    usleep(10);
+  }
+  const struct RequestHeader *computed = message_header_get_request_ptr(msg, 0);
+  if (returned != NULL && returned_size > 0) {
+    memcpy(returned, computed->data + sizeof(struct OpComputeRequest), returned_size);
+  }
+  return computed->state;
+}
+
 static int compare_i64(const void *a, const void *b) {
   const int64_t lhs = *(const int64_t *) a;
   const int64_t rhs = *(const int64_t *) b;
@@ -837,7 +1074,8 @@ static int compare_i64(const void *a, const void *b) {
 }
 
 static int test_qkv_sparse_e2e_channel(void *chan) {
-  enum { N_HEADS = 24, HEAD_DIM = 64, INPUT_DIM = 1536, TEXT_TOKENS = 154, MAX_RUNS = 100 };
+  enum { N_HEADS = 24, INPUT_DIM = 1536, TEXT_TOKENS = 154, MAX_RUNS = 100 };
+  const int HEAD_DIM = env_positive_int("HTP_QKV_HEAD_DIM", 64);
   const int resolution = env_positive_int("HTP_QKV_E2E_RESOLUTION", 256);
   const int warmups = env_positive_int("HTP_QKV_E2E_WARMUPS", 3);
   const int runs = env_positive_int("HTP_QKV_E2E_RUNS", 10);
@@ -1071,11 +1309,13 @@ cleanup:
 }
 
 static int test_packed_sparse_attention_channel(void *chan) {
-  enum { N_HEADS = 24, HEAD_DIM = 64, TEXT_TOKENS = 154 };
+  enum { N_HEADS = 24, DEFAULT_TEXT_TOKENS = 154 };
+  const int HEAD_DIM = env_positive_int("HTP_PACKED_ATTN_HEAD_DIM", 64);
   const int token_h = env_positive_int("HTP_PACKED_ATTN_TOKEN_H", 16);
   const int token_w = env_positive_int("HTP_PACKED_ATTN_TOKEN_W", 16);
+  const int text_tokens = env_nonnegative_int("HTP_PACKED_ATTN_TEXT_TOKENS", DEFAULT_TEXT_TOKENS);
   const int image_tokens = token_h * token_w;
-  const int tokens = image_tokens + TEXT_TOKENS;
+  const int tokens = image_tokens + text_tokens;
   if (token_h <= 0 || token_w <= 0 || token_h % 4 != 0 || token_w % 8 != 0) {
     return -1;
   }
@@ -1134,7 +1374,7 @@ static int test_packed_sparse_attention_channel(void *chan) {
     .block_q = 32, .block_k = 32, .n_q_blocks = N_HEADS * blocks,
     .n_k_blocks = N_HEADS * blocks, .mask_format = 1, .max_kept_blocks = max_kept,
     .with_lse = 1, .sparse_policy = HTP_SPARSE_POLICY_STATIC_HALO,
-    .image_tokens = image_tokens, .text_tokens = TEXT_TOKENS,
+    .image_tokens = image_tokens, .text_tokens = text_tokens,
     .halo_kv_load_mode = load_mode, .halo_trace = 1,
     .image_block_rows = image_block_rows, .image_block_cols = image_block_cols,
   };
@@ -1175,6 +1415,287 @@ static int test_packed_sparse_attention_channel(void *chan) {
            raw_returned.halo_exec_mode == expected_exec &&
            packed_returned.halo_exec_mode == expected_exec && max_abs <= 0.006f ? 0 : -1;
   free_shared_mem_buf(data, fd, total_size);
+  fprintf(stderr, result == 0 ? "%s passed\n" : "%s failed\n", __func__);
+  return result;
+}
+
+static void unpack_packed_attention_qkv(const __fp16 *q, const __fp16 *k,
+                                        const __fp16 *v, float *raw_q,
+                                        __fp16 *raw_k, __fp16 *raw_v,
+                                        int tokens, int n_heads, int head_dim) {
+  for (int t = 0; t < tokens; ++t) {
+    for (int h = 0; h < n_heads; ++h) {
+      for (int d = 0; d < head_dim; ++d) {
+        const size_t raw = ((size_t) t * n_heads + h) * head_dim + d;
+        raw_q[raw] = packed_q_value(q, tokens, head_dim, t, h, d);
+        raw_k[raw] = (__fp16) packed_k_value(k, tokens, head_dim, t, h, d);
+        raw_v[raw] = (__fp16) packed_v_value(v, tokens, head_dim, t, h, d);
+      }
+    }
+  }
+}
+
+static int test_flux2_attention_benchmark_channel(void *chan) {
+  enum {
+    N_HEADS = 24,
+    HEAD_DIM = 128,
+    INPUT_DIM = 3072,
+    IMAGE_TOKENS = 256,
+    TEXT_TOKENS = 512,
+    TOKENS = IMAGE_TOKENS + TEXT_TOKENS,
+    MAX_RUNS = 100,
+  };
+  const int dual = env_enabled("HTP_FLUX2_ATTN_DUAL");
+  const int reorder = env_enabled("HTP_FLUX2_ATTN_REORDER");
+  const int use_userdma = env_enabled("HTP_FLUX2_ATTN_USERDMA");
+  const int warmups = env_positive_int("HTP_FLUX2_ATTN_WARMUPS", 10);
+  const int requested_runs = env_positive_int("HTP_FLUX2_ATTN_RUNS", 50);
+  const int runs = requested_runs > MAX_RUNS ? MAX_RUNS : requested_runs;
+  const int blocks = (TOKENS + 31) / 32;
+  const int image_block_rows = 4;
+  const int image_block_cols = 2;
+  const int output_cols = 3 * N_HEADS * HEAD_DIM;
+  const int load_mode = use_userdma ? HTP_HALO_KV_LOAD_USERDMA_AB : HTP_HALO_KV_LOAD_L2_PREFETCH;
+  const size_t activation_bytes = (size_t) TOKENS * INPUT_DIM * sizeof(float);
+  const size_t weight_bytes = (size_t) INPUT_DIM * output_cols * sizeof(__fp16);
+  const size_t bias_bytes = (size_t) output_cols * sizeof(float);
+  const size_t norm_bytes = (size_t) HEAD_DIM * sizeof(float);
+  const size_t rope_bytes = (size_t) TOKENS * (HEAD_DIM / 2) * 4 * sizeof(float);
+  const size_t head_elems = (size_t) blocks * (HEAD_DIM / 32) * 1024;
+  const size_t qkv_bytes = (size_t) N_HEADS * head_elems * sizeof(__fp16);
+  const size_t raw_elements = (size_t) TOKENS * N_HEADS * HEAD_DIM;
+  const size_t mask_elements = (size_t) N_HEADS * blocks * blocks;
+  const size_t output_elements = (size_t) TOKENS * N_HEADS * (HEAD_DIM + 1);
+
+  size_t activation_offset = 0;
+  size_t image_weight_offset = align_up(activation_offset + activation_bytes, 128);
+  size_t text_weight_offset = align_up(image_weight_offset + weight_bytes, 128);
+  size_t image_bias_offset = align_up(text_weight_offset + weight_bytes, 128);
+  size_t text_bias_offset = align_up(image_bias_offset + bias_bytes, 128);
+  size_t image_q_norm_offset = align_up(text_bias_offset + bias_bytes, 128);
+  size_t image_k_norm_offset = align_up(image_q_norm_offset + norm_bytes, 128);
+  size_t text_q_norm_offset = align_up(image_k_norm_offset + norm_bytes, 128);
+  size_t text_k_norm_offset = align_up(text_q_norm_offset + norm_bytes, 128);
+  size_t rope_offset = align_up(text_k_norm_offset + norm_bytes, 128);
+  size_t q_offset = align_up(rope_offset + rope_bytes, 128);
+  size_t k_offset = align_up(q_offset + qkv_bytes, 128);
+  size_t v_offset = align_up(k_offset + qkv_bytes, 128);
+  size_t mask_offset = align_up(v_offset + qkv_bytes, 128);
+  size_t raw_q_offset = align_up(mask_offset + mask_elements * sizeof(int32_t), 128);
+  size_t raw_k_offset = align_up(raw_q_offset + raw_elements * sizeof(float), 128);
+  size_t raw_v_offset = align_up(raw_k_offset + raw_elements * sizeof(__fp16), 128);
+  size_t raw_output_offset = align_up(raw_v_offset + raw_elements * sizeof(__fp16), 128);
+  size_t packed_output_offset = align_up(raw_output_offset + output_elements * sizeof(float), 128);
+  size_t total_bytes = align_up(packed_output_offset + output_elements * sizeof(float), 128);
+
+  uint8_t *data = NULL;
+  int fd = -1;
+  int result = -1;
+  if (alloc_shared_mem_buf((void **) &data, &fd, total_bytes) != 0) {
+    fprintf(stderr, "Cannot allocate Flux2 benchmark rpcmem (%zu bytes)\n", total_bytes);
+    return -1;
+  }
+
+  float *activation = (float *) (data + activation_offset);
+  __fp16 *image_weight = (__fp16 *) (data + image_weight_offset);
+  __fp16 *text_weight = (__fp16 *) (data + text_weight_offset);
+  float *image_bias = (float *) (data + image_bias_offset);
+  float *text_bias = (float *) (data + text_bias_offset);
+  float *image_q_norm = (float *) (data + image_q_norm_offset);
+  float *image_k_norm = (float *) (data + image_k_norm_offset);
+  float *text_q_norm = (float *) (data + text_q_norm_offset);
+  float *text_k_norm = (float *) (data + text_k_norm_offset);
+  float *rope_pe = (float *) (data + rope_offset);
+  __fp16 *q = (__fp16 *) (data + q_offset);
+  __fp16 *k = (__fp16 *) (data + k_offset);
+  __fp16 *v = (__fp16 *) (data + v_offset);
+  int32_t *mask = (int32_t *) (data + mask_offset);
+  float *raw_q = (float *) (data + raw_q_offset);
+  __fp16 *raw_k = (__fp16 *) (data + raw_k_offset);
+  __fp16 *raw_v = (__fp16 *) (data + raw_v_offset);
+  float *raw_output = (float *) (data + raw_output_offset);
+  float *packed_output = (float *) (data + packed_output_offset);
+
+  for (int t = 0; t < TOKENS; ++t) {
+    for (int c = 0; c < INPUT_DIM; ++c) {
+      activation[(size_t) t * INPUT_DIM + c] = qkv_bench_activation_value(t, c);
+    }
+  }
+  for (int c = 0; c < output_cols; ++c) {
+    image_bias[c] = (float) ((c % 19) - 9) * 0.007f;
+    text_bias[c] = (float) ((c % 23) - 11) * 0.006f;
+  }
+  for (int d = 0; d < HEAD_DIM; ++d) {
+    image_q_norm[d] = 0.9f + (float) (d % 11) * 0.013f;
+    image_k_norm[d] = 1.1f - (float) (d % 7) * 0.009f;
+    text_q_norm[d] = 1.0f + (float) (d % 13) * 0.008f;
+    text_k_norm[d] = 0.95f - (float) (d % 5) * 0.007f;
+  }
+  for (int t = 0; t < TOKENS; ++t) {
+    for (int d = 0; d < HEAD_DIM / 2; ++d) {
+      const float angle = 0.013f * (float) (t + 1) * (float) (d + 1);
+      float *m = rope_pe + ((size_t) t * (HEAD_DIM / 2) + d) * 4;
+      m[0] = cosf(angle);
+      m[1] = -sinf(angle);
+      m[2] = sinf(angle);
+      m[3] = cosf(angle);
+    }
+  }
+  for (int r = 0; r < INPUT_DIM; ++r) {
+    for (int c = 0; c < output_cols; ++c) {
+      const int r0 = r / 32;
+      const int r1 = r % 32;
+      const int c0 = c / 32;
+      const int c1 = c % 32;
+      const size_t tile = (size_t) (c0 * (INPUT_DIM / 32) + r0) * 1024;
+      const size_t in_tile = (size_t) (r1 & ~1) * 32 + c1 * 2 + (r1 & 1);
+      image_weight[tile + in_tile] = (__fp16) qkv_bench_weight_value(r, c);
+      text_weight[tile + in_tile] = (__fp16) qkv_bench_weight_value(r + 17, c + 11);
+    }
+  }
+  fill_static_halo_index(mask, blocks, blocks, N_HEADS,
+                         image_block_rows, image_block_cols);
+  memset(q, 0, qkv_bytes);
+  memset(k, 0, qkv_bytes);
+  memset(v, 0, qkv_bytes);
+  memset(raw_output, 0, output_elements * sizeof(float));
+  memset(packed_output, 0, output_elements * sizeof(float));
+
+  struct QkvMulRmsPackedRopeParams single_params = {
+    .q = { fd, (int32_t) q_offset }, .k_out = { fd, (int32_t) k_offset },
+    .v = { fd, (int32_t) v_offset }, .activation = { fd, (int32_t) activation_offset },
+    .weight = { fd, (int32_t) image_weight_offset }, .bias = { fd, (int32_t) image_bias_offset },
+    .q_norm = { fd, (int32_t) image_q_norm_offset }, .k_norm = { fd, (int32_t) image_k_norm_offset },
+    .rope_pe = { fd, (int32_t) rope_offset }, .tokens = TOKENS,
+    .input_dim = INPUT_DIM, .n_heads = N_HEADS, .head_dim = HEAD_DIM,
+    .rope_token_offset = 0, .rope_token_count = TOKENS, .elapsed_us = -1,
+  };
+  struct QkvMulRmsPackedDualRopeParams dual_params = {
+    .q = { fd, (int32_t) q_offset }, .k_out = { fd, (int32_t) k_offset },
+    .v = { fd, (int32_t) v_offset },
+    .image_activation = { fd, (int32_t) activation_offset },
+    .image_weight = { fd, (int32_t) image_weight_offset },
+    .image_bias = { fd, (int32_t) image_bias_offset },
+    .image_q_norm = { fd, (int32_t) image_q_norm_offset },
+    .image_k_norm = { fd, (int32_t) image_k_norm_offset },
+    .text_activation = { fd, (int32_t) (activation_offset + (size_t) IMAGE_TOKENS * INPUT_DIM * sizeof(float)) },
+    .text_weight = { fd, (int32_t) text_weight_offset },
+    .text_bias = { fd, (int32_t) text_bias_offset },
+    .text_q_norm = { fd, (int32_t) text_q_norm_offset },
+    .text_k_norm = { fd, (int32_t) text_k_norm_offset },
+    .rope_pe = { fd, (int32_t) rope_offset },
+    .image_tokens = IMAGE_TOKENS, .text_tokens = TEXT_TOKENS,
+    .input_dim = INPUT_DIM, .n_heads = N_HEADS, .head_dim = HEAD_DIM,
+    .image_rope_token_offset = 0, .text_rope_token_offset = IMAGE_TOKENS, .elapsed_us = -1,
+  };
+
+#define BUF_AT(off) { .fd = fd, .offset = (int32_t) (off) }
+  struct BlockSparseAttnParams packed_attn_params = {
+    .o = BUF_AT(packed_output_offset), .q = BUF_AT(q_offset),
+    .k = BUF_AT(k_offset), .v = BUF_AT(v_offset), .block_mask = BUF_AT(mask_offset),
+    .qo_len = TOKENS, .kv_len = TOKENS, .n_heads = N_HEADS, .n_kv_heads = N_HEADS,
+    .head_dim = HEAD_DIM, .block_q = 32, .block_k = 32,
+    .n_q_blocks = N_HEADS * blocks, .n_k_blocks = N_HEADS * blocks,
+    .mask_format = 1, .max_kept_blocks = blocks, .with_lse = 1,
+    .sparse_policy = HTP_SPARSE_POLICY_STATIC_HALO,
+    .image_tokens = IMAGE_TOKENS, .text_tokens = TEXT_TOKENS,
+    .halo_kv_load_mode = load_mode, .halo_trace = 1,
+    .image_block_rows = image_block_rows, .image_block_cols = image_block_cols,
+  };
+  struct BlockSparseAttnParams raw_attn_params = packed_attn_params;
+  raw_attn_params.o = (struct RpcmemBufAddr) BUF_AT(raw_output_offset);
+  raw_attn_params.q = (struct RpcmemBufAddr) BUF_AT(raw_q_offset);
+  raw_attn_params.k = (struct RpcmemBufAddr) BUF_AT(raw_k_offset);
+  raw_attn_params.v = (struct RpcmemBufAddr) BUF_AT(raw_v_offset);
+#undef BUF_AT
+
+  int64_t samples[MAX_RUNS];
+  int64_t qkv_dsp_total = 0;
+  int64_t attn_dsp_total = 0;
+  struct QkvMulRmsPackedRopeParams single_returned = {};
+  struct QkvMulRmsPackedDualRopeParams dual_returned = {};
+  struct BlockSparseAttnParams packed_returned = {};
+  struct BlockSparseAttnParams raw_returned = {};
+  int qkv_state = 0;
+  int timed_attn_state = 0;
+  for (int run = -warmups; run < runs; ++run) {
+    const int64_t start = get_time_us();
+    qkv_state = dual ?
+      run_qkv_rope_request(chan, HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32,
+                           &dual_params, sizeof(dual_params), &dual_returned, sizeof(dual_returned)) :
+      run_qkv_rope_request(chan, HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32,
+                           &single_params, sizeof(single_params), &single_returned, sizeof(single_returned));
+    if (qkv_state == 0 && reorder) {
+      unpack_packed_attention_qkv(q, k, v, raw_q, raw_k, raw_v,
+                                  TOKENS, N_HEADS, HEAD_DIM);
+      timed_attn_state = run_sparse_attention_request(
+        chan, HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16,
+        &raw_attn_params, &raw_returned);
+    } else if (qkv_state == 0) {
+      timed_attn_state = run_sparse_attention_request(
+        chan, HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16,
+        &packed_attn_params, &packed_returned);
+    } else {
+      timed_attn_state = -1;
+    }
+    const int64_t elapsed = get_time_us() - start;
+    if (qkv_state != 0 || timed_attn_state != 0) {
+      fprintf(stderr, "Flux2 %s benchmark dispatch failed qkv=%d attn=%d\n",
+              dual ? "double" : "single", qkv_state, timed_attn_state);
+      goto cleanup;
+    }
+    if (run >= 0) {
+      samples[run] = elapsed;
+      qkv_dsp_total += dual ? dual_returned.elapsed_us : single_returned.elapsed_us;
+      attn_dsp_total += reorder ? raw_returned.elapsed_us : packed_returned.elapsed_us;
+    }
+  }
+
+  unpack_packed_attention_qkv(q, k, v, raw_q, raw_k, raw_v,
+                              TOKENS, N_HEADS, HEAD_DIM);
+  const int raw_state = run_sparse_attention_request(
+    chan, HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16, &raw_attn_params, &raw_returned);
+  const int packed_state = run_sparse_attention_request(
+    chan, HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16, &packed_attn_params, &packed_returned);
+  float max_abs = 0.0f;
+  size_t worst = 0;
+  for (size_t i = 0; i < output_elements; ++i) {
+    const float diff = fabsf(raw_output[i] - packed_output[i]);
+    if (diff > max_abs) {
+      max_abs = diff;
+      worst = i;
+    }
+  }
+
+  qsort(samples, runs, sizeof(samples[0]), compare_i64);
+  int64_t total_us = 0;
+  for (int i = 0; i < runs; ++i) total_us += samples[i];
+  const double avg_us = (double) total_us / runs;
+  const double median_us = runs % 2 ? (double) samples[runs / 2] :
+    0.5 * (double) (samples[runs / 2 - 1] + samples[runs / 2]);
+  const int p95_index = (95 * runs + 99) / 100 - 1;
+  fprintf(stderr,
+          "flux2_attention_e2e: device=8gen3 mode=%s layout=%s loader=%s image_tokens=%d text_tokens=%d "
+          "heads=%d head_dim=%d warmups=%d runs=%d avg_us=%.1f median_us=%.1f "
+          "p95_us=%lld min_us=%lld qkv_dsp_avg_us=%.1f attn_dsp_avg_us=%.1f "
+          "timed_exec=%d raw_exec=%d packed_exec=%d max_abs=%g worst=%zu raw=%g packed=%g\n",
+          dual ? "double" : "single", reorder ? "reordered" : "packed",
+          use_userdma ? "userdma" : "l2fetch",
+          IMAGE_TOKENS, TEXT_TOKENS, N_HEADS, HEAD_DIM, warmups, runs,
+          avg_us, median_us, (long long) samples[p95_index], (long long) samples[0],
+          (double) qkv_dsp_total / runs, (double) attn_dsp_total / runs,
+          reorder ? raw_returned.halo_exec_mode : packed_returned.halo_exec_mode,
+          raw_returned.halo_exec_mode, packed_returned.halo_exec_mode,
+          max_abs, worst, raw_output[worst], packed_output[worst]);
+
+  const int expected_exec = use_userdma ? 2 : 1;
+  result = raw_state == 0 && packed_state == 0 &&
+           raw_returned.halo_exec_mode == expected_exec &&
+           packed_returned.halo_exec_mode == expected_exec &&
+           isfinite(raw_output[0]) && isfinite(packed_output[0]) && max_abs <= 0.006f ? 0 : -1;
+
+cleanup:
+  if (data != NULL) free_shared_mem_buf(data, fd, total_bytes);
   fprintf(stderr, result == 0 ? "%s passed\n" : "%s failed\n", __func__);
   return result;
 }
@@ -1401,6 +1922,15 @@ int main(int argc, char **argv) {
       qkv_bench_err = fused_err;
     }
   }
+  if (env_enabled("HTP_QKV_ROPE_BENCH")) {
+    int rope_err = test_qkv_rope_channel(chan);
+    if (rope_err != 0) {
+      fprintf(stderr, "QKV RoPE benchmark failed\n");
+    }
+    if (qkv_bench_err == 0) {
+      qkv_bench_err = rope_err;
+    }
+  }
   if (env_enabled("HTP_QKV_PACKED_ATTN_BENCH")) {
     int packed_attn_err = test_packed_sparse_attention_channel(chan);
     if (packed_attn_err != 0) {
@@ -1417,6 +1947,15 @@ int main(int argc, char **argv) {
     }
     if (qkv_bench_err == 0) {
       qkv_bench_err = e2e_err;
+    }
+  }
+  if (env_enabled("HTP_FLUX2_ATTN_BENCH")) {
+    int flux2_err = test_flux2_attention_benchmark_channel(chan);
+    if (flux2_err != 0) {
+      fprintf(stderr, "Flux2 attention benchmark failed\n");
+    }
+    if (qkv_bench_err == 0) {
+      qkv_bench_err = flux2_err;
     }
   }
   if (getenv("HTP_SKIP_BLOCK_SPARSE_TEST") == NULL) {

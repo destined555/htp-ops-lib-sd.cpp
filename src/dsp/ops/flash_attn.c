@@ -167,6 +167,14 @@ static bool checked_size_mul(size_t a, size_t b, size_t *result) {
   return true;
 }
 
+static inline bool packed_head_dim_supported(int head_dim) {
+  return head_dim == 64 || head_dim == 128;
+}
+
+static inline int block_sparse_halo_packed_dma_desc_count(int head_dim) {
+  return packed_head_dim_supported(head_dim) ? 1 + head_dim / HMX_FP16_TILE_N_COLS : -1;
+}
+
 static bool block_sparse_halo_mask_span_fits(int n_heads, int q_blocks_per_head,
                                              int max_kept_blocks) {
   size_t total_q_blocks;
@@ -669,7 +677,7 @@ int block_sparse_halo_get_packed_segment(block_sparse_halo_packed_segment_t *seg
                                          int col_start, int block_count, int image_block_cols, int head_dim) {
   if (segment == NULL || slot == NULL || !slot->ready || slot->packed_k == NULL || slot->packed_v == NULL ||
       col_start < 0 || block_count <= 0 || image_block_cols <= 0 ||
-      col_start > image_block_cols - block_count || head_dim <= 0 || head_dim % 64 != 0) {
+      col_start > image_block_cols - block_count || !packed_head_dim_supported(head_dim)) {
     return -1;
   }
 
@@ -993,8 +1001,9 @@ static int block_sparse_halo_build_packed_dma_row_descs(
   void *packed_row, int kv_head_idx, int head_dim, int token_tiles,
   int image_block_cols, int row_id) {
   if (descs == NULL || ((uintptr_t) descs & 63u) != 0 || K == NULL || V == NULL ||
-      packed_row == NULL || desc_capacity < BLOCK_SPARSE_HALO_PACKED_DMA_DESCS_PER_ROW ||
-      kv_head_idx < 0 || head_dim != 64 || token_tiles <= 0 || image_block_cols <= 0 || row_id < 0) {
+      packed_row == NULL || kv_head_idx < 0 || !packed_head_dim_supported(head_dim) || token_tiles <= 0 ||
+      image_block_cols <= 0 || row_id < 0 ||
+      desc_capacity < block_sparse_halo_packed_dma_desc_count(head_dim)) {
     return -1;
   }
   const int token_tile = row_id * image_block_cols;
@@ -1003,32 +1012,39 @@ static int block_sparse_halo_build_packed_dma_row_descs(
   }
   const size_t k_tile_bytes = (size_t) head_dim * HMX_FP16_TILE_N_ROWS * sizeof(__fp16);
   const size_t v_tile_bytes = HMX_FP16_TILE_SIZE;
+  const int dim_tiles = head_dim / HMX_FP16_TILE_N_COLS;
   const size_t row_half_bytes = (size_t) image_block_cols * k_tile_bytes;
   size_t k_offset;
-  size_t v0_offset;
-  size_t v1_offset;
+  size_t v_offset[4] = {};
   if (block_sparse_packed_qk_tile_offset(
         &k_offset, kv_head_idx, token_tile, 0, token_tiles, head_dim) != 0 ||
-      block_sparse_packed_v_tile_offset(
-        &v0_offset, kv_head_idx, token_tile, 0, token_tiles, head_dim) != 0 ||
-      block_sparse_packed_v_tile_offset(
-        &v1_offset, kv_head_idx, token_tile, 1, token_tiles, head_dim) != 0) {
+      dim_tiles > (int) (sizeof(v_offset) / sizeof(v_offset[0]))) {
     return -1;
+  }
+  for (int d = 0; d < dim_tiles; ++d) {
+    if (block_sparse_packed_v_tile_offset(
+          &v_offset[d], kv_head_idx, token_tile, d, token_tiles, head_dim) != 0) {
+      return -1;
+    }
   }
   uint8_t *dst = (uint8_t *) packed_row;
+  const int desc_count = block_sparse_halo_packed_dma_desc_count(head_dim);
   if (dma_desc_2d_init(
         &descs[0], &descs[1], K + k_offset, dst,
-        k_tile_bytes, image_block_cols, k_tile_bytes, k_tile_bytes) != DMA_SUBMIT_OK ||
-      dma_desc_2d_init(
-        &descs[1], &descs[2], V + v0_offset, dst + row_half_bytes,
-        v_tile_bytes, image_block_cols, v_tile_bytes, v_tile_bytes) != DMA_SUBMIT_OK ||
-      dma_desc_2d_init(
-        &descs[2], NULL, V + v1_offset,
-        dst + row_half_bytes + (size_t) image_block_cols * v_tile_bytes,
-        v_tile_bytes, image_block_cols, v_tile_bytes, v_tile_bytes) != DMA_SUBMIT_OK) {
+        k_tile_bytes, image_block_cols, k_tile_bytes, k_tile_bytes) != DMA_SUBMIT_OK) {
     return -1;
   }
-  return BLOCK_SPARSE_HALO_PACKED_DMA_DESCS_PER_ROW;
+  for (int d = 0; d < dim_tiles; ++d) {
+    const int desc_idx = 1 + d;
+    dma_desc_2d_t *next = desc_idx + 1 < desc_count ? &descs[desc_idx + 1] : NULL;
+    if (dma_desc_2d_init(
+          &descs[desc_idx], next, V + v_offset[d],
+          dst + row_half_bytes + (size_t) d * image_block_cols * v_tile_bytes,
+          v_tile_bytes, image_block_cols, v_tile_bytes, v_tile_bytes) != DMA_SUBMIT_OK) {
+      return -1;
+    }
+  }
+  return desc_count;
 }
 
 #define BLOCK_SPARSE_USERDMA_PROBE_BYTES (64 * 1024)
@@ -1916,7 +1932,7 @@ static int block_sparse_halo_row_dma_load_async(block_sparse_halo_row_slot_t *sl
                                                 int kv_head_idx, int head_dim, int image_block_cols, int row_id,
                                                 bool input_packed, int token_tiles,
                                                 int userdma_scope, int worker_index) {
-  const int expected_descs = input_packed ? BLOCK_SPARSE_HALO_PACKED_DMA_DESCS_PER_ROW :
+  const int expected_descs = input_packed ? block_sparse_halo_packed_dma_desc_count(head_dim) :
                                             BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW;
   if (slot == NULL || descs == NULL || slot->outstanding || slot->raw == NULL || row_id < 0 ||
       (input_packed ?
@@ -4359,7 +4375,7 @@ int block_sparse_flash_attn_f16_core_chunked(int kv_head_idx, uint8_t *vtcm, uin
   const bool use_host_index =
     mask_format == 1 && max_kept_blocks > 0 && G == 1 && block_q == HMX_FP16_TILE_N_ROWS &&
     block_k == HMX_FP16_TILE_N_COLS;
-  if (input_packed && (G != 1 || n_heads != 24 || n_kv_heads != 24 || head_dim != 64 ||
+  if (input_packed && (G != 1 || n_heads != 24 || n_kv_heads != 24 || !packed_head_dim_supported(head_dim) ||
                        block_q != HMX_FP16_TILE_N_ROWS || block_k != HMX_FP16_TILE_N_COLS ||
                        qo_len != kv_len)) {
     return -1;
@@ -5629,7 +5645,7 @@ static int block_sparse_flash_attn_f16_core_halo_rows(int kv_head_idx, uint8_t *
 
   block_sparse_halo_row_slot_t dma_row_slots[BLOCK_SPARSE_HALO_RAW_STAGING_SLOTS] = {};
   _Alignas(64) dma_desc_2d_t dma_desc_storage[BLOCK_SPARSE_HALO_MAX_DMA_DESCS_PER_ROW];
-  const int dma_desc_count = input_packed ? BLOCK_SPARSE_HALO_PACKED_DMA_DESCS_PER_ROW :
+  const int dma_desc_count = input_packed ? block_sparse_halo_packed_dma_desc_count(head_dim) :
                                             BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW;
   int dma_pending_slot = -1;
   int dma_pending_row = -1;
@@ -8140,7 +8156,7 @@ static int block_sparse_flash_attn_impl(
     return -1;
   }
   if (input_packed &&
-      (qo_len != kv_len || n_heads != 24 || n_kv_heads != 24 || head_dim != 64 ||
+      (qo_len != kv_len || n_heads != 24 || n_kv_heads != 24 || !packed_head_dim_supported(head_dim) ||
        block_q != HMX_FP16_TILE_N_ROWS || block_k != HMX_FP16_TILE_N_COLS ||
        mask_format != 1 || sparse_policy != 1 ||
        (halo_kv_load_mode != 1 && halo_kv_load_mode != 2))) {

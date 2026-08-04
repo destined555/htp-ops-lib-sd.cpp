@@ -31,6 +31,22 @@ int hmx_qkv_mul_rms_packed_dual_w16a32(
     const float *text_activation, const __fp16 *text_weight, const float *text_bias,
     const float *text_q_norm, const float *text_k_norm, int text_tokens,
     int input_dim, int n_heads, int head_dim);
+
+int hmx_qkv_mul_rms_packed_rope_w16a32(
+    __fp16 *restrict q, __fp16 *restrict k_out, __fp16 *restrict v,
+    const float *restrict activation, const __fp16 *restrict permuted_weight,
+    const float *restrict bias, const float *restrict q_norm, const float *restrict k_norm,
+    const float *restrict rope_pe, int rope_token_offset, int rope_token_count,
+    int tokens, int input_dim, int n_heads, int head_dim);
+
+int hmx_qkv_mul_rms_packed_dual_rope_w16a32(
+    __fp16 *restrict q, __fp16 *restrict k_out, __fp16 *restrict v,
+    const float *image_activation, const __fp16 *image_weight, const float *image_bias,
+    const float *image_q_norm, const float *image_k_norm, int image_tokens,
+    const float *text_activation, const __fp16 *text_weight, const float *text_bias,
+    const float *text_q_norm, const float *text_k_norm, int text_tokens,
+    const float *rope_pe, int image_rope_token_offset, int text_rope_token_offset,
+    int input_dim, int n_heads, int head_dim);
 int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *activation, const uint8_t *permuted_weight,
                                      int m, int k, int n, enum ggml_type weight_type);
 
@@ -54,7 +70,7 @@ typedef struct {
 #define BLOCK_SPARSE_HALO_DMA_BANKS 2
 #define BLOCK_SPARSE_HALO_DMA_DESCS_PER_BANK (2 * BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS)
 #define BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW 2
-#define BLOCK_SPARSE_HALO_PACKED_DMA_DESCS_PER_ROW 3
+#define BLOCK_SPARSE_HALO_PACKED_DMA_DESCS_PER_ROW 5
 #define BLOCK_SPARSE_HALO_MAX_DMA_DESCS_PER_ROW BLOCK_SPARSE_HALO_PACKED_DMA_DESCS_PER_ROW
 #define BLOCK_SPARSE_HALO_ROW_SLOTS 4
 #define BLOCK_SPARSE_HALO_PACKED_ROW_SLOTS 3

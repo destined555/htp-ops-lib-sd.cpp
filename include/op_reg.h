@@ -26,6 +26,8 @@ enum HtpOpsIndex {
   HTP_OPS_QKV_MUL_RMS_PACKED_W16A32,
   HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16,
   HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_W16A32,
+  HTP_OPS_QKV_MUL_RMS_PACKED_ROPE_W16A32,
+  HTP_OPS_QKV_MUL_RMS_PACKED_DUAL_ROPE_W16A32,
   HTP_OPS_COUNT,
 };
 
@@ -98,12 +100,62 @@ struct QkvMulRmsPackedBufferSizes {
   size_t norm_bytes;
 };
 
+struct QkvMulRmsPackedRopeParams {
+  struct RpcmemBufAddr q;
+  struct RpcmemBufAddr k_out;
+  struct RpcmemBufAddr v;
+  struct RpcmemBufAddr activation;
+  struct RpcmemBufAddr weight;
+  struct RpcmemBufAddr bias;
+  struct RpcmemBufAddr q_norm;
+  struct RpcmemBufAddr k_norm;
+  struct RpcmemBufAddr rope_pe;
+  int32_t tokens;
+  int32_t input_dim;
+  int32_t n_heads;
+  int32_t head_dim;
+  int32_t rope_token_offset;
+  int32_t rope_token_count;
+  int32_t elapsed_us;
+} __attribute__((packed));
+
+struct QkvMulRmsPackedDualRopeParams {
+  struct RpcmemBufAddr q;
+  struct RpcmemBufAddr k_out;
+  struct RpcmemBufAddr v;
+  struct RpcmemBufAddr image_activation;
+  struct RpcmemBufAddr image_weight;
+  struct RpcmemBufAddr image_bias;
+  struct RpcmemBufAddr image_q_norm;
+  struct RpcmemBufAddr image_k_norm;
+  struct RpcmemBufAddr text_activation;
+  struct RpcmemBufAddr text_weight;
+  struct RpcmemBufAddr text_bias;
+  struct RpcmemBufAddr text_q_norm;
+  struct RpcmemBufAddr text_k_norm;
+  struct RpcmemBufAddr rope_pe;
+  int32_t image_tokens;
+  int32_t text_tokens;
+  int32_t input_dim;
+  int32_t n_heads;
+  int32_t head_dim;
+  int32_t image_rope_token_offset;
+  int32_t text_rope_token_offset;
+  int32_t elapsed_us;
+} __attribute__((packed));
+
 #ifdef __cplusplus
 static_assert(sizeof(QkvMulRmsPackedParams) == 84);
 static_assert(sizeof(QkvMulRmsPackedDualParams) == 128);
+static_assert(sizeof(QkvMulRmsPackedRopeParams) == 100);
+static_assert(sizeof(QkvMulRmsPackedDualRopeParams) == 144);
 #else
 _Static_assert(sizeof(struct QkvMulRmsPackedParams) == 84,
                "unexpected QKV MUL payload size");
+_Static_assert(sizeof(struct QkvMulRmsPackedRopeParams) == 100,
+               "unexpected QKV MUL RoPE payload size");
+_Static_assert(sizeof(struct QkvMulRmsPackedDualRopeParams) == 144,
+               "unexpected QKV MUL dual RoPE payload size");
 #endif
 
 struct FlashAttnParams {
