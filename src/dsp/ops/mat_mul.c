@@ -13,6 +13,7 @@
 #include "dsp/utils.h"
 #include "dsp/vtcm_mgr.h"
 #include "dsp/worker_pool.h"
+#include "op_reg.h"
 
 // debug & profile
 #include "HAP_farf.h"
@@ -903,7 +904,7 @@ static void qkv_pack_q_tile(__fp16 *dst, const float *src, int n_rows, int head_
 }
 
 static inline bool qkv_supported_head_dim(int head_dim) {
-  return head_dim == 64 || head_dim == 128;
+  return htp_packed_head_dim_supported(head_dim) != 0;
 }
 
 static void qkv_pack_k_tile(__fp16 *dst, const __fp16 *src, int n_rows, int head_dim) {
@@ -1210,7 +1211,7 @@ static int hmx_qkv_mul_rms_packed_w16a32_impl(
     const float *rope_pe, int rope_token_offset, int rope_token_count) {
   if (q == NULL || k_out == NULL || v == NULL || activation == NULL || permuted_weight == NULL ||
       bias == NULL || q_norm == NULL || k_norm == NULL || tokens <= 0 || input_dim <= 0 ||
-      n_heads != 24 || !qkv_supported_head_dim(head_dim) || input_dim % 32 != 0) {
+      !htp_packed_shape_supported(n_heads, n_heads, head_dim, 1) || input_dim % 32 != 0) {
     return -1;
   }
   if (!is_aligned(q, VLEN) || !is_aligned(k_out, VLEN) || !is_aligned(v, VLEN) ||

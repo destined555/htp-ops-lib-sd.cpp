@@ -17,6 +17,7 @@
 #include "dsp/utils.h"
 #include "dsp/vtcm_mgr.h"
 #include "dsp/worker_pool.h"
+#include "op_reg.h"
 
 // for debug
 #include <HAP_farf.h>
@@ -168,7 +169,7 @@ static bool checked_size_mul(size_t a, size_t b, size_t *result) {
 }
 
 static inline bool packed_head_dim_supported(int head_dim) {
-  return head_dim == 64 || head_dim == 128;
+  return htp_packed_head_dim_supported(head_dim) != 0;
 }
 
 static inline int block_sparse_halo_packed_dma_desc_count(int head_dim) {
@@ -4375,7 +4376,7 @@ int block_sparse_flash_attn_f16_core_chunked(int kv_head_idx, uint8_t *vtcm, uin
   const bool use_host_index =
     mask_format == 1 && max_kept_blocks > 0 && G == 1 && block_q == HMX_FP16_TILE_N_ROWS &&
     block_k == HMX_FP16_TILE_N_COLS;
-  if (input_packed && (G != 1 || n_heads != 24 || n_kv_heads != 24 || !packed_head_dim_supported(head_dim) ||
+  if (input_packed && (G != 1 || !htp_packed_shape_supported(n_heads, n_kv_heads, head_dim, 1) ||
                        block_q != HMX_FP16_TILE_N_ROWS || block_k != HMX_FP16_TILE_N_COLS ||
                        qo_len != kv_len)) {
     return -1;
@@ -8156,10 +8157,10 @@ static int block_sparse_flash_attn_impl(
     return -1;
   }
   if (input_packed &&
-      (qo_len != kv_len || n_heads != 24 || n_kv_heads != 24 || !packed_head_dim_supported(head_dim) ||
+      (qo_len != kv_len || !htp_packed_shape_supported(n_heads, n_kv_heads, head_dim, 1) ||
        block_q != HMX_FP16_TILE_N_ROWS || block_k != HMX_FP16_TILE_N_COLS ||
-       mask_format != 1 || sparse_policy != 1 ||
-       (halo_kv_load_mode != 1 && halo_kv_load_mode != 2))) {
+       !((mask_format == 1 && sparse_policy == 1 && (halo_kv_load_mode == 1 || halo_kv_load_mode == 2)) ||
+         (mask_format == 0 && sparse_policy == 0 && halo_kv_load_mode == 0)))) {
     return -1;
   }
 

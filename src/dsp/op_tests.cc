@@ -92,6 +92,15 @@ void test_qkv_mul_rms_packed_dual_contracts() {
   OP_TEST_ASSERT(sizes.bias_bytes == size_t(4608) * sizeof(float));
   OP_TEST_ASSERT(sizes.norm_bytes == size_t(64) * sizeof(float));
 
+  params.n_heads = 30;
+  params.head_dim = 128;
+  OP_TEST_ASSERT(htp_packed_shape_supported(30, 30, 128, 1));
+  OP_TEST_ASSERT(qkv_mul_rms_packed_dual_buffer_sizes(&params, &sizes) == 0);
+  OP_TEST_ASSERT(sizes.qkv_bytes == size_t(30) * 136u * 8192u);
+  OP_TEST_ASSERT(sizes.weight_bytes == size_t(1536) * 11520u * sizeof(__fp16));
+  OP_TEST_ASSERT(sizes.bias_bytes == size_t(11520) * sizeof(float));
+  OP_TEST_ASSERT(sizes.norm_bytes == size_t(128) * sizeof(float));
+
   params.image_tokens = 0;
   OP_TEST_ASSERT(qkv_mul_rms_packed_dual_buffer_sizes(&params, &sizes) != 0);
   params.image_tokens = 255;
@@ -100,7 +109,38 @@ void test_qkv_mul_rms_packed_dual_contracts() {
   params.n_heads = 16;
   OP_TEST_ASSERT(qkv_mul_rms_packed_dual_buffer_sizes(&params, &sizes) != 0);
 
+  OP_TEST_ASSERT(!htp_packed_shape_supported(16, 16, 128, 1));
+  OP_TEST_ASSERT(!htp_packed_shape_supported(30, 24, 128, 1));
+  OP_TEST_ASSERT(htp_packed_shape_supported(30, 15, 128, 0));
+
   FARF(ALWAYS, "qkv_mul_rms_packed_dual_contracts: PASS");
+}
+
+void test_block_sparse_30_head_contracts() {
+  BlockSparseAttnParams params = {};
+  params.qo_len = 512;
+  params.kv_len = 512;
+  params.n_heads = 30;
+  params.n_kv_heads = 30;
+  params.head_dim = 128;
+  params.block_q = 32;
+  params.block_k = 32;
+  params.n_q_blocks = 30 * 16;
+  params.n_k_blocks = 30 * 16;
+  params.mask_format = 1;
+  params.max_kept_blocks = 16;
+  params.with_lse = 1;
+
+  BlockSparseAttnBufferSizes sizes = {};
+  OP_TEST_ASSERT(htp_packed_shape_supported(30, 30, 128, 1));
+  OP_TEST_ASSERT(block_sparse_attn_buffer_sizes(&params, &sizes) == 0);
+  OP_TEST_ASSERT(sizes.q == size_t(512) * 30u * 128u * sizeof(float));
+  OP_TEST_ASSERT(sizes.o == size_t(512) * 30u * 129u * sizeof(float));
+  OP_TEST_ASSERT(sizes.kv == size_t(512) * 30u * 128u * sizeof(__fp16));
+  OP_TEST_ASSERT(sizes.block_mask == size_t(30 * 16 * 16) * sizeof(int32_t));
+  OP_TEST_ASSERT(!htp_packed_shape_supported(31, 31, 128, 1));
+  OP_TEST_ASSERT(htp_packed_shape_supported(30, 15, 128, 0));
+  FARF(ALWAYS, "block_sparse_30_head_contracts: PASS");
 }
 
 template <size_t PayloadSize>
@@ -1951,6 +1991,7 @@ void internal_op_tests() {
   using namespace internal;
 
   test_qkv_mul_rms_packed_dual_contracts();
+  test_block_sparse_30_head_contracts();
   test_block_sparse_fa_select_plan();
   test_block_sparse_halo_contracts();
   test_block_sparse_halo_image_only_contracts();

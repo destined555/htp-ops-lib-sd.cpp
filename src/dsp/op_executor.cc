@@ -21,10 +21,6 @@ size_t align_up_size(size_t v, size_t a) {
   return ((v + a - 1) / a) * a;
 }
 
-bool packed_head_dim_supported(int head_dim) {
-  return head_dim == 64 || head_dim == 128;
-}
-
 bool checked_size_add(size_t a, size_t b, size_t *result) {
   if (result == nullptr || a > SIZE_MAX - b) {
     return false;
@@ -40,6 +36,8 @@ bool checked_size_mul(size_t a, size_t b, size_t *result) {
   *result = a * b;
   return true;
 }
+
+constexpr size_t kPackedZeroBiasFloats = 3u * 30u * 128u;
 
 size_t ggml_super_block_size(enum ggml_type type) {
   // TODO: more types
@@ -131,10 +129,10 @@ int block_sparse_attn_buffer_sizes(const struct BlockSparseAttnParams *params,
 
 int qkv_mul_rms_packed_dual_buffer_sizes(const struct QkvMulRmsPackedDualParams *params,
                                          struct QkvMulRmsPackedBufferSizes *sizes) {
-  if (params == nullptr || sizes == nullptr || params->image_tokens <= 0 || params->text_tokens <= 0 ||
+  if (params == nullptr || sizes == nullptr || params->image_tokens <= 0 || params->text_tokens < 0 ||
       params->image_tokens % 32 != 0 ||
-      params->input_dim <= 0 || params->input_dim % 32 != 0 || params->n_heads != 24 ||
-      !packed_head_dim_supported(params->head_dim)) {
+      params->input_dim <= 0 || params->input_dim % 32 != 0 ||
+      !htp_packed_shape_supported(params->n_heads, params->n_heads, params->head_dim, 1)) {
     return -1;
   }
   const size_t image_tokens = (size_t) params->image_tokens;
@@ -239,8 +237,9 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
           return -1;
         }
         auto params = reinterpret_cast<QkvMulRmsPackedParams *>(req->payload);
-        if (params->tokens <= 0 || params->input_dim <= 0 || params->n_heads != 24 ||
-            !packed_head_dim_supported(params->head_dim) || params->input_dim % 32 != 0) {
+        if (params->tokens <= 0 || params->input_dim <= 0 ||
+            !htp_packed_shape_supported(params->n_heads, params->n_heads, params->head_dim, 1) ||
+            params->input_dim % 32 != 0) {
           return -1;
         }
 
@@ -317,7 +316,11 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
         add_buffer(in_bufs, params->text_k_norm, sizes.norm_bytes);
         validate_in_bufs();
         const int64_t t0 = HAP_perf_get_qtimer_count();
-        static float zero_bias[3 * 24 * 128] __attribute__((aligned(128))) = {};
+        static float zero_bias[kPackedZeroBiasFloats] __attribute__((aligned(128))) = {};
+        if ((params->image_bias.fd < 0 || params->text_bias.fd < 0) &&
+            sizes.bias_bytes > sizeof(zero_bias)) {
+          return -1;
+        }
         ret = hmx_qkv_mul_rms_packed_dual_w16a32(
             (__fp16 *) OUT_PTR(0), (__fp16 *) OUT_PTR(1), (__fp16 *) OUT_PTR(2),
             (const float *) IN_PTR(0), (const __fp16 *) IN_PTR(1),
@@ -339,8 +342,9 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
           return -1;
         }
         auto params = reinterpret_cast<QkvMulRmsPackedRopeParams *>(req->payload);
-        if (params->tokens <= 0 || params->input_dim <= 0 || params->n_heads != 24 ||
-            !packed_head_dim_supported(params->head_dim) || params->input_dim % 32 != 0 ||
+        if (params->tokens <= 0 || params->input_dim <= 0 ||
+            !htp_packed_shape_supported(params->n_heads, params->n_heads, params->head_dim, 1) ||
+            params->input_dim % 32 != 0 ||
             params->rope_token_offset < 0 || params->rope_token_count <= 0) {
           return -1;
         }
@@ -375,7 +379,10 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
         add_buffer(in_bufs, params->rope_pe, rope_size);
         validate_in_bufs();
         const int64_t t0 = HAP_perf_get_qtimer_count();
-        static float zero_bias[3 * 24 * 128] __attribute__((aligned(128))) = {};
+        static float zero_bias[kPackedZeroBiasFloats] __attribute__((aligned(128))) = {};
+        if (params->bias.fd < 0 && bias_size > sizeof(zero_bias)) {
+          return -1;
+        }
         ret = hmx_qkv_mul_rms_packed_rope_w16a32(
           (__fp16 *) OUT_PTR(0), (__fp16 *) OUT_PTR(1), (__fp16 *) OUT_PTR(2),
           (const float *) IN_PTR(0), (const __fp16 *) IN_PTR(1),
@@ -432,7 +439,11 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
         add_buffer(in_bufs, params->rope_pe, rope_size);
         validate_in_bufs();
         const int64_t t0 = HAP_perf_get_qtimer_count();
-        static float zero_bias[3 * 24 * 128] __attribute__((aligned(128))) = {};
+        static float zero_bias[kPackedZeroBiasFloats] __attribute__((aligned(128))) = {};
+        if ((params->image_bias.fd < 0 || params->text_bias.fd < 0) &&
+            sizes.bias_bytes > sizeof(zero_bias)) {
+          return -1;
+        }
         ret = hmx_qkv_mul_rms_packed_dual_rope_w16a32(
           (__fp16 *) OUT_PTR(0), (__fp16 *) OUT_PTR(1), (__fp16 *) OUT_PTR(2),
           (const float *) IN_PTR(0), (const __fp16 *) IN_PTR(1),
@@ -579,11 +590,16 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
           return -1;
         }
         if (input_packed) {
-          if (qo_len != kv_len || n_heads != 24 || n_kv_heads != 24 || !packed_head_dim_supported(head_dim) ||
-              params->block_q != 32 || params->block_k != 32 || mask_format != 1 ||
-              params->sparse_policy != HTP_SPARSE_POLICY_STATIC_HALO ||
-              (params->halo_kv_load_mode != HTP_HALO_KV_LOAD_L2_PREFETCH &&
-               params->halo_kv_load_mode != HTP_HALO_KV_LOAD_USERDMA_AB)) {
+          const bool packed_static_halo =
+            mask_format == 1 && params->sparse_policy == HTP_SPARSE_POLICY_STATIC_HALO &&
+            (params->halo_kv_load_mode == HTP_HALO_KV_LOAD_L2_PREFETCH ||
+             params->halo_kv_load_mode == HTP_HALO_KV_LOAD_USERDMA_AB);
+          const bool packed_full_keep =
+            mask_format == 0 && params->sparse_policy == HTP_SPARSE_POLICY_NONE &&
+            params->halo_kv_load_mode == HTP_HALO_KV_LOAD_BASELINE;
+          if (qo_len != kv_len || !htp_packed_shape_supported(n_heads, n_kv_heads, head_dim, 1) ||
+              params->block_q != 32 || params->block_k != 32 ||
+              (!packed_static_halo && !packed_full_keep)) {
             return -1;
           }
           const size_t padded_tokens = align_up_size((size_t) qo_len, 32);
