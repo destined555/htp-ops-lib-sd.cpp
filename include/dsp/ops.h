@@ -271,6 +271,8 @@ int block_sparse_fa_select_plan(block_sparse_fa_plan_t *plan, bool fast_path, in
                                 int kv_len, size_t available_bytes);
 int block_sparse_fa_select_halo_fallback_plan(block_sparse_fa_plan_t *plan, bool fast_path, int gqa_factor,
                                               int head_dim, int kv_len, size_t available_bytes);
+int block_sparse_fa_select_chunked_plan(block_sparse_fa_plan_t *plan, int gqa_factor, int head_dim,
+                                        int kv_len, size_t available_bytes);
 
 int block_sparse_halo_parse_row(block_sparse_halo_row_t *parsed, const int32_t *row, int max_kept_blocks,
                                 int q_block, int q_blocks_per_head, int k_blocks_per_head, int image_blocks);

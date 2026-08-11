@@ -365,6 +365,15 @@ int block_sparse_fa_select_halo_fallback_plan(block_sparse_fa_plan_t *plan, bool
     plan, fast_path, gqa_factor, head_dim, kv_len, available_bytes);
 }
 
+int block_sparse_fa_select_chunked_plan(block_sparse_fa_plan_t *plan, int gqa_factor, int head_dim,
+                                        int kv_len, size_t available_bytes) {
+  if (plan == NULL) {
+    return -1;
+  }
+  return block_sparse_fa_find_mode_plan(
+    plan, BLOCK_SPARSE_FA_CHUNKED, gqa_factor, head_dim, kv_len, available_bytes) ? 0 : -1;
+}
+
 int block_sparse_halo_parse_row(block_sparse_halo_row_t *parsed, const int32_t *row, int max_kept_blocks,
                                 int q_block, int q_blocks_per_head, int k_blocks_per_head, int image_blocks) {
   if (parsed == NULL || row == NULL || max_kept_blocks <= 0 || q_block < 0 || q_blocks_per_head <= 0 ||
@@ -1715,7 +1724,7 @@ int block_sparse_halo_dma_preflight(const void *k_base, const void *v_base, cons
 int block_sparse_halo_select_execution(block_sparse_halo_plan_t *plan, int halo_kv_load_mode,
                                        bool geometry_valid, bool dma_preflight_valid, int userdma_scope, int head_dim,
                                        int text_tokens, int image_block_cols, size_t available_bytes) {
-  if (plan == NULL || halo_kv_load_mode < 0 || halo_kv_load_mode > 2) {
+  if (plan == NULL || halo_kv_load_mode < 0 || halo_kv_load_mode > 3) {
     return -1;
   }
   memset(plan, 0, sizeof(*plan));
@@ -1731,6 +1740,9 @@ int block_sparse_halo_select_execution(block_sparse_halo_plan_t *plan, int halo_
     // packed image-row ring.
     return block_sparse_halo_select_plan(plan, 1, head_dim, text_tokens, image_block_cols, available_bytes) == 0 ?
       BLOCK_SPARSE_HALO_EXEC_L2_PREFETCH : BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
+  }
+  if (halo_kv_load_mode == 3) {
+    return BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
   }
   if (!dma_preflight_valid || userdma_scope != BLOCK_SPARSE_HALO_USERDMA_PER_WORKER) {
     return BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK;
@@ -8041,8 +8053,8 @@ static void block_sparse_flash_attn_worker(void *data, int worker_index) {
       plan.blk_sz_c = s->halo_plan.blk_sz_c;
       plan.required_bytes = s->halo_plan.required_bytes;
     } else if (halo_force_chunked) {
-      plan_result = block_sparse_fa_select_halo_fallback_plan(
-        &plan, fast_path, G, s->head_dim, s->kv_len, s->vtcm_size_per_thread);
+      plan_result = block_sparse_fa_select_chunked_plan(
+        &plan, G, s->head_dim, s->kv_len, s->vtcm_size_per_thread);
     } else {
       plan_result = block_sparse_fa_select_plan(
         &plan, fast_path, G, s->head_dim, s->kv_len, s->vtcm_size_per_thread);
@@ -8159,7 +8171,8 @@ static int block_sparse_flash_attn_impl(
   if (input_packed &&
       (qo_len != kv_len || !htp_packed_shape_supported(n_heads, n_kv_heads, head_dim, 1) ||
        block_q != HMX_FP16_TILE_N_ROWS || block_k != HMX_FP16_TILE_N_COLS ||
-       !((mask_format == 1 && sparse_policy == 1 && (halo_kv_load_mode == 1 || halo_kv_load_mode == 2)) ||
+       !((mask_format == 1 && sparse_policy == 1 &&
+          (halo_kv_load_mode == 1 || halo_kv_load_mode == 2 || halo_kv_load_mode == 3)) ||
          (mask_format == 0 && sparse_policy == 0 && halo_kv_load_mode == 0)))) {
     return -1;
   }
@@ -8214,7 +8227,7 @@ static int block_sparse_flash_attn_impl(
   }
   if (halo_force_chunked) {
     FARF(ALWAYS,
-         "block_sparse_fa halo loader fallback=FULL_KV_OR_FULL_K_OR_CHUNKED policy=%d loader=%d "
+         "block_sparse_fa halo loader fallback=CHUNKED policy=%d loader=%d "
          "geometry=%d dma_preflight=%d "
          "userdma_scope=%d available=%u",
          sparse_policy, halo_kv_load_mode, halo_geometry_valid ? 1 : 0, dma_preflight_valid ? 1 : 0, userdma_scope,

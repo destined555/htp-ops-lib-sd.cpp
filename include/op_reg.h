@@ -12,11 +12,12 @@ enum HtpHaloKvLoadMode {
   HTP_HALO_KV_LOAD_BASELINE    = 0,
   HTP_HALO_KV_LOAD_L2_PREFETCH = 1,
   HTP_HALO_KV_LOAD_USERDMA_AB  = 2,
+  HTP_HALO_KV_LOAD_CHUNKED     = 3,
 };
 
 // Keep packed shape admission identical on the HLOS and DSP sides.
 static inline int htp_packed_head_count_supported(int n_heads) {
-  return n_heads == 24 || n_heads == 30;
+  return n_heads == 24 || n_heads == 30 || n_heads == 38;
 }
 
 static inline int htp_packed_head_dim_supported(int head_dim) {
@@ -28,6 +29,7 @@ static inline int htp_packed_shape_supported(int n_heads, int n_kv_heads,
   return n_heads > 0 && n_kv_heads > 0 && n_heads % n_kv_heads == 0 &&
          htp_packed_head_count_supported(n_heads) &&
          htp_packed_head_dim_supported(head_dim) &&
+         (n_heads != 38 || head_dim == 64) &&
          (!require_equal_kv || (n_heads == n_kv_heads &&
                                 htp_packed_head_count_supported(n_kv_heads)));
 }
@@ -227,6 +229,7 @@ struct BlockSparseAttnParams {
 } __attribute__((packed));
 
 enum HtpHaloExecTraceMode {
+  HTP_HALO_EXEC_TRACE_L2_PREFETCH = 1,
   HTP_HALO_EXEC_TRACE_USERDMA_ROWS = 2,
   HTP_HALO_EXEC_TRACE_CHUNKED_FALLBACK = 3,
 };

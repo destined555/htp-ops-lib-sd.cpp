@@ -593,7 +593,8 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
           const bool packed_static_halo =
             mask_format == 1 && params->sparse_policy == HTP_SPARSE_POLICY_STATIC_HALO &&
             (params->halo_kv_load_mode == HTP_HALO_KV_LOAD_L2_PREFETCH ||
-             params->halo_kv_load_mode == HTP_HALO_KV_LOAD_USERDMA_AB);
+             params->halo_kv_load_mode == HTP_HALO_KV_LOAD_USERDMA_AB ||
+             params->halo_kv_load_mode == HTP_HALO_KV_LOAD_CHUNKED);
           const bool packed_full_keep =
             mask_format == 0 && params->sparse_policy == HTP_SPARSE_POLICY_NONE &&
             params->halo_kv_load_mode == HTP_HALO_KV_LOAD_BASELINE;
