@@ -54,6 +54,24 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
                       const __fp16 *restrict mask, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim,
                       bool with_lse);
 
+struct FusedAnchorAttnParams;
+
+typedef struct {
+  size_t blk_sz_r;
+  size_t blk_sz_c;
+  size_t required_bytes;
+} fused_anchor_fa_plan_t;
+
+size_t fused_anchor_fa_compute_vtcm_usage(int head_dim, int n_rows, int n_cols);
+int fused_anchor_fa_find_chunk_size(fused_anchor_fa_plan_t *plan, int head_dim,
+                                    int qo_len, int kv_len, size_t available_bytes);
+int fused_anchor_block_keep(const int32_t *block_mask, const struct FusedAnchorAttnParams *params,
+                            int head, int query_index, int key_block_index);
+int fused_anchor_flash_attn(float *restrict output, const float *restrict q,
+                            const __fp16 *restrict k, const __fp16 *restrict v,
+                            const __fp16 *restrict dense_mask, const int32_t *restrict block_mask,
+                            const struct FusedAnchorAttnParams *params);
+
 enum block_sparse_fa_mode {
   BLOCK_SPARSE_FA_FULL_KV,
   BLOCK_SPARSE_FA_FULL_K,

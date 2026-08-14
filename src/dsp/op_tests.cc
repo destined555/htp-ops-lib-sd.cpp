@@ -73,6 +73,8 @@ static_assert(kBlockSparseAttnHaloV1PayloadSize == 136);
 static_assert(HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16 ==
               HTP_OPS_QKV_MUL_RMS_PACKED_W16A32 + 1);
 static_assert(sizeof(QkvMulRmsPackedDualParams) == 128);
+static_assert(sizeof(FusedAnchorAttnParams) == 116);
+static_assert(offsetof(FusedAnchorAttnParams, elapsed_us) == 112);
 
 void test_qkv_mul_rms_packed_dual_contracts() {
   QkvMulRmsPackedDualParams params = {};
@@ -344,6 +346,211 @@ void test_block_sparse_attn_buffer_size_contracts() {
   FARF(ALWAYS, "block_sparse_attn_buffer_size_contracts: PASS");
 }
 
+static FusedAnchorAttnParams make_fused_anchor_params(int head_dim) {
+  FusedAnchorAttnParams params = {};
+  params.qo_len = 320;
+  params.kv_len = 320;
+  params.n_heads = 24;
+  params.n_kv_heads = 24;
+  params.head_dim = head_dim;
+  params.block_q = 32;
+  params.block_k = 32;
+  params.n_q_blocks = 24 * 10;
+  params.n_k_blocks = 24 * 10;
+  params.max_kept_blocks = 10;
+  params.mask_format = 1;
+  params.sparse_policy = HTP_SPARSE_POLICY_STATIC_HALO;
+  params.image_tokens = 256;
+  params.text_tokens = 64;
+  params.image_block_rows = 2;
+  params.image_block_cols = 4;
+  params.elapsed_us = INT32_MIN;
+  return params;
+}
+
+static FusedAnchorAttnParams make_fused_anchor_shape_params(
+    int n_heads, int head_dim) {
+  FusedAnchorAttnParams params = make_fused_anchor_params(head_dim);
+  params.n_heads = n_heads;
+  params.n_kv_heads = n_heads;
+  params.n_q_blocks = n_heads * 10;
+  params.n_k_blocks = n_heads * 10;
+  return params;
+}
+
+void test_fused_anchor_buffer_size_contracts() {
+  FusedAnchorAttnParams params = make_fused_anchor_params(64);
+  FusedAnchorAttnBufferSizes sizes = {};
+
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) == 0);
+  OP_TEST_ASSERT(sizes.q == size_t(320) * 24u * 64u * sizeof(float));
+  OP_TEST_ASSERT(sizes.kv == size_t(320) * 24u * 64u * sizeof(__fp16));
+  OP_TEST_ASSERT(sizes.dense_mask == size_t(320) * 320u * sizeof(__fp16));
+  OP_TEST_ASSERT(sizes.block_mask == size_t(24 * 10 * 10) * sizeof(int32_t));
+  OP_TEST_ASSERT(sizes.slab == size_t(320) * 24u * 65u * sizeof(float));
+  OP_TEST_ASSERT(sizes.output == 2u * sizes.slab);
+
+  params = make_fused_anchor_params(128);
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) == 0);
+  OP_TEST_ASSERT(sizes.slab == size_t(320) * 24u * 129u * sizeof(float));
+
+  params = make_fused_anchor_shape_params(38, 64);
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) == 0);
+  OP_TEST_ASSERT(sizes.q == size_t(320) * 38u * 64u * sizeof(float));
+  OP_TEST_ASSERT(sizes.kv == size_t(320) * 38u * 64u * sizeof(__fp16));
+  OP_TEST_ASSERT(sizes.block_mask == size_t(38 * 10 * 10) * sizeof(int32_t));
+  OP_TEST_ASSERT(sizes.slab == size_t(320) * 38u * 65u * sizeof(float));
+
+  params = make_fused_anchor_shape_params(30, 128);
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) == 0);
+  OP_TEST_ASSERT(sizes.q == size_t(320) * 30u * 128u * sizeof(float));
+  OP_TEST_ASSERT(sizes.kv == size_t(320) * 30u * 128u * sizeof(__fp16));
+  OP_TEST_ASSERT(sizes.block_mask == size_t(30 * 10 * 10) * sizeof(int32_t));
+  OP_TEST_ASSERT(sizes.slab == size_t(320) * 30u * 129u * sizeof(float));
+
+  params.n_kv_heads = 12;
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) != 0);
+  params = make_fused_anchor_params(96);
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) != 0);
+  params = make_fused_anchor_params(64);
+  params.block_q = 16;
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) != 0);
+  params = make_fused_anchor_params(64);
+  params.n_q_blocks--;
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) != 0);
+  params = make_fused_anchor_params(64);
+  params.n_k_blocks--;
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) != 0);
+  params = make_fused_anchor_params(64);
+  params.max_kept_blocks = 11;
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) != 0);
+  params = make_fused_anchor_params(64);
+  params.qo_len = INT_MAX;
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) != 0);
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(nullptr, &sizes) != 0);
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, nullptr) != 0);
+
+  FARF(ALWAYS, "fused_anchor_buffer_size_contracts: PASS");
+}
+
+template <size_t PayloadSize>
+struct alignas(8) FusedAnchorExecutorTestRequest {
+  uint8_t compute_request[sizeof(OpComputeRequest) + PayloadSize];
+  uint8_t canary[64];
+};
+
+template <size_t PayloadSize>
+static FusedAnchorExecutorTestRequest<PayloadSize> make_fused_anchor_executor_request() {
+  FusedAnchorExecutorTestRequest<PayloadSize> storage;
+  memset(&storage, 0xa5, sizeof(storage));
+  const uint32_t op = HTP_OPS_FUSED_ANCHOR_ATTN_QO_F32_KV_F16;
+  memcpy(storage.compute_request, &op, sizeof(op));
+  const FusedAnchorAttnParams params = make_fused_anchor_params(64);
+  const size_t copied = PayloadSize < sizeof(params) ? PayloadSize : sizeof(params);
+  memcpy(storage.compute_request + sizeof(OpComputeRequest), &params, copied);
+  return storage;
+}
+
+void test_fused_anchor_payload_boundaries() {
+  {
+    auto request = make_fused_anchor_executor_request<sizeof(FusedAnchorAttnParams) - 1>();
+    auto before = request;
+    OP_TEST_ASSERT(execute_op_simple((OpComputeRequest *) request.compute_request,
+                                     sizeof(request.compute_request)) != 0);
+    OP_TEST_ASSERT(memcmp(&request, &before, sizeof(request)) == 0);
+  }
+
+  {
+    auto request = make_fused_anchor_executor_request<sizeof(FusedAnchorAttnParams)>();
+    uint8_t canary_before[sizeof(request.canary)];
+    memcpy(canary_before, request.canary, sizeof(canary_before));
+    OP_TEST_ASSERT(execute_op_simple((OpComputeRequest *) request.compute_request,
+                                     sizeof(request.compute_request)) != 0);
+    const auto *params = (const FusedAnchorAttnParams *)
+      (request.compute_request + sizeof(OpComputeRequest));
+    OP_TEST_ASSERT(params->elapsed_us != INT32_MIN);
+    OP_TEST_ASSERT(memcmp(request.canary, canary_before, sizeof(canary_before)) == 0);
+  }
+
+  {
+    constexpr size_t kFuturePayloadSize = sizeof(FusedAnchorAttnParams) + 16;
+    auto request = make_fused_anchor_executor_request<kFuturePayloadSize>();
+    auto before = request;
+    OP_TEST_ASSERT(execute_op_simple((OpComputeRequest *) request.compute_request,
+                                     sizeof(request.compute_request)) != 0);
+    const size_t future_tail_offset = sizeof(OpComputeRequest) + sizeof(FusedAnchorAttnParams);
+    OP_TEST_ASSERT(memcmp(request.compute_request + future_tail_offset,
+                          before.compute_request + future_tail_offset,
+                          kFuturePayloadSize - sizeof(FusedAnchorAttnParams)) == 0);
+    OP_TEST_ASSERT(memcmp(request.canary, before.canary, sizeof(request.canary)) == 0);
+  }
+
+  FARF(ALWAYS, "fused_anchor_payload_boundaries: PASS");
+}
+
+void test_fused_anchor_output_slab_boundaries() {
+  FusedAnchorAttnParams params = {};
+  params.qo_len = 32;
+  params.kv_len = 32;
+  params.n_heads = 1;
+  params.n_kv_heads = 1;
+  params.head_dim = 64;
+  params.block_q = 32;
+  params.block_k = 32;
+  params.n_q_blocks = 1;
+  params.n_k_blocks = 1;
+  params.max_kept_blocks = 1;
+  params.mask_format = 1;
+  params.sparse_policy = HTP_SPARSE_POLICY_STATIC_HALO;
+  params.image_tokens = 32;
+  params.text_tokens = 0;
+  params.image_block_rows = 1;
+  params.image_block_cols = 1;
+
+  FusedAnchorAttnBufferSizes sizes = {};
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) == 0);
+  constexpr size_t canary_size = 128;
+  auto *output_storage = static_cast<uint8_t *>(malloc(canary_size + sizes.output + canary_size));
+  auto *q = static_cast<float *>(calloc(1, sizes.q));
+  auto *k = static_cast<__fp16 *>(calloc(1, sizes.kv));
+  auto *v = static_cast<__fp16 *>(calloc(1, sizes.kv));
+  auto *dense_mask = static_cast<__fp16 *>(calloc(1, sizes.dense_mask));
+  auto *block_mask = static_cast<int32_t *>(malloc(sizes.block_mask));
+  OP_TEST_ASSERT(output_storage != nullptr && q != nullptr && k != nullptr && v != nullptr &&
+                 dense_mask != nullptr && block_mask != nullptr);
+
+  memset(output_storage, 0x5a, canary_size + sizes.output + canary_size);
+  block_mask[0] = 0;
+  float *output = reinterpret_cast<float *>(output_storage + canary_size);
+  OP_TEST_ASSERT(fused_anchor_flash_attn(output, q, k, v, dense_mask, block_mask, &params) == 0);
+
+  for (size_t i = 0; i < canary_size; ++i) {
+    OP_TEST_ASSERT(output_storage[i] == 0x5a);
+    OP_TEST_ASSERT(output_storage[canary_size + sizes.output + i] == 0x5a);
+  }
+  const size_t row_width = static_cast<size_t>(params.head_dim + 1);
+  const size_t slab_elements = sizes.slab / sizeof(float);
+  for (int branch = 0; branch < 2; ++branch) {
+    const float *slab = output + static_cast<size_t>(branch) * slab_elements;
+    for (int row = 0; row < params.qo_len; ++row) {
+      const float *row_output = slab + static_cast<size_t>(row) * row_width;
+      for (int d = 0; d < params.head_dim; ++d) {
+        OP_TEST_ASSERT(std::isfinite(row_output[d]));
+        OP_TEST_ASSERT(fabsf(row_output[d]) <= 1e-6f);
+      }
+      OP_TEST_ASSERT(std::isfinite(row_output[params.head_dim]));
+    }
+  }
+
+  free(block_mask);
+  free(dense_mask);
+  free(v);
+  free(k);
+  free(q);
+  free(output_storage);
+  FARF(ALWAYS, "fused_anchor_output_slab_boundaries: PASS");
+}
+
 void test_message_header_layout_validation() {
   alignas(8) uint8_t storage[128] = {};
   auto *message = (MessageHeader *) storage;
@@ -452,6 +659,106 @@ void test_block_sparse_fa_select_plan() {
                                              std::numeric_limits<size_t>::max()) == -1);
 
   FARF(ALWAYS, "block_sparse_fa_select_plan: PASS");
+}
+
+void test_fused_anchor_fa_planner() {
+  OP_TEST_ASSERT(fused_anchor_fa_compute_vtcm_usage(64, 32, 64) == 47872);
+  OP_TEST_ASSERT(fused_anchor_fa_compute_vtcm_usage(128, 32, 64) == 80640);
+
+  fused_anchor_fa_plan_t plan = {};
+  const size_t minimum = fused_anchor_fa_compute_vtcm_usage(64, 32, 64);
+  OP_TEST_ASSERT(fused_anchor_fa_find_chunk_size(&plan, 64, 320, 320, minimum) == 0);
+  OP_TEST_ASSERT(plan.blk_sz_r == 32);
+  OP_TEST_ASSERT(plan.blk_sz_c == 64);
+  OP_TEST_ASSERT(plan.required_bytes == minimum);
+  OP_TEST_ASSERT(fused_anchor_fa_find_chunk_size(&plan, 64, 320, 320, minimum - 1) != 0);
+
+  OP_TEST_ASSERT(fused_anchor_fa_find_chunk_size(&plan, 64, 320, 320, 1024u * 1024u) == 0);
+  OP_TEST_ASSERT(plan.blk_sz_r >= 32 && plan.blk_sz_r % 32 == 0);
+  OP_TEST_ASSERT(plan.blk_sz_c >= 64 && plan.blk_sz_c % 64 == 0);
+  OP_TEST_ASSERT(plan.required_bytes <= 1024u * 1024u);
+
+  OP_TEST_ASSERT(fused_anchor_fa_find_chunk_size(&plan, 128, 320, 320, 1024u * 1024u) == 0);
+  OP_TEST_ASSERT(plan.blk_sz_r >= 32 && plan.blk_sz_c >= 64);
+  OP_TEST_ASSERT(plan.required_bytes <= 1024u * 1024u);
+  OP_TEST_ASSERT(fused_anchor_fa_find_chunk_size(nullptr, 64, 320, 320, 1024u * 1024u) != 0);
+  OP_TEST_ASSERT(fused_anchor_fa_find_chunk_size(&plan, 96, 320, 320, 1024u * 1024u) != 0);
+
+  FARF(ALWAYS, "fused_anchor_fa_planner: PASS");
+}
+
+static FusedAnchorAttnParams make_small_fused_anchor_params() {
+  FusedAnchorAttnParams params = {};
+  params.qo_len = 70;
+  params.kv_len = 70;
+  params.n_heads = 1;
+  params.n_kv_heads = 1;
+  params.head_dim = 64;
+  params.block_q = 32;
+  params.block_k = 32;
+  params.n_q_blocks = 3;
+  params.n_k_blocks = 3;
+  params.max_kept_blocks = 3;
+  params.mask_format = 1;
+  params.sparse_policy = HTP_SPARSE_POLICY_STATIC_HALO;
+  params.image_tokens = 64;
+  params.text_tokens = 6;
+  params.image_block_rows = 1;
+  params.image_block_cols = 2;
+  return params;
+}
+
+void test_fused_anchor_block_keep() {
+  const FusedAnchorAttnParams params = make_small_fused_anchor_params();
+  int32_t rows[9] = {
+    0, 2, -1,
+    1, -1, -1,
+    0, 1, 2,
+  };
+
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 0, 0) == 1);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 0, 1) == 0);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 0, 2) == 1);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 31, 2) == 1);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 32, 1) == 1);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 63, 0) == 0);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 64, 1) == 1);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 69, 2) == 1);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 70, 0) == -1);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 1, 0, 0) == -1);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 0, 3) == -1);
+
+  int32_t duplicate_rows[9];
+  memcpy(duplicate_rows, rows, sizeof(rows));
+  duplicate_rows[1] = 0;
+  OP_TEST_ASSERT(fused_anchor_block_keep(duplicate_rows, &params, 0, 0, 0) == -1);
+
+  int32_t out_of_range_rows[9];
+  memcpy(out_of_range_rows, rows, sizeof(rows));
+  out_of_range_rows[0] = 3;
+  OP_TEST_ASSERT(fused_anchor_block_keep(out_of_range_rows, &params, 0, 0, 0) == -1);
+
+  int32_t unsorted_rows[9];
+  memcpy(unsorted_rows, rows, sizeof(rows));
+  unsorted_rows[0] = 2;
+  unsorted_rows[1] = 0;
+  OP_TEST_ASSERT(fused_anchor_block_keep(unsorted_rows, &params, 0, 0, 0) == -1);
+
+  int32_t data_after_sentinel[9];
+  memcpy(data_after_sentinel, rows, sizeof(rows));
+  data_after_sentinel[1] = -1;
+  data_after_sentinel[2] = 2;
+  OP_TEST_ASSERT(fused_anchor_block_keep(data_after_sentinel, &params, 0, 0, 0) == -1);
+  OP_TEST_ASSERT(fused_anchor_block_keep(nullptr, &params, 0, 0, 0) == -1);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, nullptr, 0, 0, 0) == -1);
+
+  FARF(ALWAYS, "fused_anchor_block_keep: PASS");
+}
+
+void test_fused_anchor_entry_contract() {
+  auto *entry = &fused_anchor_flash_attn;
+  OP_TEST_ASSERT(entry != nullptr);
+  FARF(ALWAYS, "fused_anchor_entry_contract: PASS");
 }
 
 static void fill_static_halo_rows(int32_t *rows, int grid_h, int grid_w, int text_blocks) {
@@ -2002,6 +2309,9 @@ void internal_op_tests() {
   test_qkv_mul_rms_packed_dual_contracts();
   test_block_sparse_30_head_contracts();
   test_block_sparse_fa_select_plan();
+  test_fused_anchor_fa_planner();
+  test_fused_anchor_block_keep();
+  test_fused_anchor_entry_contract();
   test_block_sparse_halo_contracts();
   test_block_sparse_halo_image_only_contracts();
   test_block_sparse_halo_row_ring_contracts();
@@ -2015,6 +2325,9 @@ void internal_op_tests() {
   test_block_sparse_halo_userdma_scope();
   test_block_sparse_attn_buffer_size_contracts();
   test_op_executor_sparse_payload_boundaries();
+  test_fused_anchor_buffer_size_contracts();
+  test_fused_anchor_payload_boundaries();
+  test_fused_anchor_output_slab_boundaries();
   test_message_header_layout_validation();
   test_fp32_vector_log();
 

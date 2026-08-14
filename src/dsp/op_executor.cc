@@ -127,6 +127,83 @@ int block_sparse_attn_buffer_sizes(const struct BlockSparseAttnParams *params,
   return 0;
 }
 
+int fused_anchor_attn_buffer_sizes(const struct FusedAnchorAttnParams *params,
+                                   struct FusedAnchorAttnBufferSizes *sizes) {
+  if (params == nullptr || sizes == nullptr || params->qo_len <= 0 || params->kv_len <= 0 ||
+      params->qo_len != params->kv_len || params->n_heads <= 0 ||
+      params->n_heads != params->n_kv_heads ||
+      (params->head_dim != 64 && params->head_dim != 128) ||
+      params->block_q != 32 || params->block_k != 32 ||
+      params->mask_format != 1 || params->sparse_policy != HTP_SPARSE_POLICY_STATIC_HALO ||
+      params->max_kept_blocks <= 0 || params->image_tokens <= 0 || params->text_tokens < 0 ||
+      params->image_tokens % params->block_q != 0 ||
+      params->image_tokens > params->qo_len || params->text_tokens != params->qo_len - params->image_tokens ||
+      params->image_block_rows <= 0 || params->image_block_cols <= 0) {
+    return -1;
+  }
+
+  const int q_blocks_per_head = params->qo_len / params->block_q +
+                                (params->qo_len % params->block_q != 0);
+  const int k_blocks_per_head = params->kv_len / params->block_k +
+                                (params->kv_len % params->block_k != 0);
+  if (q_blocks_per_head <= 0 || k_blocks_per_head <= 0 ||
+      params->n_heads > INT_MAX / q_blocks_per_head ||
+      params->n_kv_heads > INT_MAX / k_blocks_per_head ||
+      params->n_q_blocks != params->n_heads * q_blocks_per_head ||
+      params->n_k_blocks != params->n_kv_heads * k_blocks_per_head ||
+      params->max_kept_blocks != k_blocks_per_head ||
+      params->image_block_rows > INT_MAX / params->image_block_cols ||
+      params->image_block_rows * params->image_block_cols != params->image_tokens / params->block_q) {
+    return -1;
+  }
+
+  size_t row_count = 0;
+  size_t row_width = 0;
+  size_t slab_elements = 0;
+  size_t slab_size = 0;
+  size_t output_size = 0;
+  size_t q_elements = 0;
+  size_t q_size = 0;
+  size_t kv_elements = 0;
+  size_t kv_size = 0;
+  size_t dense_mask_stride = 0;
+  size_t dense_mask_elements = 0;
+  size_t dense_mask_size = 0;
+  size_t block_mask_elements = 0;
+  size_t block_mask_size = 0;
+  if (!checked_size_mul((size_t) params->qo_len, (size_t) params->n_heads, &row_count) ||
+      !checked_size_add((size_t) params->head_dim, 1u, &row_width) ||
+      !checked_size_mul(row_count, row_width, &slab_elements) ||
+      !checked_size_mul(slab_elements, sizeof(float), &slab_size) ||
+      !checked_size_mul(slab_size, 2u, &output_size) ||
+      !checked_size_mul(row_count, (size_t) params->head_dim, &q_elements) ||
+      !checked_size_mul(q_elements, sizeof(float), &q_size) ||
+      !checked_size_mul((size_t) params->kv_len, (size_t) params->n_kv_heads, &kv_elements) ||
+      !checked_size_mul(kv_elements, (size_t) params->head_dim, &kv_elements) ||
+      !checked_size_mul(kv_elements, sizeof(__fp16), &kv_size) ||
+      !checked_size_add((size_t) params->kv_len, 63u, &dense_mask_stride)) {
+    return -1;
+  }
+  dense_mask_stride &= ~(size_t) 63u;
+  if (!checked_size_mul((size_t) params->qo_len, dense_mask_stride, &dense_mask_elements) ||
+      !checked_size_mul(dense_mask_elements, sizeof(__fp16), &dense_mask_size) ||
+      !checked_size_mul((size_t) params->n_q_blocks, (size_t) params->max_kept_blocks,
+                        &block_mask_elements) ||
+      !checked_size_mul(block_mask_elements, sizeof(int32_t), &block_mask_size)) {
+    return -1;
+  }
+
+  *sizes = {
+    .output = output_size,
+    .slab = slab_size,
+    .q = q_size,
+    .kv = kv_size,
+    .dense_mask = dense_mask_size,
+    .block_mask = block_mask_size,
+  };
+  return 0;
+}
+
 int qkv_mul_rms_packed_dual_buffer_sizes(const struct QkvMulRmsPackedDualParams *params,
                                          struct QkvMulRmsPackedBufferSizes *sizes) {
   if (params == nullptr || sizes == nullptr || params->image_tokens <= 0 || params->text_tokens < 0 ||
@@ -555,6 +632,38 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
           FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=simple elapsed_us=%lld", elapsed_us);
           validate_out_bufs();
         }
+      }
+      break;
+
+    case HTP_OPS_FUSED_ANCHOR_ATTN_QO_F32_KV_F16:
+      {
+        if (payload_size < sizeof(FusedAnchorAttnParams)) {
+          return -1;
+        }
+        auto *params = reinterpret_cast<FusedAnchorAttnParams *>(req->payload);
+        params->elapsed_us = 0;
+
+        FusedAnchorAttnBufferSizes buffer_sizes = {};
+        if (fused_anchor_attn_buffer_sizes(params, &buffer_sizes) != 0) {
+          return -1;
+        }
+        add_buffer(out_bufs, params->output, buffer_sizes.output);
+        add_buffer(in_bufs, params->q, buffer_sizes.q);
+        add_buffer(in_bufs, params->k, buffer_sizes.kv);
+        add_buffer(in_bufs, params->v, buffer_sizes.kv);
+        add_buffer(in_bufs, params->dense_mask, buffer_sizes.dense_mask);
+        add_buffer(in_bufs, params->block_mask, buffer_sizes.block_mask);
+
+        validate_in_bufs();
+        const int64_t t0 = HAP_perf_get_qtimer_count();
+        ret = fused_anchor_flash_attn(
+          (float *) OUT_PTR(0), (const float *) IN_PTR(0), (const __fp16 *) IN_PTR(1),
+          (const __fp16 *) IN_PTR(2), (const __fp16 *) IN_PTR(3),
+          (const int32_t *) IN_PTR(4), params);
+        const int64_t elapsed_us = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
+        params->elapsed_us = (int32_t) elapsed_us;
+        FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=fused_anchor elapsed_us=%lld", elapsed_us);
+        validate_out_bufs();
       }
       break;
 
