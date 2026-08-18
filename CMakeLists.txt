@@ -3,6 +3,7 @@ project(htp_ops C CXX ASM)
 # cmake_policy(SET CMP0115 OLD)
 
 option(HTP_OPS_QUIET_BENCH "Disable DSP FARF logging for unbiased benchmarks" OFF)
+option(HTP_FUSED_ANCHOR_PROFILE "Emit trace-only fused anchor counters" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -83,6 +84,9 @@ else()
     )
     if(HTP_OPS_QUIET_BENCH)
         target_compile_definitions(htp_ops_skel PRIVATE HTP_OPS_QUIET_BENCH)
+    endif()
+    if(HTP_FUSED_ANCHOR_PROFILE)
+        target_compile_definitions(htp_ops_skel PRIVATE HTP_FUSED_ANCHOR_PROFILE)
     endif()
     build_idl(include/htp_ops.idl htp_ops_skel)
 

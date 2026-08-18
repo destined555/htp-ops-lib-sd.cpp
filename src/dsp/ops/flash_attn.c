@@ -212,6 +212,7 @@ static bool fused_anchor_fa_vtcm_usage(int head_dim, int n_rows, int n_cols, siz
   size_t col_vec_size = 0;
   size_t row_vec_size = 0;
   size_t keep_flags_size = 0;
+  size_t keep_tile_count = 0;
   size_t total = 0;
   if (!checked_size_align_up((size_t) n_rows, HMX_FP16_TILE_N_ROWS, &g_br) ||
       !checked_size_mul(g_br, (size_t) head_dim, &value) ||
@@ -230,7 +231,11 @@ static bool fused_anchor_fa_vtcm_usage(int head_dim, int n_rows, int n_cols, siz
       !checked_size_align_up(value, 256, &col_vec_size) ||
       !checked_size_mul((size_t) n_cols, sizeof(__fp16), &value) ||
       !checked_size_align_up(value, 256, &row_vec_size) ||
-      !checked_size_align_up(g_br, 256, &keep_flags_size)) {
+      !checked_size_add((size_t) n_cols, HMX_FP16_TILE_N_COLS - 1, &keep_tile_count)) {
+    return false;
+  }
+  keep_tile_count /= HMX_FP16_TILE_N_COLS;
+  if (!checked_size_align_up(keep_tile_count, 256, &keep_flags_size)) {
     return false;
   }
 
@@ -343,6 +348,76 @@ int fused_anchor_block_keep(const int32_t *block_mask, const struct FusedAnchorA
     found = found || entry == target;
   }
   return found ? 1 : 0;
+}
+
+int fused_anchor_plan_selected_segments(fused_anchor_keep_plan_t *plan, const uint8_t *keep_flags,
+                                        int tile_count, int first_tile, bool is_text_query) {
+  if (plan == NULL || keep_flags == NULL || tile_count < 0 || first_tile < 0) {
+    return -1;
+  }
+  memset(plan, 0, sizeof(*plan));
+  plan->first_tile = first_tile;
+  plan->tile_count = tile_count;
+  plan->is_text_query = is_text_query;
+  int tile = 0;
+  while (tile < tile_count) {
+    if (keep_flags[tile] == 0) {
+      ++plan->skipped_tiles;
+      ++tile;
+      continue;
+    }
+    if (keep_flags[tile] != 1) {
+      return -1;
+    }
+    const int start = tile;
+    while (tile < tile_count && keep_flags[tile] == 1) {
+      ++plan->selected_tiles;
+      ++tile;
+    }
+    if (plan->segment_count >= FUSED_ANCHOR_MAX_SELECTED_SEGMENTS) {
+      return -1;
+    }
+    plan->tile_offsets[plan->segment_count] = first_tile + start;
+    plan->tile_counts[plan->segment_count] = tile - start;
+    ++plan->segment_count;
+  }
+  return 0;
+}
+
+int fused_anchor_prepare_keep_plan(fused_anchor_keep_plan_t *plan, uint8_t *keep_flags,
+                                   int keep_flags_capacity, const block_sparse_halo_row_t *row,
+                                   int jc, int n_cols, int kv_len, int block_k) {
+  if (plan == NULL || keep_flags == NULL || row == NULL || keep_flags_capacity <= 0 ||
+      jc < 0 || n_cols <= 0 || kv_len <= 0 || jc >= kv_len || block_k != 32 ||
+      n_cols > kv_len - jc ||
+      row->k_blocks_per_head <= 0 || row->image_block_total <= 0 ||
+      row->image_block_total > row->k_blocks_per_head || row->first_k_block < 0 || row->image_count < 0 ||
+      row->image_count > BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS) {
+    return -1;
+  }
+  const int tile_count = (n_cols + block_k - 1) / block_k;
+  if (tile_count > keep_flags_capacity) {
+    return -1;
+  }
+  memset(keep_flags, 0, (size_t) tile_count);
+  const int image_block_limit = row->image_block_total;
+  for (int tile = 0; tile < tile_count; ++tile) {
+    const int local_block = (jc + tile * block_k) / block_k;
+    const int global_block = row->first_k_block + local_block;
+    bool keep = row->is_text_query || local_block >= image_block_limit;
+    if (!row->is_text_query && local_block < image_block_limit) {
+      keep = false;
+      for (int i = 0; i < row->image_count; ++i) {
+        if (row->image_blocks[i] == global_block) {
+          keep = true;
+          break;
+        }
+      }
+    }
+    keep_flags[tile] = keep ? 1 : 0;
+  }
+  return fused_anchor_plan_selected_segments(plan, keep_flags, tile_count, jc / block_k,
+                                             row->is_text_query);
 }
 
 int block_sparse_packed_qk_tile_offset(size_t *offset, int head, int token_tile, int dim_tile,
@@ -540,6 +615,9 @@ int block_sparse_halo_parse_row(block_sparse_halo_row_t *parsed, const int32_t *
   const int first_k_block = kv_head * k_blocks_per_head;
   const bool is_text_query = q_block_in_head >= image_blocks;
   result.is_text_query = is_text_query;
+  result.image_block_total = image_blocks;
+  result.first_k_block = first_k_block;
+  result.k_blocks_per_head = k_blocks_per_head;
 
   int entry_count = 0;
   while (entry_count < max_kept_blocks && row[entry_count] != -1) {
@@ -4524,6 +4602,8 @@ static int fused_anchor_build_probability(
   HVX_Vector *row_buffer0, HVX_Vector *row_buffer1,
   const __fp16 *dense_mask, size_t dense_mask_stride,
   const int32_t *block_mask, const struct FusedAnchorAttnParams *params,
+  const uint8_t *keep_flags, int keep_flag_count,
+  fused_anchor_fa_stats_t *stats,
   int head, int ir, int jc, int n_rows, int n_cols, int blk_sz_c, bool sparse) {
   const int n_row_vec_cnt = ceil_div(n_rows, 64);
   const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);
@@ -4574,13 +4654,37 @@ static int fused_anchor_build_probability(
           const int key_block0 = key / params->block_k;
           const int key_block1 = key_block0 + 1;
           const bool second_block_valid = key + HMX_FP16_TILE_N_COLS < params->kv_len;
-          const int keep00 = fused_anchor_block_keep(block_mask, params, head, query0, key_block0);
-          const int keep01 = second_block_valid ?
-            fused_anchor_block_keep(block_mask, params, head, query0, key_block1) : 0;
-          const int keep10 = row1_valid ?
-            fused_anchor_block_keep(block_mask, params, head, query1, key_block0) : 0;
-          const int keep11 = row1_valid && second_block_valid ?
-            fused_anchor_block_keep(block_mask, params, head, query1, key_block1) : 0;
+          int keep00;
+          int keep01;
+          int keep10;
+          int keep11;
+          if (keep_flags != NULL) {
+            const int flag0 = (key - jc) / params->block_k;
+            const int flag1 = flag0 + 1;
+            if (flag0 < 0 || flag0 >= keep_flag_count ||
+                (second_block_valid && (flag1 < 0 || flag1 >= keep_flag_count))) {
+              return -1;
+            }
+            keep00 = keep_flags[flag0];
+            keep01 = second_block_valid ? keep_flags[flag1] : 0;
+            keep10 = row1_valid ? keep00 : 0;
+            keep11 = row1_valid && second_block_valid ? keep01 : 0;
+          } else {
+            if (stats != NULL) {
+              const uint64_t scans = 1u + (uint64_t) second_block_valid +
+                                     (uint64_t) row1_valid +
+                                     (uint64_t) (row1_valid && second_block_valid);
+              stats->mask_row_scans += scans;
+              stats->mask_entry_scans += scans * (uint64_t) params->max_kept_blocks;
+            }
+            keep00 = fused_anchor_block_keep(block_mask, params, head, query0, key_block0);
+            keep01 = second_block_valid ?
+              fused_anchor_block_keep(block_mask, params, head, query0, key_block1) : 0;
+            keep10 = row1_valid ?
+              fused_anchor_block_keep(block_mask, params, head, query1, key_block0) : 0;
+            keep11 = row1_valid && second_block_valid ?
+              fused_anchor_block_keep(block_mask, params, head, query1, key_block1) : 0;
+          }
           if (keep00 < 0 || keep01 < 0 || keep10 < 0 || keep11 < 0) {
             return -1;
           }
@@ -4621,6 +4725,11 @@ static int fused_anchor_build_probability(
       HVX_Vector v_p_rowsum1 = v_zero;
 
       for (int c = 0; c < n_cols; c += 64) {
+        if (sparse && keep_flags != NULL && keep_flags[c / params->block_k] == 0 &&
+            (c / params->block_k + 1 >= keep_flag_count ||
+             keep_flags[c / params->block_k + 1] == 0)) {
+          continue;
+        }
         const HVX_Vector v_score0 = row_buffer0[c / 64];
         const HVX_Vector v_score1 = row_buffer1[c / 64];
         const HVX_VectorPred q_score_keep0 = Q6_Q_vcmp_gt_VhfVhf(v_score0, v_neg_inf);
@@ -4669,12 +4778,19 @@ static void fused_anchor_accumulate_probability(
   HVX_Vector *mvec_s_rowmax, const HVX_Vector *mvec_p_rowsum,
   int n_row_tiles, int n_row_vec_cnt, int n_col_tiles,
   int n_tiles_per_blk_r, int n_tiles_per_blk_c, int head_dim,
+  const fused_anchor_keep_plan_t *keep_plan,
   const uint8_t *hmx_output_scales_id, const int16_t *d_tile_vscatter_offsets) {
+  if (keep_plan != NULL && keep_plan->selected_tiles == 0) {
+    return;
+  }
   for (int i = 0; i < n_row_vec_cnt; ++i) {
     const HVX_Vector v_m_prev = mvec_m[i];
-    const HVX_Vector v_m_curr = Q6_Vhf_vmax_VhfVhf(v_m_prev, mvec_s_rowmax[i]);
+    const HVX_VectorPred q_has_work = Q6_Q_vcmp_gt_VhfVhf(mvec_p_rowsum[i], Q6_V_vzero());
+    const HVX_Vector v_m_candidate = Q6_Vhf_vmax_VhfVhf(v_m_prev, mvec_s_rowmax[i]);
+    const HVX_Vector v_m_curr = Q6_V_vmux_QVV(q_has_work, v_m_candidate, v_m_prev);
     const HVX_Vector v_m_diff = Q6_Vqf16_vsub_VhfVhf(v_m_prev, v_m_curr);
-    const HVX_Vector v_exp_m_diff = hvx_my_exp2_vhf_vqf16(v_m_diff);
+    HVX_Vector v_exp_m_diff = hvx_my_exp2_vhf_vqf16(v_m_diff);
+    v_exp_m_diff = Q6_V_vmux_QVV(q_has_work, v_exp_m_diff, Q6_Vh_vsplat_R(0x3c00));
     HVX_Vector v_l_curr = Q6_Vqf16_vmpy_Vqf16Vhf(mvec_l[i], v_exp_m_diff);
     v_l_curr = Q6_Vqf16_vadd_Vqf16Vhf(v_l_curr, mvec_p_rowsum[i]);
     mvec_m[i] = v_m_curr;
@@ -4701,10 +4817,22 @@ static void fused_anchor_accumulate_probability(
 
       const __fp16 *p_tile_in = p_tile + (r * n_tiles_per_blk_c) * HMX_FP16_TILE_N_ELMS;
       const __fp16 *v_tile_in = v_tile + (c * n_tiles_per_blk_c) * HMX_FP16_TILE_N_ELMS;
-      for (int k = 0; k < n_col_tiles; k += 32) {
-        const int offset = k * HMX_FP16_TILE_N_ELMS;
-        const int n_tiles = smin(n_col_tiles - k, 32);
-        hmx_load_tiles_fp16(p_tile_in + offset, v_tile_in + offset, n_tiles);
+      if (keep_plan == NULL) {
+        for (int k = 0; k < n_col_tiles; k += 32) {
+          const int offset = k * HMX_FP16_TILE_N_ELMS;
+          const int n_tiles = smin(n_col_tiles - k, 32);
+          hmx_load_tiles_fp16(p_tile_in + offset, v_tile_in + offset, n_tiles);
+        }
+      } else {
+        for (int s = 0; s < keep_plan->segment_count; ++s) {
+          const int local_tile = keep_plan->tile_offsets[s] - keep_plan->first_tile;
+          const int offset = local_tile * HMX_FP16_TILE_N_ELMS;
+          const int n_tiles = keep_plan->tile_counts[s];
+          if (local_tile < 0 || local_tile + n_tiles > n_col_tiles || n_tiles <= 0) {
+            continue;
+          }
+          hmx_load_tiles_fp16(p_tile_in + offset, v_tile_in + offset, n_tiles);
+        }
       }
 
       __fp16 *o_tile_out = o_tile_curr + (c * n_tiles_per_blk_r + r) * HMX_FP16_TILE_N_ELMS;
@@ -4724,8 +4852,15 @@ static void fused_anchor_normalize_and_store(
   const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
   HVX_Vector v_content;
   for (int i = 0; i < n_row_tiles; ++i) {
+    HVX_Vector v_l_content = Q6_Vhf_equals_Vqf16(mvec_l[i / 2]);
+    if ((i % 2) != 0) {
+      v_l_content = Q6_V_vror_VR(v_l_content, 64);
+    }
+    const HVX_VectorPred q_l_valid = Q6_Q_vcmp_gt_VhfVhf(v_l_content, Q6_V_vzero());
+    const HVX_Vector v_inv_l = Q6_V_vmux_QVV(
+      q_l_valid, hvx_my_inv_vhf(v_l_content), Q6_V_vzero());
     if ((i % 2) == 0) {
-      v_content = hvx_my_inv_vhf(Q6_Vhf_equals_Vqf16(mvec_l[i / 2]));
+      v_content = v_inv_l;
     } else {
       v_content = Q6_V_vror_VR(v_content, 64);
     }
@@ -4787,12 +4922,14 @@ typedef struct {
   const __fp16 *dense_mask;
   const int32_t *block_mask;
   const struct FusedAnchorAttnParams *params;
+  fused_anchor_fa_stats_t *stats;
 } fused_anchor_fa_task_state_t;
 
 static int fused_anchor_flash_attn_head(
   int head, uint8_t *vtcm, uint8_t *vtcm_limit, float *output, const float *q,
   const __fp16 *k, const __fp16 *v, const __fp16 *dense_mask,
-  const int32_t *block_mask, const struct FusedAnchorAttnParams *params) {
+  const int32_t *block_mask, const struct FusedAnchorAttnParams *params,
+  fused_anchor_fa_stats_t *stats) {
   fused_anchor_fa_plan_t plan;
   if (fused_anchor_fa_find_chunk_size(
         &plan, params->head_dim, params->qo_len, params->kv_len,
@@ -4811,7 +4948,7 @@ static int fused_anchor_flash_attn_head(
   const size_t d_tile_size = align_up((size_t) blk_sz_r * blk_sz_r * sizeof(__fp16), 4096);
   const size_t col_vec_size = align_up((size_t) blk_sz_r * sizeof(__fp16), 256);
   const size_t row_vec_size = align_up((size_t) blk_sz_c * sizeof(__fp16), 256);
-  const size_t keep_flags_size = align_up((size_t) blk_sz_r, 256);
+  const size_t keep_flags_size = align_up((size_t) ceil_div(blk_sz_c, HMX_FP16_TILE_N_COLS), 256);
 
   uint8_t *vtcm_cur = vtcm;
   __fp16 *q_tile = (__fp16 *) vtcm_seq_alloc(&vtcm_cur, qo_tile_size);
@@ -4863,6 +5000,27 @@ static int fused_anchor_flash_attn_head(
     const int n_rows = smin(params->qo_len - ir, blk_sz_r);
     const int n_row_tiles = ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
     const int n_row_vec_cnt = ceil_div(n_rows, 64);
+    if (stats != NULL) {
+      ++stats->q_blocks_decoded;
+    }
+
+    block_sparse_halo_row_t keep_row = {};
+    const int q_blocks_per_head = ceil_div(params->qo_len, params->block_q);
+    const int image_blocks = params->image_block_rows * params->image_block_cols;
+    const int q_block = head * q_blocks_per_head + ir / params->block_q;
+    const int32_t *row_data = block_mask + (size_t) q_block * (size_t) params->max_kept_blocks;
+    if (block_sparse_halo_parse_row(&keep_row, row_data, params->max_kept_blocks,
+                                    q_block, q_blocks_per_head,
+                                    ceil_div(params->kv_len, params->block_k), image_blocks) != 0) {
+      return -1;
+    }
+    if (stats != NULL) {
+      ++stats->mask_row_scans;
+      stats->mask_entry_scans += (uint64_t) params->max_kept_blocks;
+      if (keep_row.is_text_query) {
+        ++stats->text_full_keep_blocks;
+      }
+    }
 
     const size_t q_stride_bytes = q_stride * sizeof(float);
     const uint8_t *q_base = (const uint8_t *) q +
@@ -4899,6 +5057,17 @@ static int fused_anchor_flash_attn_head(
     for (int jc = 0; jc < params->kv_len; jc += blk_sz_c) {
       const int n_cols = smin(params->kv_len - jc, blk_sz_c);
       const int n_col_tiles = ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
+      if (stats != NULL) {
+        ++stats->k_chunks;
+        stats->qk_tiles += (uint64_t) n_row_tiles * (uint64_t) n_col_tiles;
+      }
+      fused_anchor_keep_plan_t keep_plan = {};
+      if (fused_anchor_prepare_keep_plan(&keep_plan, keep_flags,
+                                         (int) keep_flags_size, &keep_row,
+                                         jc, n_cols, params->kv_len, params->block_k) != 0) {
+        return -1;
+      }
+      const fused_anchor_keep_plan_t *sparse_keep_plan = &keep_plan;
 
       const __fp16 *k_base = k + (size_t) jc * kv_stride + (size_t) head * D;
       l2fetch(k_base, kv_stride * sizeof(__fp16), (size_t) D * sizeof(__fp16), n_cols, 1);
@@ -4941,7 +5110,7 @@ static int fused_anchor_flash_attn_head(
       if (fused_anchor_build_probability(
             s_tile, p_tile, dense_m, rowmax, rowsum, row_buffer0, row_buffer1,
             dense_mask, dense_mask_stride, block_mask, params,
-            head, ir, jc, n_rows, n_cols, blk_sz_c, false) != 0) {
+            NULL, 0, stats, head, ir, jc, n_rows, n_cols, blk_sz_c, false) != 0) {
         return -1;
       }
 
@@ -4970,22 +5139,47 @@ static int fused_anchor_flash_attn_head(
         dense_o_prev, o_scratch, p_tile, v_tile, d_tile,
         dense_m, dense_l, rowmax, rowsum, n_row_tiles, n_row_vec_cnt,
         n_col_tiles, n_tiles_per_blk_r, n_tiles_per_blk_c, D,
+        NULL,
         hmx_output_scales_id, d_tile_vscatter_offsets);
+      if (stats != NULL) {
+        stats->dense_pv_tiles += (uint64_t) n_row_tiles *
+                                 (uint64_t) (D / HMX_FP16_TILE_N_COLS) *
+                                 (uint64_t) n_col_tiles;
+      }
       __fp16 *old_dense = dense_o_prev;
       dense_o_prev = o_scratch;
       o_scratch = old_dense;
 
+      if (keep_row.is_text_query) {
+        sparse_o_prev = dense_o_prev;
+        hvx_copy(sparse_m, dense_m, col_vec_size);
+        hvx_copy(sparse_l, dense_l, col_vec_size);
+        continue;
+      }
+
       if (fused_anchor_build_probability(
             s_tile, p_tile, sparse_m, rowmax, rowsum, row_buffer0, row_buffer1,
             dense_mask, dense_mask_stride, block_mask, params,
-            head, ir, jc, n_rows, n_cols, blk_sz_c, true) != 0) {
+            keep_flags, keep_plan.tile_count,
+            stats, head, ir, jc, n_rows, n_cols, blk_sz_c, true) != 0) {
         return -1;
+      }
+
+      if (stats != NULL && sparse_keep_plan != NULL) {
+        stats->sparse_selected_tiles += (uint64_t) n_row_tiles *
+                                        (uint64_t) sparse_keep_plan->selected_tiles;
+        stats->sparse_skipped_tiles += (uint64_t) n_row_tiles *
+                                       (uint64_t) sparse_keep_plan->skipped_tiles;
+        if (sparse_keep_plan->selected_tiles == 0) {
+          ++stats->sparse_empty_chunks;
+        }
       }
 
       fused_anchor_accumulate_probability(
         sparse_o_prev, o_scratch, p_tile, v_tile, d_tile,
         sparse_m, sparse_l, rowmax, rowsum, n_row_tiles, n_row_vec_cnt,
         n_col_tiles, n_tiles_per_blk_r, n_tiles_per_blk_c, D,
+        sparse_keep_plan,
         hmx_output_scales_id, d_tile_vscatter_offsets);
       __fp16 *old_sparse = sparse_o_prev;
       sparse_o_prev = o_scratch;
@@ -5016,7 +5210,8 @@ static void fused_anchor_flash_attn_worker(void *data, int worker_index) {
     }
     if (fused_anchor_flash_attn_head(
           (int) task_id, vtcm, vtcm_limit, state->output, state->q, state->k, state->v,
-          state->dense_mask, state->block_mask, state->params) != 0) {
+          state->dense_mask, state->block_mask, state->params,
+          state->stats != NULL ? &state->stats[worker_index] : NULL) != 0) {
       worker_pool_atomic_inc_return(&state->error_count);
     }
   }
@@ -5026,7 +5221,8 @@ static void fused_anchor_flash_attn_worker(void *data, int worker_index) {
 
 int fused_anchor_flash_attn(float *restrict output, const float *restrict q,
                             const __fp16 *restrict k, const __fp16 *restrict v,
-                            const __fp16 *restrict dense_mask, const int32_t *restrict block_mask,
+                            const __fp16 *restrict dense_mask,
+                            const int32_t *restrict block_mask,
                             const struct FusedAnchorAttnParams *params) {
   if (output == NULL || q == NULL || k == NULL || v == NULL || dense_mask == NULL ||
       block_mask == NULL || params == NULL ||
@@ -5041,9 +5237,10 @@ int fused_anchor_flash_attn(float *restrict output, const float *restrict q,
 
   const int n_jobs = num_hvx128_contexts;
   const unsigned int vtcm_slice_count = num_workers;
+  fused_anchor_fa_stats_t worker_stats[64] = {};
   uint8_t *vtcm_base = (uint8_t *) vtcm_manager_get_vtcm_base();
   const size_t acquired_vtcm_size = vtcm_manager_get_vtcm_size();
-  if (n_jobs <= 0 || vtcm_slice_count == 0 || vtcm_base == NULL ||
+  if (n_jobs <= 0 || vtcm_slice_count == 0 || vtcm_slice_count > 64 || vtcm_base == NULL ||
       acquired_vtcm_size < (size_t) vtcm_slice_count * 1024u * 1024u) {
     return -1;
   }
@@ -5061,6 +5258,7 @@ int fused_anchor_flash_attn(float *restrict output, const float *restrict q,
     .dense_mask = dense_mask,
     .block_mask = block_mask,
     .params = params,
+    .stats = worker_stats,
   };
   worker_pool_job_t job = { .fptr = fused_anchor_flash_attn_worker, .dptr = &state };
   worker_pool_synctoken_init(&state.sync_ctx, n_jobs);
@@ -5068,6 +5266,30 @@ int fused_anchor_flash_attn(float *restrict output, const float *restrict q,
     worker_pool_submit(NULL, job);
   }
   worker_pool_synctoken_wait(&state.sync_ctx);
+  fused_anchor_fa_stats_t total_stats = {};
+  for (unsigned int worker = 0; worker < vtcm_slice_count; ++worker) {
+    const uint64_t *src = (const uint64_t *) &worker_stats[worker];
+    uint64_t *dst = (uint64_t *) &total_stats;
+    for (size_t i = 0; i < sizeof(total_stats) / sizeof(uint64_t); ++i) {
+      dst[i] += src[i];
+    }
+  }
+#ifdef HTP_FUSED_ANCHOR_PROFILE
+  FARF(ALWAYS,
+       "HTP_FUSED_ANCHOR_STATS q_blocks_decoded=%llu mask_row_scans=%llu mask_entry_scans=%llu "
+       "k_chunks=%llu qk_tiles=%llu dense_pv_tiles=%llu sparse_selected_tiles=%llu "
+       "sparse_skipped_tiles=%llu sparse_empty_chunks=%llu text_full_keep_blocks=%llu",
+       (unsigned long long) total_stats.q_blocks_decoded,
+       (unsigned long long) total_stats.mask_row_scans,
+       (unsigned long long) total_stats.mask_entry_scans,
+       (unsigned long long) total_stats.k_chunks,
+       (unsigned long long) total_stats.qk_tiles,
+       (unsigned long long) total_stats.dense_pv_tiles,
+       (unsigned long long) total_stats.sparse_selected_tiles,
+       (unsigned long long) total_stats.sparse_skipped_tiles,
+       (unsigned long long) total_stats.sparse_empty_chunks,
+       (unsigned long long) total_stats.text_full_keep_blocks);
+#endif
   return state.error_count == 0 ? 0 : -1;
 }
 
@@ -6109,7 +6331,7 @@ static int block_sparse_flash_attn_f16_core_halo_rows(int kv_head_idx, uint8_t *
     (vtcm + halo_plan->softmax_state_offset + col_vec_size);
   // 当前 halo 执行要求走 fused image-Q 路径，因此不再单独分配 m/l：
   // mvec_s_rowmax 和 mvec_p_rowsum 在融合更新中分别复用为 rowmax/rowsum；
-  // 下面的别名只保证被拒绝的 legacy non-fused 分支保持类型/布局完整。
+  // 下面的别名只保证被拒绝的 non-fused 分支保持类型/布局完整。
   HVX_Vector *mvec_m = mvec_s_rowmax;
   HVX_Vector *mvec_l = mvec_p_rowsum;
 

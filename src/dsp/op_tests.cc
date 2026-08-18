@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <limits>
+#include <vector>
 
 #include "dsp/hmx_mgr.h"
 #include "dsp/hvx_math.h"
@@ -755,6 +756,81 @@ void test_fused_anchor_block_keep() {
   FARF(ALWAYS, "fused_anchor_block_keep: PASS");
 }
 
+void test_fused_anchor_profile_counter_contracts() {
+  fused_anchor_fa_stats_t stats = {};
+  stats.q_blocks_decoded = 2;
+  stats.qk_tiles = 4;
+  stats.dense_pv_tiles = 4;
+  OP_TEST_ASSERT(stats.q_blocks_decoded != 0);
+  OP_TEST_ASSERT(stats.qk_tiles == stats.dense_pv_tiles);
+  OP_TEST_ASSERT(sizeof(FusedAnchorAttnParams) == 116);
+  OP_TEST_ASSERT(offsetof(FusedAnchorAttnParams, elapsed_us) == 112);
+  OP_TEST_ASSERT(sizeof(stats) >= 10 * sizeof(uint64_t));
+  FARF(ALWAYS, "fused_anchor_profile_counter_contracts: PASS");
+}
+
+void test_fused_anchor_keep_flags() {
+  FusedAnchorAttnParams params = make_small_fused_anchor_params();
+  params.qo_len = 576;
+  params.kv_len = 576;
+  params.n_q_blocks = 18;
+  params.n_k_blocks = 18;
+  params.max_kept_blocks = 18;
+  params.image_tokens = 512;
+  params.text_tokens = 64;
+  params.image_block_rows = 4;
+  params.image_block_cols = 4;
+  int32_t rows[18 * 18];
+  std::fill(rows, rows + 18 * 18, -1);
+  const int first_row[] = {0, 1, 4, 5, 16, 17};
+  std::copy(first_row, first_row + 6, rows);
+  for (int i = 0; i < 18; ++i) {
+    rows[17 * 18 + i] = i;
+  }
+  block_sparse_halo_row_t parsed = {};
+  OP_TEST_ASSERT(block_sparse_halo_parse_row(&parsed, rows, 18, 0, 18, 18, 16) == 0);
+  uint8_t flags[32] = {};
+  fused_anchor_keep_plan_t plan = {};
+  OP_TEST_ASSERT(fused_anchor_prepare_keep_plan(&plan, flags, 32, &parsed, 0, 576, 576, 32) == 0);
+  OP_TEST_ASSERT(plan.tile_count == 18 && plan.selected_tiles == 6 && plan.skipped_tiles == 12);
+  OP_TEST_ASSERT(flags[0] == 1 && flags[2] == 1 && flags[3] == 0 && flags[4] == 1 && flags[5] == 0);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 0, 0) == flags[0]);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 0, 1) == flags[1]);
+  OP_TEST_ASSERT(fused_anchor_block_keep(rows, &params, 0, 31, 2) == flags[2]);
+
+  OP_TEST_ASSERT(block_sparse_halo_parse_row(&parsed, rows + 17 * 18, 18, 17, 18, 18, 16) == 0);
+  memset(flags, 0, sizeof(flags));
+  OP_TEST_ASSERT(fused_anchor_prepare_keep_plan(&plan, flags, 32, &parsed, 0, 64, 576, 32) == 0);
+  OP_TEST_ASSERT(plan.is_text_query && plan.selected_tiles == 2 && flags[0] == 1 && flags[1] == 1);
+
+  memset(flags, 0, sizeof(flags));
+  OP_TEST_ASSERT(fused_anchor_prepare_keep_plan(&plan, flags, 32, &parsed, 544, 6, 576, 32) == 0);
+  OP_TEST_ASSERT(plan.tile_count == 1 && plan.selected_tiles == 1 && flags[0] == 1);
+  OP_TEST_ASSERT(fused_anchor_prepare_keep_plan(&plan, flags, 0, &parsed, 0, 64, 70, 32) != 0);
+  FARF(ALWAYS, "fused_anchor_keep_flags: PASS");
+}
+
+void test_fused_anchor_selected_segments() {
+  fused_anchor_keep_plan_t plan = {};
+  const uint8_t flags[] = {1, 1, 0, 1, 0, 0, 1};
+  OP_TEST_ASSERT(fused_anchor_plan_selected_segments(&plan, flags, 7, 4, false) == 0);
+  OP_TEST_ASSERT(plan.segment_count == 3 && plan.selected_tiles == 4 && plan.skipped_tiles == 3);
+  OP_TEST_ASSERT(plan.tile_offsets[0] == 4 && plan.tile_counts[0] == 2);
+  OP_TEST_ASSERT(plan.tile_offsets[1] == 7 && plan.tile_counts[1] == 1);
+  OP_TEST_ASSERT(plan.tile_offsets[2] == 10 && plan.tile_counts[2] == 1);
+
+  const uint8_t full[] = {1, 1, 1};
+  OP_TEST_ASSERT(fused_anchor_plan_selected_segments(&plan, full, 3, 0, true) == 0);
+  OP_TEST_ASSERT(plan.segment_count == 1 && plan.selected_tiles == 3 && plan.skipped_tiles == 0 &&
+                 plan.is_text_query);
+  const uint8_t empty[] = {0, 0};
+  OP_TEST_ASSERT(fused_anchor_plan_selected_segments(&plan, empty, 2, 8, false) == 0);
+  OP_TEST_ASSERT(plan.segment_count == 0 && plan.selected_tiles == 0 && plan.skipped_tiles == 2);
+  const uint8_t malformed[] = {1, 2};
+  OP_TEST_ASSERT(fused_anchor_plan_selected_segments(&plan, malformed, 2, 0, false) != 0);
+  FARF(ALWAYS, "fused_anchor_selected_segments: PASS");
+}
+
 void test_fused_anchor_entry_contract() {
   auto *entry = &fused_anchor_flash_attn;
   OP_TEST_ASSERT(entry != nullptr);
@@ -785,6 +861,169 @@ static void fill_static_halo_rows(int32_t *rows, int grid_h, int grid_w, int tex
       row[kb] = kb;
     }
   }
+}
+
+static void fused_anchor_scalar_row(
+    std::vector<float> & expected, float *expected_lse,
+    const float *q, const __fp16 *k, const __fp16 *v, const __fp16 *dense_mask,
+    const int32_t *block_mask, const FusedAnchorAttnParams &params,
+    int query, bool sparse) {
+  const int D = params.head_dim;
+  const int mask_stride = (params.kv_len + 63) & ~63;
+  std::vector<float> scores(params.kv_len, -INFINITY);
+  float rowmax = -INFINITY;
+  for (int key = 0; key < params.kv_len; ++key) {
+    const float mask = static_cast<float>(dense_mask[(size_t) query * mask_stride + key]);
+    const int keep = sparse ? fused_anchor_block_keep(
+      block_mask, &params, 0, query, key / params.block_k) : 1;
+    OP_TEST_ASSERT(keep >= 0);
+    if (mask <= -16.0f || keep == 0) {
+      continue;
+    }
+    float score = 0.0f;
+    for (int d = 0; d < D; ++d) {
+      score += q[(size_t) query * D + d] * static_cast<float>(k[(size_t) key * D + d]);
+    }
+    score /= sqrtf(static_cast<float>(D));
+    scores[key] = score;
+    rowmax = std::max(rowmax, score);
+  }
+
+  expected.assign(D, 0.0f);
+  if (!std::isfinite(rowmax)) {
+    *expected_lse = -INFINITY;
+    return;
+  }
+  float rowsum = 0.0f;
+  for (int key = 0; key < params.kv_len; ++key) {
+    if (!std::isfinite(scores[key])) {
+      continue;
+    }
+    const float probability = expf(scores[key] - rowmax);
+    rowsum += probability;
+    for (int d = 0; d < D; ++d) {
+      expected[d] += probability * static_cast<float>(v[(size_t) key * D + d]);
+    }
+  }
+  for (float & value : expected) {
+    value /= rowsum;
+  }
+  *expected_lse = rowmax + logf(rowsum);
+}
+
+static void test_fused_anchor_numeric_selected_tiles_for_dim(int head_dim) {
+  FusedAnchorAttnParams params = {};
+  params.qo_len = 546;
+  params.kv_len = 546;
+  params.n_heads = 1;
+  params.n_kv_heads = 1;
+  params.head_dim = head_dim;
+  params.block_q = 32;
+  params.block_k = 32;
+  params.n_q_blocks = 18;
+  params.n_k_blocks = 18;
+  params.max_kept_blocks = 18;
+  params.mask_format = 1;
+  params.sparse_policy = HTP_SPARSE_POLICY_STATIC_HALO;
+  params.image_tokens = 512;
+  params.text_tokens = 34;
+  params.image_block_rows = 4;
+  params.image_block_cols = 4;
+
+  FusedAnchorAttnBufferSizes sizes = {};
+  OP_TEST_ASSERT(fused_anchor_attn_buffer_sizes(&params, &sizes) == 0);
+  constexpr size_t canary_size = 128;
+  auto *ab_storage = static_cast<uint8_t *>(malloc(canary_size + sizes.output + canary_size));
+  auto *q = static_cast<float *>(malloc(sizes.q));
+  auto *k = static_cast<__fp16 *>(malloc(sizes.kv));
+  auto *v = static_cast<__fp16 *>(malloc(sizes.kv));
+  auto *dense_mask = static_cast<__fp16 *>(malloc(sizes.dense_mask));
+  auto *block_mask = static_cast<int32_t *>(malloc(sizes.block_mask));
+  OP_TEST_ASSERT(ab_storage != nullptr && q != nullptr && k != nullptr &&
+                 v != nullptr && dense_mask != nullptr && block_mask != nullptr);
+
+  memset(ab_storage, 0x5a, canary_size + sizes.output + canary_size);
+  const size_t q_elements = sizes.q / sizeof(float);
+  const size_t kv_elements = sizes.kv / sizeof(__fp16);
+  const size_t mask_elements = sizes.dense_mask / sizeof(__fp16);
+  for (size_t i = 0; i < q_elements; ++i) {
+    q[i] = static_cast<float>(static_cast<int>((i * 13u + 7u) % 31u) - 15) * 0.01f;
+  }
+  for (size_t i = 0; i < kv_elements; ++i) {
+    k[i] = static_cast<__fp16>(
+      static_cast<float>(static_cast<int>((i * 7u + 3u) % 29u) - 14) * 0.0125f);
+    v[i] = static_cast<__fp16>(
+      static_cast<float>(static_cast<int>((i * 11u + 5u) % 37u) - 18) * 0.02f);
+  }
+  std::fill(dense_mask, dense_mask + mask_elements, static_cast<__fp16>(0.0f));
+  fill_static_halo_rows(block_mask, 4, 4, 2);
+
+  const int empty_sparse_query = 64;
+  const int mask_stride = (params.kv_len + 63) & ~63;
+  for (int key = 0; key < params.kv_len; ++key) {
+    const int keep = fused_anchor_block_keep(
+      block_mask, &params, 0, empty_sparse_query, key / params.block_k);
+    OP_TEST_ASSERT(keep >= 0);
+    if (keep != 0) {
+      dense_mask[(size_t) empty_sparse_query * mask_stride + key] =
+        static_cast<__fp16>(-INFINITY);
+    }
+  }
+
+  float *ab = reinterpret_cast<float *>(ab_storage + canary_size);
+  OP_TEST_ASSERT(fused_anchor_flash_attn(
+    ab, q, k, v, dense_mask, block_mask, &params) == 0);
+
+  for (size_t i = 0; i < canary_size; ++i) {
+    OP_TEST_ASSERT(ab_storage[i] == 0x5a &&
+                   ab_storage[canary_size + sizes.output + i] == 0x5a);
+  }
+
+  const size_t row_width = static_cast<size_t>(head_dim + 1);
+  const size_t slab_elements = sizes.slab / sizeof(float);
+
+  for (int query = params.image_tokens; query < params.qo_len; ++query) {
+    const float *dense_row = ab + static_cast<size_t>(query) * row_width;
+    const float *sparse_row = ab + slab_elements + static_cast<size_t>(query) * row_width;
+    for (int d = 0; d <= head_dim; ++d) {
+      OP_TEST_ASSERT(dense_row[d] == sparse_row[d]);
+    }
+  }
+
+  const int sample_queries[] = {0, empty_sparse_query, params.image_tokens, params.qo_len - 1};
+  for (int query : sample_queries) {
+    for (int branch = 0; branch < 2; ++branch) {
+      std::vector<float> expected;
+      float expected_lse = 0.0f;
+      fused_anchor_scalar_row(expected, &expected_lse, q, k, v, dense_mask,
+                              block_mask, params, query, branch == 1);
+      const float *actual = ab + static_cast<size_t>(branch) * slab_elements +
+                            static_cast<size_t>(query) * row_width;
+      for (int d = 0; d < head_dim; ++d) {
+        OP_TEST_ASSERT(std::isfinite(actual[d]));
+        OP_TEST_ASSERT(fabsf(expected[d] - actual[d]) <= 5.0e-2f);
+      }
+      if (std::isinf(expected_lse)) {
+        OP_TEST_ASSERT(std::isinf(actual[head_dim]) && actual[head_dim] < 0.0f);
+      } else {
+        OP_TEST_ASSERT(std::isfinite(actual[head_dim]));
+        OP_TEST_ASSERT(fabsf(expected_lse - actual[head_dim]) <= 7.5e-2f);
+      }
+    }
+  }
+
+  free(block_mask);
+  free(dense_mask);
+  free(v);
+  free(k);
+  free(q);
+  free(ab_storage);
+}
+
+void test_fused_anchor_numeric_selected_tiles() {
+  test_fused_anchor_numeric_selected_tiles_for_dim(64);
+  test_fused_anchor_numeric_selected_tiles_for_dim(128);
+  FARF(ALWAYS, "fused_anchor_numeric_selected_tiles: PASS");
 }
 
 void test_block_sparse_halo_contracts() {
@@ -2066,7 +2305,13 @@ void test_int16_fp16_conversion() {
     input[i] = (__fp16) x;
   }
 
+#if 0
+  // Q6_Vh_equals_Vhf is not exposed by the SDK 6.3 v75 intrinsic headers.
   vmemu(output) = Q6_Vh_equals_Vhf(vmemu(input));
+#else
+  FARF(ALWAYS, "%s: native fp16/int16 conversion intrinsic unavailable", __func__);
+  return;
+#endif
 
   for (int i = 0; i < 64; ++i) {
     FARF(ALWAYS, "%s: x=%g y=%d", __func__, (float) input[i], output[i]);
@@ -2311,7 +2556,11 @@ void internal_op_tests() {
   test_block_sparse_fa_select_plan();
   test_fused_anchor_fa_planner();
   test_fused_anchor_block_keep();
+  test_fused_anchor_profile_counter_contracts();
+  test_fused_anchor_keep_flags();
+  test_fused_anchor_selected_segments();
   test_fused_anchor_entry_contract();
+  test_fused_anchor_numeric_selected_tiles();
   test_block_sparse_halo_contracts();
   test_block_sparse_halo_image_only_contracts();
   test_block_sparse_halo_row_ring_contracts();

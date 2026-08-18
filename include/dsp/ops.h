@@ -55,6 +55,20 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
                       bool with_lse);
 
 struct FusedAnchorAttnParams;
+typedef struct block_sparse_halo_row block_sparse_halo_row_t;
+
+typedef struct {
+  uint64_t q_blocks_decoded;
+  uint64_t mask_row_scans;
+  uint64_t mask_entry_scans;
+  uint64_t k_chunks;
+  uint64_t qk_tiles;
+  uint64_t dense_pv_tiles;
+  uint64_t sparse_selected_tiles;
+  uint64_t sparse_skipped_tiles;
+  uint64_t sparse_empty_chunks;
+  uint64_t text_full_keep_blocks;
+} fused_anchor_fa_stats_t;
 
 typedef struct {
   size_t blk_sz_r;
@@ -62,11 +76,32 @@ typedef struct {
   size_t required_bytes;
 } fused_anchor_fa_plan_t;
 
+#ifndef BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS
+#define BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS 9
+#endif
+#define FUSED_ANCHOR_MAX_SELECTED_SEGMENTS (BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS + 1)
+
+typedef struct {
+  int first_tile;
+  int tile_count;
+  int selected_tiles;
+  int skipped_tiles;
+  int segment_count;
+  int tile_offsets[FUSED_ANCHOR_MAX_SELECTED_SEGMENTS];
+  int tile_counts[FUSED_ANCHOR_MAX_SELECTED_SEGMENTS];
+  bool is_text_query;
+} fused_anchor_keep_plan_t;
+
 size_t fused_anchor_fa_compute_vtcm_usage(int head_dim, int n_rows, int n_cols);
 int fused_anchor_fa_find_chunk_size(fused_anchor_fa_plan_t *plan, int head_dim,
                                     int qo_len, int kv_len, size_t available_bytes);
 int fused_anchor_block_keep(const int32_t *block_mask, const struct FusedAnchorAttnParams *params,
                             int head, int query_index, int key_block_index);
+int fused_anchor_prepare_keep_plan(fused_anchor_keep_plan_t *plan, uint8_t *keep_flags,
+                                   int keep_flags_capacity, const block_sparse_halo_row_t *row,
+                                   int jc, int n_cols, int kv_len, int block_k);
+int fused_anchor_plan_selected_segments(fused_anchor_keep_plan_t *plan, const uint8_t *keep_flags,
+                                        int tile_count, int first_tile, bool is_text_query);
 int fused_anchor_flash_attn(float *restrict output, const float *restrict q,
                             const __fp16 *restrict k, const __fp16 *restrict v,
                             const __fp16 *restrict dense_mask, const int32_t *restrict block_mask,
@@ -84,7 +119,6 @@ typedef struct {
   size_t                    required_bytes;
 } block_sparse_fa_plan_t;
 
-#define BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS 9
 #define BLOCK_SPARSE_HALO_DMA_BANKS 2
 #define BLOCK_SPARSE_HALO_DMA_DESCS_PER_BANK (2 * BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS)
 #define BLOCK_SPARSE_HALO_DMA_DESCS_PER_ROW 2
@@ -96,9 +130,12 @@ typedef struct {
 #define BLOCK_SPARSE_HALO_TEXT_KV_BATCH_ROWS 3
 #define BLOCK_SPARSE_HALO_MAX_UPDATE_SEGMENTS 4
 
-typedef struct {
+typedef struct block_sparse_halo_row {
   bool    is_text_query;
   int     image_count;
+  int     image_block_total;
+  int     first_k_block;
+  int     k_blocks_per_head;
   int32_t image_blocks[BLOCK_SPARSE_HALO_MAX_IMAGE_BLOCKS];
 } block_sparse_halo_row_t;
 
