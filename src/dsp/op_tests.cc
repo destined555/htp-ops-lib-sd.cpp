@@ -633,6 +633,8 @@ void test_block_sparse_fa_select_plan() {
 
   OP_TEST_ASSERT(block_sparse_fa_select_chunked_plan(&plan, 1, 64, 4250, available) == 0);
   OP_TEST_ASSERT(plan.mode == BLOCK_SPARSE_FA_CHUNKED);
+  OP_TEST_ASSERT(block_sparse_fa_select_chunked_plan(&plan, 1, 128, 4250, available) == 0);
+  OP_TEST_ASSERT(plan.mode == BLOCK_SPARSE_FA_CHUNKED);
   OP_TEST_ASSERT(block_sparse_fa_select_chunked_plan(nullptr, 1, 64, 4250, available) == -1);
 
   block_sparse_halo_plan_t halo_plan = {};
