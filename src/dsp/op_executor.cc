@@ -2,6 +2,7 @@
 
 #include <qurt_memory.h>
 
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
@@ -74,6 +75,23 @@ static_assert(offsetof(BlockSparseAttnParams, elapsed_us) + sizeof(int32_t) ==
 constexpr size_t kBlockSparseAttnHaloV1PayloadSize =
   offsetof(BlockSparseAttnParams, halo_image_q_batch_updates);
 static_assert(kBlockSparseAttnHaloV1PayloadSize == 136);
+/* Full pre-metrics struct: every HaloV1 field is present but the sender knows
+   nothing about the DDR->VTCM tail. Still accepted, metrics stay untouched. */
+constexpr size_t kBlockSparseAttnHaloTracePayloadSize =
+  offsetof(BlockSparseAttnParams, halo_metrics_present);
+static_assert(kBlockSparseAttnHaloTracePayloadSize == 144);
+/* HaloV2 = HaloV1 fields + the metrics tail. */
+constexpr size_t kBlockSparseAttnHaloV2PayloadSize = sizeof(BlockSparseAttnParams);
+static_assert(kBlockSparseAttnHaloV2PayloadSize == 200);
+
+/* DDR->VTCM counters are only collected when the DSP skel is built with
+   HTP_ATTN_METRICS; otherwise the fields stay zero and the wire flag reports
+   that no metrics were produced. */
+#ifdef HTP_ATTN_METRICS
+constexpr bool kBlockSparseAttnMetricsBuilt = true;
+#else
+constexpr bool kBlockSparseAttnMetricsBuilt = false;
+#endif
 
 }  // namespace
 
@@ -667,21 +685,54 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
       }
       break;
 
+    case HTP_OPS_ATTN_REARRANGE_BENCH:
+      {
+        if (payload_size < sizeof(AttnRearrangeBenchParams)) {
+          return -1;
+        }
+        auto        *params    = reinterpret_cast<AttnRearrangeBenchParams *>(req->payload);
+        const size_t src_bytes = (size_t) params->rows_total * (size_t) params->row_stride_bytes;
+        add_buffer(in_bufs, params->src, src_bytes);
+        validate_in_bufs();
+
+        int32_t sum_us[4] = { 0, 0, 0, 0 };
+        int32_t blocks[4] = { 0, 0, 0, 0 };
+        int     workers   = 0;
+        ret = attn_rearrange_bench((const __fp16 *) IN_PTR(0), params->row_stride_bytes, params->head_dim,
+                                   params->n_blocks, params->iters, params->rows_total, params->variant_mask,
+                                   sum_us, blocks, &workers);
+
+        /* The wire struct lives in the request payload, which is copied back to
+           the host once the op returns. */
+        auto *wire_params    = reinterpret_cast<AttnRearrangeBenchParams *>(req->payload);
+        wire_params->workers = workers;
+        for (int i = 0; i < 4; ++i) {
+          wire_params->sum_us[i] = sum_us[i];
+          wire_params->blocks[i] = blocks[i];
+        }
+        FARF(ALWAYS, "HTP_ATTN_REARRANGE_BENCH workers=%d vtcm_us=%d hot_us=%d cold_us=%d copy_us=%d ret=%d",
+             workers, sum_us[0], sum_us[1], sum_us[2], sum_us[3], ret);
+      }
+      break;
+
     case HTP_OPS_BLOCK_SPARSE_ATTN_QO_F32_KV_F16:
     case HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16:
       {
         const bool input_packed = req->op == HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16;
         const bool legacy_payload = payload_size == kBlockSparseAttnLegacyPayloadSize;
         const bool halo_v1_payload = payload_size == kBlockSparseAttnHaloV1PayloadSize;
-        if ((!legacy_payload && !halo_v1_payload && payload_size < sizeof(BlockSparseAttnParams)) ||
-            (input_packed && payload_size < sizeof(BlockSparseAttnParams))) {
+        const bool halo_trace_payload = payload_size == kBlockSparseAttnHaloTracePayloadSize;
+        const bool halo_v2_payload = payload_size >= kBlockSparseAttnHaloV2PayloadSize;
+        if ((!legacy_payload && !halo_v1_payload && !halo_trace_payload && !halo_v2_payload) ||
+            (input_packed && payload_size < kBlockSparseAttnHaloTracePayloadSize)) {
           return -1;
         }
 
         BlockSparseAttnParams decoded_params = {};
         const size_t decoded_size = legacy_payload ? kBlockSparseAttnLegacyPayloadSize :
                                     (halo_v1_payload ? kBlockSparseAttnHaloV1PayloadSize :
-                                                       sizeof(decoded_params));
+                                    (halo_trace_payload ? kBlockSparseAttnHaloTracePayloadSize :
+                                                          sizeof(decoded_params)));
         memcpy(&decoded_params, req->payload, decoded_size);
         auto *params = &decoded_params;
 
@@ -703,7 +754,8 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
             mask_format == 1 && params->sparse_policy == HTP_SPARSE_POLICY_STATIC_HALO &&
             (params->halo_kv_load_mode == HTP_HALO_KV_LOAD_L2_PREFETCH ||
              params->halo_kv_load_mode == HTP_HALO_KV_LOAD_USERDMA_AB ||
-             params->halo_kv_load_mode == HTP_HALO_KV_LOAD_CHUNKED);
+             params->halo_kv_load_mode == HTP_HALO_KV_LOAD_CHUNKED ||
+             params->halo_kv_load_mode == HTP_HALO_KV_LOAD_CHUNKED_NO_REUSE);
           const bool packed_full_keep =
             mask_format == 0 && params->sparse_policy == HTP_SPARSE_POLICY_NONE &&
             params->halo_kv_load_mode == HTP_HALO_KV_LOAD_BASELINE;
@@ -731,6 +783,10 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
         add_buffer(in_bufs, params->block_mask, buffer_sizes.block_mask);
 
         validate_in_bufs();
+        /* The counters are written into the trace struct whenever the pointer is
+           passed, which is the case for trace runs and for metrics builds. */
+        const bool halo_trace_enabled = params->halo_trace != 0;
+        const bool halo_run_trace_wanted = halo_trace_enabled || kBlockSparseAttnMetricsBuilt;
         block_sparse_halo_run_trace_t halo_run_trace = {};
         const int64_t t0 = HAP_perf_get_qtimer_count();
         ret = input_packed ?
@@ -740,16 +796,16 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
             params->block_q, params->block_k, params->n_q_blocks, params->n_k_blocks,
             mask_format, max_kept_blocks, with_lse, params->sparse_policy, params->image_tokens,
             params->text_tokens, params->image_block_rows, params->image_block_cols,
-            params->halo_kv_load_mode, params->halo_trace != 0,
-            params->halo_trace != 0 ? &halo_run_trace : NULL) :
+            params->halo_kv_load_mode, halo_trace_enabled,
+            halo_run_trace_wanted ? &halo_run_trace : NULL) :
           block_sparse_flash_attn(
             (__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
             (const int32_t *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim,
             params->block_q, params->block_k, params->n_q_blocks, params->n_k_blocks,
             mask_format, max_kept_blocks, with_lse, params->sparse_policy, params->image_tokens,
             params->text_tokens, params->image_block_rows, params->image_block_cols,
-            params->halo_kv_load_mode, params->halo_trace != 0,
-            params->halo_trace != 0 ? &halo_run_trace : NULL);
+            params->halo_kv_load_mode, halo_trace_enabled,
+            halo_run_trace_wanted ? &halo_run_trace : NULL);
         const int64_t elapsed_us = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
         auto *wire_params = reinterpret_cast<BlockSparseAttnParams *>(req->payload);
         wire_params->elapsed_us = (int32_t) elapsed_us;
@@ -768,8 +824,44 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
           wire_params->halo_image_q_segment_updates =
             params->halo_trace != 0 ? halo_run_trace.image_q_segment_updates : 0;
         }
+        if (halo_v2_payload) {
+          const block_sparse_attn_metrics_t &attn_metrics = halo_run_trace.metrics;
+          wire_params->halo_metrics_present = kBlockSparseAttnMetricsBuilt ? 1 : 0;
+          wire_params->halo_route_mismatch = attn_metrics.route_mismatch ? 1 : 0;
+          wire_params->halo_read_kb = block_sparse_attn_bytes_to_wire_kb(attn_metrics.read_bytes);
+          wire_params->halo_q_kb = block_sparse_attn_bytes_to_wire_kb(attn_metrics.q_bytes);
+          wire_params->halo_text_kv_kb = block_sparse_attn_bytes_to_wire_kb(attn_metrics.text_kv_bytes);
+          wire_params->halo_image_kv_kb = block_sparse_attn_bytes_to_wire_kb(attn_metrics.image_kv_bytes);
+          wire_params->halo_misc_kb = block_sparse_attn_bytes_to_wire_kb(attn_metrics.misc_bytes);
+          wire_params->halo_transfer_count = attn_metrics.transfer_count > (uint64_t) INT32_MAX ?
+                                               INT32_MAX : (int32_t) attn_metrics.transfer_count;
+          wire_params->halo_ddr_to_vtcm_us = block_sparse_attn_us_to_wire(attn_metrics.ddr_to_vtcm_us);
+          wire_params->halo_overlap_us = block_sparse_attn_us_to_wire(attn_metrics.overlap_us);
+          wire_params->halo_inflight_us = block_sparse_attn_us_to_wire(attn_metrics.inflight_us);
+          wire_params->halo_pack_us = block_sparse_attn_us_to_wire(attn_metrics.pack_us);
+          wire_params->halo_submit_us = block_sparse_attn_us_to_wire(attn_metrics.submit_us);
+          wire_params->halo_worker_elapsed_us =
+            block_sparse_attn_us_to_wire(attn_metrics.worker_elapsed_us);
+        }
         FARF(ALWAYS, "HTP_ATTN_OP_BENCH kind=%s elapsed_us=%lld",
              input_packed ? "block_sparse_packed" : "block_sparse", elapsed_us);
+        if (kBlockSparseAttnMetricsBuilt) {
+          const block_sparse_attn_metrics_t &attn_metrics = halo_run_trace.metrics;
+          FARF(ALWAYS,
+               "HTP_ATTN_METRICS loader=%d route_match=%d read_bytes=%llu q_bytes=%llu text_kv_bytes=%llu "
+               "image_kv_bytes=%llu misc_bytes=%llu transfers=%llu l2_lines=%llu ddr_to_vtcm_us=%lld "
+               "overlap_us=%lld inflight_us=%lld pack_us=%lld submit_us=%lld worker_us=%lld elapsed_us=%lld",
+               (int) params->halo_kv_load_mode, attn_metrics.route_mismatch ? 0 : 1,
+               (unsigned long long) attn_metrics.read_bytes, (unsigned long long) attn_metrics.q_bytes,
+               (unsigned long long) attn_metrics.text_kv_bytes,
+               (unsigned long long) attn_metrics.image_kv_bytes,
+               (unsigned long long) attn_metrics.misc_bytes,
+               (unsigned long long) attn_metrics.transfer_count,
+               (unsigned long long) attn_metrics.l2_lines, (long long) attn_metrics.ddr_to_vtcm_us,
+               (long long) attn_metrics.overlap_us, (long long) attn_metrics.inflight_us,
+               (long long) attn_metrics.pack_us, (long long) attn_metrics.submit_us,
+               (long long) attn_metrics.worker_elapsed_us, (long long) elapsed_us);
+        }
         validate_out_bufs();
       }
       break;

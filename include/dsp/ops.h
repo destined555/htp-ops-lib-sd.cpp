@@ -282,6 +282,85 @@ enum block_sparse_halo_exec_mode {
   BLOCK_SPARSE_HALO_EXEC_CHUNKED_FALLBACK,
 };
 
+/* Per-op DDR->VTCM read accounting for the sparse attention cores.
+ *
+ * Byte counters are *issued read* counts: everything the kernels hand to a
+ * loader (UserDMA descriptors, l2fetch hints, direct pack/copy loops) while
+ * reading Q, the resident text K/V and the image K/V rows. Output writes are
+ * never counted. Because l2fetch is only a hint, read_bytes is an upper bound
+ * on the true DRAM traffic whenever data was already L2 resident.
+ *
+ * transfer_count is the number of loader issues (one 2D UserDMA descriptor or
+ * one K/V tile load counts as one), so read_bytes / transfer_count is the
+ * average payload per transfer.
+ */
+typedef struct block_sparse_attn_metrics {
+  uint64_t read_bytes;     /* total DDR->VTCM read bytes (q + text_kv + image_kv + misc) */
+  uint64_t q_bytes;
+  uint64_t text_kv_bytes;
+  uint64_t image_kv_bytes;
+  uint64_t misc_bytes;     /* mask, scales and other small constant reads */
+  uint64_t transfer_count; /* loader issues; see above */
+  uint64_t l2_lines;       /* 128B-aligned read requests, alignment sanity only */
+  int64_t  ddr_to_vtcm_us; /* wall time spent waiting for DDR->VTCM data */
+  int64_t  overlap_us;     /* part of the transfer window overlapped by compute */
+  int64_t  inflight_us;    /* outstanding transfer window: submit + overlap + exposed */
+  int64_t  pack_us;        /* in-VTCM rearrange cost, after data has arrived */
+  int64_t  submit_us;      /* descriptor build + submit cost */
+  int64_t  worker_elapsed_us; /* summed per-task worker wall time; the denominator
+                                 for the DDR wait share when several kv heads run
+                                 on the same worker */
+  int      route_mismatch; /* 1 when the run did not take the requested route */
+} block_sparse_attn_metrics_t;
+
+/* Average payload per loader issue; 0 when nothing was transferred. */
+static inline uint64_t block_sparse_attn_avg_transfer_bytes(const block_sparse_attn_metrics_t *metrics) {
+  if (metrics == NULL || metrics->transfer_count == 0) {
+    return 0;
+  }
+  return metrics->read_bytes / metrics->transfer_count;
+}
+
+/* Byte counters travel over the wire as int32 KB, so that one field covers
+   every realistic shape. Round up: a non-zero byte count must never read back
+   as 0. */
+static inline int32_t block_sparse_attn_bytes_to_wire_kb(uint64_t bytes) {
+  const uint64_t kb = (bytes + 1023u) / 1024u;
+  return kb > (uint64_t) INT32_MAX ? INT32_MAX : (int32_t) kb;
+}
+
+/* K/V residency split for the chunked core: a chunk that starts at
+   `first_token` covers `token_count` tokens, of which the ones below
+   `image_tokens` are image rows and the rest belong to the resident text tail.
+   K/V are fp16, so one token contributes head_dim * 2 bytes to each of K and V;
+   both are charged here. */
+static inline void block_sparse_attn_metrics_add_kv_bytes(block_sparse_attn_metrics_t *metrics,
+                                                          int first_token, size_t token_count,
+                                                          int head_dim, int image_tokens) {
+  if (metrics == NULL || first_token < 0 || token_count == 0 || head_dim <= 0) {
+    return;
+  }
+  size_t image_cols = 0;
+  if (first_token < image_tokens) {
+    image_cols = (size_t) image_tokens - (size_t) first_token;
+    if (image_cols > token_count) {
+      image_cols = token_count;
+    }
+  }
+  const uint64_t bytes_per_token = (uint64_t) head_dim * 2u;  /* fp16 K and fp16 V */
+  metrics->image_kv_bytes += (uint64_t) image_cols * bytes_per_token;
+  metrics->text_kv_bytes += (uint64_t) (token_count - image_cols) * bytes_per_token;
+}
+
+/* Wire transport for the microsecond fields; negative and overflowing values
+   clamp to 0 / INT32_MAX. */
+static inline int32_t block_sparse_attn_us_to_wire(int64_t us) {
+  if (us <= 0) {
+    return 0;
+  }
+  return us > (int64_t) INT32_MAX ? INT32_MAX : (int32_t) us;
+}
+
 typedef struct {
   int exec_mode;
   int image_rows_updated;
@@ -289,6 +368,9 @@ typedef struct {
   int text_q_image_block_updates;
   int image_q_batch_updates;
   int image_q_segment_updates;
+  /* DDR->VTCM read accounting, filled whenever the pointer is non-NULL.
+     Compiled in by HTP_ATTN_METRICS; zero when the counters are not built. */
+  struct block_sparse_attn_metrics metrics;
 } block_sparse_halo_run_trace_t;
 
 int block_sparse_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K,
@@ -455,6 +537,19 @@ int hvx_mat_mul_int32_core(int32_t *restrict __vtcm c, const int32_t *restrict _
 
 int hvx_mat_mul_fp16_core_mt(__fp16 *restrict __vtcm c, const __fp16 *restrict __vtcm a,
                              const __fp16 *restrict __vtcm b, int M, int K, int N, int n_threads);
+
+/*
+ * Times the chunked core's K/V rearrange primitives without running an
+ * attention operator: one "block" is the work the kernel does for one consumed
+ * K/V block (a K [32, head_dim] transpose plus a V [32, head_dim] pack, 4 KB
+ * each). Pass a `variant_mask` built from HTP_ATTN_RB_VARIANT_* and an `src`
+ * with at least `rows_total` rows of `row_stride_bytes`. `sum_us` and `blocks`
+ * are indexed by variant bit (0 = VTCM, 1 = HOT, 2 = COLD, 3 = COPY) and are
+ * summed over the worker slices.
+ */
+int attn_rearrange_bench(const __fp16 *restrict src, int row_stride_bytes, int head_dim, int n_blocks,
+                         int iters, int rows_total, int variant_mask, int32_t *sum_us, int32_t *blocks,
+                         int *workers);
 
 #ifdef __cplusplus
 }

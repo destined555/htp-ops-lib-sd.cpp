@@ -4,6 +4,7 @@ project(htp_ops C CXX ASM)
 
 option(HTP_OPS_QUIET_BENCH "Disable DSP FARF logging for unbiased benchmarks" OFF)
 option(HTP_FUSED_ANCHOR_PROFILE "Emit trace-only fused anchor counters" OFF)
+option(HTP_ATTN_METRICS "Collect DDR->VTCM read accounting in sparse attention cores" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -87,6 +88,9 @@ else()
     endif()
     if(HTP_FUSED_ANCHOR_PROFILE)
         target_compile_definitions(htp_ops_skel PRIVATE HTP_FUSED_ANCHOR_PROFILE)
+    endif()
+    if(HTP_ATTN_METRICS)
+        target_compile_definitions(htp_ops_skel PRIVATE HTP_ATTN_METRICS)
     endif()
     build_idl(include/htp_ops.idl htp_ops_skel)
 

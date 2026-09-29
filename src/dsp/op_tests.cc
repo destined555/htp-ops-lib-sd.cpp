@@ -71,6 +71,15 @@ static_assert(offsetof(BlockSparseAttnParams, elapsed_us) + sizeof(int32_t) ==
 constexpr size_t kBlockSparseAttnHaloV1PayloadSize =
   offsetof(BlockSparseAttnParams, halo_image_q_batch_updates);
 static_assert(kBlockSparseAttnHaloV1PayloadSize == 136);
+constexpr size_t kBlockSparseAttnHaloTracePayloadSize =
+  offsetof(BlockSparseAttnParams, halo_metrics_present);
+static_assert(kBlockSparseAttnHaloTracePayloadSize == 144);
+constexpr size_t kBlockSparseAttnHaloV2PayloadSize = sizeof(BlockSparseAttnParams);
+static_assert(kBlockSparseAttnHaloV2PayloadSize == 200);
+static_assert(offsetof(BlockSparseAttnParams, halo_transfer_count) == 172);
+static_assert(offsetof(BlockSparseAttnParams, halo_submit_us) == 192);
+static_assert(offsetof(BlockSparseAttnParams, halo_worker_elapsed_us) == 196);
+static_assert(sizeof(BlockSparseAttnParams) == 200);
 static_assert(HTP_OPS_BLOCK_SPARSE_ATTN_QKV_PACKED_F16 ==
               HTP_OPS_QKV_MUL_RMS_PACKED_W16A32 + 1);
 static_assert(sizeof(QkvMulRmsPackedDualParams) == 128);
@@ -178,6 +187,20 @@ static BlockSparseAttnParams make_rejected_sparse_params() {
   params.halo_text_q_image_block_updates = INT32_MIN;
   params.halo_image_q_batch_updates = INT32_MIN;
   params.halo_image_q_segment_updates = INT32_MIN;
+  params.halo_metrics_present = INT32_MIN;
+  params.halo_route_mismatch = INT32_MIN;
+  params.halo_read_kb = INT32_MIN;
+  params.halo_q_kb = INT32_MIN;
+  params.halo_text_kv_kb = INT32_MIN;
+  params.halo_image_kv_kb = INT32_MIN;
+  params.halo_misc_kb = INT32_MIN;
+  params.halo_transfer_count = INT32_MIN;
+  params.halo_ddr_to_vtcm_us = INT32_MIN;
+  params.halo_overlap_us = INT32_MIN;
+  params.halo_inflight_us = INT32_MIN;
+  params.halo_pack_us = INT32_MIN;
+  params.halo_submit_us = INT32_MIN;
+  params.halo_worker_elapsed_us = INT32_MIN;
   return params;
 }
 
@@ -240,7 +263,35 @@ void test_op_executor_sparse_payload_boundaries() {
     OP_TEST_ASSERT(params->halo_text_q_image_block_updates != INT32_MIN);
     OP_TEST_ASSERT(params->halo_image_q_batch_updates != INT32_MIN);
     OP_TEST_ASSERT(params->halo_image_q_segment_updates != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_metrics_present != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_route_mismatch != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_read_kb != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_transfer_count != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_ddr_to_vtcm_us != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_inflight_us != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_submit_us != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_worker_elapsed_us != INT32_MIN);
     OP_TEST_ASSERT(memcmp(request.canary, canary_before, sizeof(canary_before)) == 0);
+  }
+
+  {
+    // Pre-metrics boundary: this sender ships every HaloV1 field but does not
+    // know about the DDR->VTCM tail, so the tail must stay untouched while the
+    // HaloV1 trace fields are still written back.
+    auto request = make_sparse_executor_request<kBlockSparseAttnHaloTracePayloadSize>();
+    const uint8_t *payload = request.compute_request + sizeof(OpComputeRequest);
+    uint8_t tail_before[sizeof(BlockSparseAttnParams) - kBlockSparseAttnHaloTracePayloadSize];
+    memcpy(tail_before, payload + kBlockSparseAttnHaloTracePayloadSize, sizeof(tail_before));
+
+    OP_TEST_ASSERT(execute_op_simple((OpComputeRequest *) request.compute_request,
+                                     sizeof(request.compute_request)) != 0);
+    const auto *params = (const BlockSparseAttnParams *) payload;
+    OP_TEST_ASSERT(params->elapsed_us != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_exec_mode != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_image_q_batch_updates != INT32_MIN);
+    OP_TEST_ASSERT(params->halo_image_q_segment_updates != INT32_MIN);
+    OP_TEST_ASSERT(memcmp(payload + kBlockSparseAttnHaloTracePayloadSize, tail_before,
+                          sizeof(tail_before)) == 0);
   }
 
   {
@@ -769,6 +820,61 @@ void test_fused_anchor_profile_counter_contracts() {
   OP_TEST_ASSERT(offsetof(FusedAnchorAttnParams, elapsed_us) == 112);
   OP_TEST_ASSERT(sizeof(stats) >= 10 * sizeof(uint64_t));
   FARF(ALWAYS, "fused_anchor_profile_counter_contracts: PASS");
+}
+
+void test_block_sparse_attn_dma_metric_contracts() {
+  // Byte accounting identity: read_bytes must be the sum of its parts, and the
+  // average transfer size must degrade to 0 instead of dividing by zero.
+  block_sparse_attn_metrics_t metrics = {};
+  metrics.q_bytes        = 8u * 1024u;
+  metrics.text_kv_bytes  = 4u * 1024u;
+  metrics.image_kv_bytes = 16u * 1024u;
+  metrics.misc_bytes     = 1u * 1024u;
+  metrics.read_bytes = metrics.q_bytes + metrics.text_kv_bytes + metrics.image_kv_bytes + metrics.misc_bytes;
+  metrics.transfer_count = 4;
+  OP_TEST_ASSERT(metrics.read_bytes == 29u * 1024u);
+  OP_TEST_ASSERT(block_sparse_attn_avg_transfer_bytes(&metrics) == 7424u);
+
+  block_sparse_attn_metrics_t empty = {};
+  OP_TEST_ASSERT(block_sparse_attn_avg_transfer_bytes(&empty) == 0);
+  OP_TEST_ASSERT(block_sparse_attn_avg_transfer_bytes(NULL) == 0);
+
+  // Wire unit contract: KB with round-up, so small non-zero counts survive.
+  OP_TEST_ASSERT(block_sparse_attn_bytes_to_wire_kb(0) == 0);
+  OP_TEST_ASSERT(block_sparse_attn_bytes_to_wire_kb(1) == 1);
+  OP_TEST_ASSERT(block_sparse_attn_bytes_to_wire_kb(1024) == 1);
+  OP_TEST_ASSERT(block_sparse_attn_bytes_to_wire_kb(1025) == 2);
+  OP_TEST_ASSERT(block_sparse_attn_us_to_wire(-5) == 0);
+  OP_TEST_ASSERT(block_sparse_attn_us_to_wire(0) == 0);
+  OP_TEST_ASSERT(block_sparse_attn_us_to_wire(1234) == 1234);
+
+  // Payload version contract: HaloV2 only appends fields to the pre-metrics
+  // struct, and the legacy sizes keep decoding unchanged.
+  OP_TEST_ASSERT(kBlockSparseAttnLegacyPayloadSize == 92);
+  OP_TEST_ASSERT(kBlockSparseAttnHaloV1PayloadSize == 136);
+  OP_TEST_ASSERT(kBlockSparseAttnHaloTracePayloadSize == 144);
+  OP_TEST_ASSERT(kBlockSparseAttnHaloV2PayloadSize == 200);
+  OP_TEST_ASSERT(offsetof(BlockSparseAttnParams, halo_metrics_present) == 144);
+  OP_TEST_ASSERT(offsetof(BlockSparseAttnParams, halo_transfer_count) == 172);
+  OP_TEST_ASSERT(offsetof(BlockSparseAttnParams, halo_submit_us) == 192);
+
+  // The trace struct must carry the metrics without disturbing the existing
+  // execution-mode fields that the host and route assertions rely on.
+  block_sparse_halo_run_trace_t trace = {};
+  trace.exec_mode      = BLOCK_SPARSE_HALO_EXEC_USERDMA_ROWS;
+  trace.image_rows_updated = 7;
+  trace.metrics        = metrics;
+  OP_TEST_ASSERT(trace.exec_mode == BLOCK_SPARSE_HALO_EXEC_USERDMA_ROWS);
+  OP_TEST_ASSERT(trace.image_rows_updated == 7);
+  OP_TEST_ASSERT(trace.metrics.transfer_count == 4);
+  OP_TEST_ASSERT(block_sparse_attn_avg_transfer_bytes(&trace.metrics) == 7424u);
+
+  // Default state must read as "no metrics collected".
+  block_sparse_halo_run_trace_t default_trace = {};
+  OP_TEST_ASSERT(default_trace.metrics.read_bytes == 0);
+  OP_TEST_ASSERT(default_trace.metrics.route_mismatch == 0);
+
+  FARF(ALWAYS, "block_sparse_attn_dma_metric_contracts: PASS");
 }
 
 void test_fused_anchor_keep_flags() {
@@ -2575,6 +2681,7 @@ void internal_op_tests() {
   test_block_sparse_packed_layout_contracts();
   test_block_sparse_halo_userdma_scope();
   test_block_sparse_attn_buffer_size_contracts();
+  test_block_sparse_attn_dma_metric_contracts();
   test_op_executor_sparse_payload_boundaries();
   test_fused_anchor_buffer_size_contracts();
   test_fused_anchor_payload_boundaries();
