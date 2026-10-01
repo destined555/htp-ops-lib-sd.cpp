@@ -4,10 +4,13 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 #include "dsp/mmap_mgr.h"
+#include "dsp/hmx_mgr.h"
 #include "dsp/ops.h"
+#include "dsp/vtcm_mgr.h"
 #include "op_reg.h"
 
 // debug
@@ -37,6 +40,21 @@ bool checked_size_mul(size_t a, size_t b, size_t *result) {
   *result = a * b;
   return true;
 }
+
+#ifdef HTP_OPS_OP_TRACE
+uint64_t debug_hash_bytes(const void *data, size_t size) {
+  const auto *bytes = reinterpret_cast<const uint8_t *>(data);
+  uint64_t hash = UINT64_C(14695981039346656037);
+  if (bytes == nullptr) {
+    return 0;
+  }
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+#endif
 
 constexpr size_t kPackedZeroBiasFloats = 3u * 30u * 128u;
 
@@ -264,7 +282,8 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
   std::vector<Buffer> in_bufs, out_bufs;
 
   auto add_buffer = [](std::vector<Buffer> &bufs, const RpcmemBufAddr &buf_addr, size_t size, bool cached = true) {
-    auto base = reinterpret_cast<uint8_t *>(mmap_manager_get_map(buf_addr.fd));
+    auto base = reinterpret_cast<uint8_t *>(mmap_manager_get_map(
+        buf_addr.fd, static_cast<uint64_t>(buf_addr.offset), static_cast<uint64_t>(size)));
     auto ptr  = base != nullptr ? base + buf_addr.offset : nullptr;
     bufs.push_back({ ptr, size, cached });
   };
@@ -286,6 +305,10 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
   };
 
   int ret = 0;
+#ifdef HTP_OPS_OP_TRACE
+  FARF(ALWAYS, "HTP_OP_TRACE begin op=%u payload=%u", (unsigned) req->op,
+       (unsigned) payload_size);
+#endif
   switch (req->op) {
     case HTP_OPS_RMS_NORM_F32:
       {
@@ -320,9 +343,50 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
         add_buffer(in_bufs, params->activation, activation_size);
         add_buffer(in_bufs, params->weight, weight_size);
 
+        // A per-session channel uses a distinct DSP mapping context.  Return
+        // a distinct error before entering the HMX kernel when that context
+        // cannot resolve one of the RPCMEM views.
+        if (OUT_PTR(0) == nullptr || IN_PTR(0) == nullptr || IN_PTR(1) == nullptr) {
+          FARF(ERROR, "matmul RPCMEM mapping missing out=%p activation=%p weight=%p",
+               OUT_PTR(0), IN_PTR(0), IN_PTR(1));
+          return -2;
+        }
+        if (((uintptr_t) OUT_PTR(0) & 127u) != 0 ||
+            ((uintptr_t) IN_PTR(0) & 127u) != 0 ||
+            ((uintptr_t) IN_PTR(1) & 127u) != 0) {
+          FARF(ERROR, "matmul RPCMEM alignment invalid out=%p activation=%p weight=%p",
+               OUT_PTR(0), IN_PTR(0), IN_PTR(1));
+          return -3;
+        }
+
+#ifdef HTP_OPS_OP_TRACE
+        params->debug_vtcm_base = (uint64_t) (uintptr_t) vtcm_manager_get_vtcm_base();
+        params->debug_vtcm_size = (uint32_t) vtcm_manager_get_vtcm_size();
+        params->debug_vtcm_ctx = vtcm_manager_get_context_id();
+        params->debug_hmx_ctx = hmx_manager_get_context_id();
+        params->debug_worker_pool = (uint64_t) (uintptr_t) hmx_manager_get_worker_pool();
+        params->debug_hmx_lock_result = hmx_manager_get_last_lock_result();
+        FARF(ALWAYS, "HTP_OP_TRACE matmul m=%d k=%d n=%d out_fd=%d out_off=%d out=%p act_fd=%d act_off=%d act=%p weight_fd=%d weight_off=%d weight=%p",
+             m, k, n, params->output.fd, params->output.offset, OUT_PTR(0),
+             params->activation.fd, params->activation.offset, IN_PTR(0),
+             params->weight.fd, params->weight.offset, IN_PTR(1));
+#endif
+
         validate_in_bufs();
+#ifdef HTP_OPS_OP_TRACE
+        params->debug_dsp_activation_hash = debug_hash_bytes(IN_PTR(0), activation_size);
+#endif
         ret = hmx_mat_mul_permuted_w16a32((float *) OUT_PTR(0), (float *) IN_PTR(0), (__fp16 *) IN_PTR(1), m, k, n);
         validate_out_bufs();
+#ifdef HTP_OPS_OP_TRACE
+        params->debug_dsp_output_hash = debug_hash_bytes(OUT_PTR(0), output_size);
+        qurt_mem_cache_clean((qurt_addr_t) OUT_PTR(0), output_size,
+                             QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+        params->debug_dsp_output_hash_after_invalidate = debug_hash_bytes(OUT_PTR(0), output_size);
+        if (std::getenv("HTP_OPS_RELEASE_OUTPUT_MAP") != nullptr) {
+          (void) mmap_manager_put_map(params->output.fd);
+        }
+#endif
       }
       break;
 
@@ -895,6 +959,12 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
     default:
       break;
   }
+#ifdef HTP_OPS_FORCE_REMAP
+  // Diagnostic only: prove whether a stale DSP fd->address cache is the
+  // source of reserved-PD numerical divergence. The host mapper may later
+  // send duplicate puts; mmap_manager_put_map treats those as harmless hits.
+  mmap_manager_release_all();
+#endif
   return ret;
 }
 

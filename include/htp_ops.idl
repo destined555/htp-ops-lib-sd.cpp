@@ -8,13 +8,21 @@
 
 interface htp_ops : remote_handle64 {
     AEEResult init_backend();
+    AEEResult init_backend_fraction(in uint32 numerator, in uint32 denominator);
+    AEEResult init_mapping_backend();
+    AEEResult release_backend();
     AEEResult create_channel(in int32 fd, in uint32 size);
+    AEEResult create_channel_with_token(in uint64 session_token, in int32 fd, in uint32 size);
     AEEResult destroy_channel();
 
     /* ops RPC interface */
     AEEResult rms_norm_f32(in int32 fd0, in int32 offset0, in int32 fd1, in int32 offset1, in int32 ne0, in int32 ne1);
     AEEResult mat_mul_permuted_w16a32(in int32 fd0, in int32 offset0, in int32 fd1, in int32 offset1, in int32 fd2, in int32 offset2,
         in int32 m, in int32 k, in int32 n);
+    /* Diagnostic-only variant: return hashes computed inside the DSP after the same kernel. */
+    AEEResult mat_mul_permuted_w16a32_trace(in int32 fd0, in int32 offset0, in int32 fd1, in int32 offset1, in int32 fd2, in int32 offset2,
+        in int32 m, in int32 k, in int32 n, rout uint64 activation_hash, rout uint64 output_hash,
+        rout uint64 output_hash_after_remap);
     
     AEEResult test_ops(rout int32 userdma_scope);
 };

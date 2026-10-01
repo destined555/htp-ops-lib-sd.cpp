@@ -777,14 +777,14 @@ static void transfer_output_chunk_fp16_to_fp32(float *restrict dst, const __fp16
 int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activation,
                                 const __fp16 *restrict permuted_weight, int m, int k, int n) {
   if (!dst || !activation || !permuted_weight || !m || !n || !k) {
-    return -1;
+    return -10;
   }
   if (k % 32 != 0 || n % 32 != 0) {
     // TODO(hzx): can we remove this restriction?
-    return -1;
+    return -11;
   }
   if (!is_aligned(dst, VLEN) || !is_aligned(activation, VLEN) || !is_aligned(permuted_weight, VLEN)) {
-    return -1;
+    return -12;
   }
 
   const size_t weight_area_size     = WEIGHT_AREA_SIZE;

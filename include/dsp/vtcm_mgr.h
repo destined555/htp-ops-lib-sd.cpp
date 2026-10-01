@@ -8,10 +8,12 @@ extern "C" {
 #endif
 
 int vtcm_manager_setup();
+int vtcm_manager_setup_fraction(unsigned int numerator, unsigned int denominator);
 int vtcm_manager_reset();
 
 void *vtcm_manager_get_vtcm_base();
 size_t vtcm_manager_get_vtcm_size();
+int vtcm_manager_get_context_id();
 
 static inline uint8_t *vtcm_seq_alloc(uint8_t **vtcm_ptr, size_t size) {
   uint8_t *p = *vtcm_ptr;

@@ -5,6 +5,9 @@ project(htp_ops C CXX ASM)
 option(HTP_OPS_QUIET_BENCH "Disable DSP FARF logging for unbiased benchmarks" OFF)
 option(HTP_FUSED_ANCHOR_PROFILE "Emit trace-only fused anchor counters" OFF)
 option(HTP_ATTN_METRICS "Collect DDR->VTCM read accounting in sparse attention cores" OFF)
+option(HTP_OPS_MMAP_TRACE "Trace DSP-side RPCMEM mapping lifecycle" OFF)
+option(HTP_OPS_OP_TRACE "Trace DSP-side op input/output mappings" OFF)
+option(HTP_OPS_FORCE_REMAP "Release DSP fd mappings after every op (diagnostic)" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -43,6 +46,7 @@ if(${OS_TYPE} MATCHES "HLOS")
     add_executable(htp_ops_test
         ${CMAKE_CURRENT_SOURCE_DIR}/src/host/test.c
     )
+
     
     # Add common HLOS-specific linker options
     set_common_compile_and_link_options(htp_ops_test)
@@ -89,8 +93,17 @@ else()
     if(HTP_FUSED_ANCHOR_PROFILE)
         target_compile_definitions(htp_ops_skel PRIVATE HTP_FUSED_ANCHOR_PROFILE)
     endif()
+    if(HTP_OPS_MMAP_TRACE)
+        target_compile_definitions(htp_ops_skel PRIVATE HTP_OPS_MMAP_TRACE)
+    endif()
     if(HTP_ATTN_METRICS)
         target_compile_definitions(htp_ops_skel PRIVATE HTP_ATTN_METRICS)
+    endif()
+    if(HTP_OPS_OP_TRACE)
+        target_compile_definitions(htp_ops_skel PRIVATE HTP_OPS_OP_TRACE)
+    endif()
+    if(HTP_OPS_FORCE_REMAP)
+        target_compile_definitions(htp_ops_skel PRIVATE HTP_OPS_FORCE_REMAP)
     endif()
     build_idl(include/htp_ops.idl htp_ops_skel)
 

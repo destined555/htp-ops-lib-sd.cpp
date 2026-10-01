@@ -7,6 +7,7 @@
 
 static int hmx_mgr_ctx_id;
 static int hmx_mgr_spin_lock;
+static int hmx_mgr_last_lock_result;
 
 worker_pool_context_t hmx_worker_pool_ctx;
 
@@ -29,6 +30,7 @@ int hmx_manager_setup() {
     hmx_mgr_ctx_id = 0;
   }
   hmx_mgr_spin_lock = 0;
+  hmx_mgr_last_lock_result = 0;
 
   compute_res_attr_t req;
   int                err = HAP_compute_res_attr_init(&req);
@@ -87,14 +89,20 @@ int hmx_manager_reset() {
 
 void hmx_manager_enable_execution() {
   if (!hmx_mgr_ctx_id || !hmx_worker_pool_ctx) {
+    hmx_mgr_last_lock_result = -1;
     return;
   }
 
   // enable current thread to timeshare HMX unit
   int err = HAP_compute_res_hmx_lock2(hmx_mgr_ctx_id, HAP_COMPUTE_RES_HMX_SHARED);
+  hmx_mgr_last_lock_result = err;
   if (err) {
     FARF(ALWAYS, "HAP_compute_res_hmx_lock2 failed with return code 0x%x", err);
   }
+}
+
+int hmx_manager_get_last_lock_result() {
+  return hmx_mgr_last_lock_result;
 }
 
 void hmx_manager_disable_execution() {
@@ -103,6 +111,14 @@ void hmx_manager_disable_execution() {
   }
 
   HAP_compute_res_hmx_unlock2(hmx_mgr_ctx_id, HAP_COMPUTE_RES_HMX_SHARED);
+}
+
+int hmx_manager_get_context_id() {
+  return hmx_mgr_ctx_id;
+}
+
+void * hmx_manager_get_worker_pool() {
+  return (void *) hmx_worker_pool_ctx;
 }
 
 void hmx_unit_acquire() {

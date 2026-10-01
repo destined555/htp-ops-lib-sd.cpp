@@ -9,6 +9,9 @@ int hmx_manager_reset();
 
 void hmx_manager_enable_execution(); // enable HMX execution for current thread
 void hmx_manager_disable_execution(); // disable HMX execution for current thread
+int hmx_manager_get_last_lock_result();
+int hmx_manager_get_context_id();
+void * hmx_manager_get_worker_pool();
 
 void hmx_unit_acquire();
 void hmx_unit_release();

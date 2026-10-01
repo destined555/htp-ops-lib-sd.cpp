@@ -79,7 +79,24 @@ struct MatMulParams {
   int32_t m;
   int32_t k;
   int32_t n;
+  // These fields are part of the wire ABI even when host-side tracing is
+  // disabled. The DSP skeleton may enable tracing independently.
+  uint64_t debug_vtcm_base;
+  uint32_t debug_vtcm_size;
+  int32_t  debug_vtcm_ctx;
+  int32_t  debug_hmx_ctx;
+  uint64_t debug_worker_pool;
+  int32_t  debug_hmx_lock_result;
+  uint64_t debug_dsp_activation_hash;
+  uint64_t debug_dsp_output_hash;
+  uint64_t debug_dsp_output_hash_after_invalidate;
 } __attribute__((packed));
+
+#ifdef __cplusplus
+static_assert(sizeof(MatMulParams) == 92);
+#else
+_Static_assert(sizeof(struct MatMulParams) == 92, "MatMulParams size changed");
+#endif
 
 struct QkvMulRmsPackedParams {
   struct RpcmemBufAddr q;

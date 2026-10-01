@@ -27,6 +27,44 @@ static inline double rand_01() {
   return ((double) rand()) / RAND_MAX;
 }
 
+static int test_compute_channel_enabled(void *channel) {
+  // AEE_EOFFSET is 0 on Android hosts and 0x80000400 on Hexagon.
+  const uint32_t dsp_bad_state = 0x8000040dU;
+  struct MessageHeader *msg = (struct MessageHeader *) channel;
+  struct RequestHeader req_hdr = {
+    .state = 0,
+    .type = REQUEST_TYPE_OP_COMPUTE,
+  };
+  struct OpComputeRequest compute_req = {
+    .op = HTP_OPS_COUNT,
+  };
+  const size_t req_size = sizeof(req_hdr) + sizeof(compute_req);
+
+  msg->state.d = 0;
+  msg->n_reqs = 1;
+  msg->req_offsets[0] = message_header_size(msg);
+  msg->req_offsets[1] = msg->req_offsets[0] + req_size;
+
+  uint8_t *p = (uint8_t *) message_header_get_request_ptr(msg, 0);
+  memcpy(p, &req_hdr, sizeof(req_hdr));
+  p += sizeof(req_hdr);
+  memcpy(p, &compute_req, sizeof(compute_req));
+
+  msg->state.v[0] = 1;
+  while (msg->state.v[1] != 1) {
+    usleep(10);
+  }
+
+  const int32_t state = message_header_get_request_ptr(msg, 0)->state;
+  if ((uint32_t) state == dsp_bad_state) {
+    fprintf(stderr, "multi-session lease compute probe remained mapping-only: 0x%x\n", (uint32_t) state);
+    return -1;
+  }
+  fprintf(stderr, "multi-session lease compute probe reached executor: state=0x%x\n",
+          (uint32_t) state);
+  return 0;
+}
+
 // assert p_buf, p_fd and size are always valid
 int alloc_shared_mem_buf(void **p_buf, int *p_fd, size_t size) {
   void *buf = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, size);
@@ -56,6 +94,76 @@ int alloc_shared_mem_buf(void **p_buf, int *p_fd, size_t size) {
 void free_shared_mem_buf(void *buf, int fd, size_t size) {
   fastrpc_munmap(CDSP_DOMAIN_ID, fd, buf, size);
   rpcmem_free(buf);
+}
+
+static int test_multi_session_lifecycle(void) {
+  htp_ops_session *session = NULL;
+  int err = htp_ops_session_open(&session, CDSP_DOMAIN_ID, NULL, 1);
+  if (err != 0 || session == NULL) {
+    fprintf(stderr, "multi-session open failed: %d\n", err);
+    return -1;
+  }
+
+  const int domain = (int) htp_ops_session_domain(session);
+  fprintf(stderr, "multi-session lifecycle: id=%u domain=%d\n",
+          htp_ops_session_id(session), domain);
+  err = htp_ops_session_init_backend(session);
+  if (err != 0) {
+    htp_ops_session_close(session);
+    return -1;
+  }
+
+  /* The legacy op exports must follow the same active session as the
+   * explicit session API.  This is the regression probe for handle routing. */
+  if (htp_ops_set_active_session(session) != 0 ||
+      get_global_handle() != htp_ops_session_handle(session)) {
+    fprintf(stderr, "multi-session active handle did not select reserved session\n");
+    (void) htp_ops_set_default_session();
+    htp_ops_session_close(session);
+    return -1;
+  }
+  if (htp_ops_set_default_session() != 0 ||
+      get_global_handle() == htp_ops_session_handle(session)) {
+    fprintf(stderr, "multi-session active handle did not restore default session\n");
+    htp_ops_session_close(session);
+    return -1;
+  }
+
+  const size_t size = 4096;
+  void * buffer = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, size);
+  int fd = buffer != NULL ? rpcmem_to_fd(buffer) : -1;
+  if (buffer == NULL || fd < 0 || fastrpc_mmap(domain, fd, buffer, 0, size, FASTRPC_MAP_FD) != 0) {
+    if (buffer != NULL) {
+      rpcmem_free(buffer);
+    }
+    htp_ops_session_close(session);
+    return -1;
+  }
+
+  err = htp_ops_session_create_channel(session, fd, (unsigned int) size);
+  if (err == 0 && getenv("HTP_MULTI_SESSION_LEASE_TEST") != NULL) {
+    fprintf(stderr, "multi-session lease: releasing default backend\n");
+    err = release_htp_backend();
+    if (err == 0) {
+      fprintf(stderr, "multi-session lease: acquiring reserved backend\n");
+      err = htp_ops_session_acquire_backend(session);
+    }
+    if (err == 0) {
+      err = test_compute_channel_enabled(buffer);
+    }
+    if (err == 0) {
+      fprintf(stderr, "multi-session lease: releasing reserved backend\n");
+      err = htp_ops_session_release_backend(session);
+    }
+    if (err == 0) {
+      fprintf(stderr, "multi-session lease: reacquiring default backend\n");
+      init_htp_backend();
+    }
+  }
+  htp_ops_session_close(session);
+  fastrpc_munmap(domain, fd, buffer, size);
+  rpcmem_free(buffer);
+  return err;
 }
 
 static void rms_norm_f32_ref(float *dst, const float *src, int ne0, int ne1) {
@@ -2126,6 +2234,14 @@ int main(int argc, char **argv) {
   }
 
   init_htp_backend();
+
+  if (getenv("HTP_MULTI_SESSION_LIFECYCLE_TEST") != NULL) {
+    err = test_multi_session_lifecycle();
+    if (err != 0) {
+      fprintf(stderr, "multi-session lifecycle test failed\n");
+      goto skip1;
+    }
+  }
 
   // test_mat_mul_rpc(get_global_handle());
 

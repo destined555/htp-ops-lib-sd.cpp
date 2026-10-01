@@ -15,7 +15,7 @@ int      vtcm_mgr_ctx_id = 0;
 
 extern "C" {
 
-int vtcm_manager_setup() {
+static int vtcm_manager_setup_impl(unsigned int numerator, unsigned int denominator) {
   using namespace vtcm_manager;
 
   int err;
@@ -47,7 +47,20 @@ int vtcm_manager_setup() {
     FARF(ERROR, "%s: no VTCM is currently available", __func__);
     return -1;
   }
-  FARF(ALWAYS, "available VTCM size: %u KiB, total VTCM size: %u KiB", avail_size / 1024, total_size / 1024);
+  unsigned int request_size = avail_size;
+  if (denominator != 0 && numerator != 0) {
+    const uint64_t requested = (uint64_t) total_size * numerator / denominator;
+    request_size = requested > UINT32_MAX ? UINT32_MAX : (unsigned int) requested;
+    if (request_size > avail_size) {
+      request_size = avail_size;
+    }
+  }
+  if (request_size == 0) {
+    FARF(ERROR, "%s: computed VTCM request is zero", __func__);
+    return -1;
+  }
+  FARF(ALWAYS, "available VTCM size: %u KiB, total VTCM size: %u KiB, request: %u KiB",
+       avail_size / 1024, total_size / 1024, request_size / 1024);
 
   compute_res_attr_t req;
   err = HAP_compute_res_attr_init(&req);
@@ -56,16 +69,16 @@ int vtcm_manager_setup() {
     return -1;
   }
 
-  err = HAP_compute_res_attr_set_vtcm_param(&req, avail_size, 1);
+  err = HAP_compute_res_attr_set_vtcm_param(&req, request_size, 1);
   if (err) {
-    FARF(ERROR, "%s: failed to request %u VTCM bytes in one page, return code 0x%x", __func__, avail_size, err);
+    FARF(ERROR, "%s: failed to request %u VTCM bytes in one page, return code 0x%x", __func__, request_size, err);
     return -1;
   }
-  FARF(ALWAYS, "%s: requesting %u VTCM bytes in one page", __func__, avail_size);
+  FARF(ALWAYS, "%s: requesting %u VTCM bytes in one page", __func__, request_size);
 
   const int new_ctx_id = HAP_compute_res_acquire(&req, 10000);  // timeout 10ms
   if (new_ctx_id == 0) {
-    FARF(ERROR, "%s: HAP_compute_res_acquire failed for %u VTCM bytes", __func__, avail_size);
+    FARF(ERROR, "%s: HAP_compute_res_acquire failed for %u VTCM bytes", __func__, request_size);
     return -1;
   }
 
@@ -82,10 +95,18 @@ int vtcm_manager_setup() {
 
   vtcm_mgr_ctx_id = new_ctx_id;
   vtcm_base       = acquired_base;
-  vtcm_size       = avail_size;
+  vtcm_size       = request_size;
   memset(vtcm_base, 0, vtcm_size);
   FARF(ALWAYS, "%s: acquired %u VTCM bytes", __func__, (unsigned int) vtcm_size);
   return 0;
+}
+
+int vtcm_manager_setup() {
+  return vtcm_manager_setup_impl(0, 0);
+}
+
+int vtcm_manager_setup_fraction(unsigned int numerator, unsigned int denominator) {
+  return vtcm_manager_setup_impl(numerator, denominator);
 }
 
 int vtcm_manager_reset() {
@@ -110,5 +131,9 @@ void *vtcm_manager_get_vtcm_base() {
 
 size_t vtcm_manager_get_vtcm_size() {
   return vtcm_manager::vtcm_size;
+}
+
+int vtcm_manager_get_context_id() {
+  return vtcm_manager::vtcm_mgr_ctx_id;
 }
 }

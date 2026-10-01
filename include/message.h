@@ -36,6 +36,30 @@ struct RpcmemMapRequest {
   int32_t fds[0];
 } __attribute__((packed));
 
+enum {
+  RPCMEM_MAP_REQUEST_VERSION_LEGACY = 1,
+  RPCMEM_MAP_REQUEST_VERSION_SESSION = 2,
+  RPCMEM_MAP_REQUEST_SESSION_MAGIC = 0x32504d52u,
+};
+
+struct RpcmemMapEntryV2 {
+  int32_t  fd;
+  uint32_t role;
+  uint64_t offset;
+  uint64_t size;
+  uint64_t producer_epoch;
+} __attribute__((packed));
+
+struct RpcmemMapRequestV2 {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t header_size;
+  uint64_t session_token;
+  int32_t  n_puts;
+  int32_t  n_gets;
+  struct RpcmemMapEntryV2 entries[0];
+} __attribute__((packed));
+
 struct OpComputeRequest {
   uint32_t op;
   uint8_t  payload[0];
