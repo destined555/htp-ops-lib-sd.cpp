@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "dsp/dma_utils.h"
+#include "dsp/f16_gemm_plan.h"
 #include "dsp/hmx_mgr.h"
 #include "dsp/hmx_utils.h"
 #include "dsp/hvx_convert.h"
@@ -937,28 +938,24 @@ int hmx_mat_mul_f16_epilogue(float *restrict dst, const float *restrict activati
     return -12;
   }
 
-  const size_t weight_area_size     = WEIGHT_AREA_SIZE;
-  const size_t activation_area_size = ACTIVATION_AREA_SIZE;
-  const size_t output_area_size     = OUTPUT_AREA_SIZE;
+  const size_t scratch_size = mode == 3 ? 4096 * smax(1, num_workers) : 0;
+  f16_gemm_plan_t plan;
+  if (!f16_gemm_make_plan(m, k, n, vtcm_manager_get_vtcm_size(), 256 + scratch_size, &plan)) {
+    return -14;
+  }
 
   // VTCM layout: weight | activation | output | scales
   uint8_t *vtcm_ptr        = (uint8_t *) vtcm_manager_get_vtcm_base();
-  __fp16  *vtcm_weight     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, weight_area_size);
-  __fp16  *vtcm_activation = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, activation_area_size);
-  __fp16  *vtcm_output     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size);
+  __fp16  *vtcm_weight     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, plan.weight_bytes);
+  __fp16  *vtcm_activation = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, plan.activation_bytes);
+  __fp16  *vtcm_output     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, plan.output_bytes);
   __fp16  *vtcm_scales     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
 
-  float *transpose_scratch = mode==3 ? (float *)vtcm_seq_alloc(&vtcm_ptr,4096*smax(1,num_workers)) : NULL;
+  float *transpose_scratch = mode==3 ? (float *)vtcm_seq_alloc(&vtcm_ptr,scratch_size) : NULL;
 
   hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));  // fp16: 1.0
 
-  size_t vec_dot_size       = k * sizeof(__fp16);
-  size_t m_chunk_max_n_rows = align_down(activation_area_size / vec_dot_size, HMX_FP16_TILE_N_ROWS);
-  size_t n_chunk_max_n_cols = align_down(weight_area_size / vec_dot_size, HMX_FP16_TILE_N_COLS);
-
-  size_t m_chunk_n_rows = 0, n_chunk_n_cols = 0;
-  find_chunk_size(m_chunk_max_n_rows, n_chunk_max_n_cols, output_area_size / sizeof(__fp16), HMX_FP16_TILE_N_ROWS,
-                  HMX_FP16_TILE_N_COLS, &m_chunk_n_rows, &n_chunk_n_cols);
+  const size_t m_chunk_n_rows = plan.rows, n_chunk_n_cols = plan.cols;
 
   // FARF(ALWAYS, "computed chunk size: %d, %d", m_chunk_n_rows, n_chunk_n_cols);
   assert(m_chunk_n_rows > 0 && n_chunk_n_cols > 0);
@@ -2170,60 +2167,113 @@ int mat_mul_qk_0_d16a32_out_stationary(float *restrict out, const float *restric
   worker_pool_deinit(&fetch_task_worker_pool_ctx);
   return 0;
 }
-// Native convolution: gather directly from NCHW DDR into bounded VTCM tiles.
+// Pack one spatial x K tile directly into the interleaved FP16 HMX layout.
+// Each worker owns a private 4 KiB scratch tile; no full F32 im2col is materialized.
 typedef struct {
   worker_synctoken_t sync; unsigned next;
-  float *tile; const float *input; const struct NativeConvParams *p;
-  int mr, rows, padded_rows, stride;
+  __fp16 *activation; HVX_Vector *scratch;
+  const float *input; const struct NativeConvParams *p;
+  int mr, rows, padded_rows;
 } conv_gather_job;
+
+static void conv_pack_transpose(HVX_Vector *m, HVX_Vector *out) {
+  // Keep the first three butterfly stages in registers, rather than
+  // repeatedly writing full intermediate matrices to VTCM.
+  for(int g=0;g<32;g+=8) {
+    HVX_Vector *v=m+g;
+    HVX_VectorPair a0=Q6_W_vshuff_VVR(v[1],v[0],-4);
+    HVX_VectorPair a1=Q6_W_vshuff_VVR(v[3],v[2],-4);
+    HVX_VectorPair a2=Q6_W_vshuff_VVR(v[5],v[4],-4);
+    HVX_VectorPair a3=Q6_W_vshuff_VVR(v[7],v[6],-4);
+    HVX_VectorPair b0=Q6_W_vshuff_VVR(Q6_V_lo_W(a1),Q6_V_lo_W(a0),-8);
+    HVX_VectorPair b1=Q6_W_vshuff_VVR(Q6_V_hi_W(a1),Q6_V_hi_W(a0),-8);
+    HVX_VectorPair b2=Q6_W_vshuff_VVR(Q6_V_lo_W(a3),Q6_V_lo_W(a2),-8);
+    HVX_VectorPair b3=Q6_W_vshuff_VVR(Q6_V_hi_W(a3),Q6_V_hi_W(a2),-8);
+    HVX_VectorPair c0=Q6_W_vshuff_VVR(Q6_V_lo_W(b2),Q6_V_lo_W(b0),-16);
+    HVX_VectorPair c1=Q6_W_vshuff_VVR(Q6_V_hi_W(b2),Q6_V_hi_W(b0),-16);
+    HVX_VectorPair c2=Q6_W_vshuff_VVR(Q6_V_lo_W(b3),Q6_V_lo_W(b1),-16);
+    HVX_VectorPair c3=Q6_W_vshuff_VVR(Q6_V_hi_W(b3),Q6_V_hi_W(b1),-16);
+    v[0]=Q6_V_lo_W(c0);v[1]=Q6_V_hi_W(c0);
+    v[2]=Q6_V_lo_W(c1);v[3]=Q6_V_hi_W(c1);
+    v[4]=Q6_V_lo_W(c2);v[5]=Q6_V_hi_W(c2);
+    v[6]=Q6_V_lo_W(c3);v[7]=Q6_V_hi_W(c3);
+  }
+  for(int k=0;k<8;++k) {
+    HVX_VectorPair d0=Q6_W_vshuff_VVR(m[k+8],m[k],-32);
+    HVX_VectorPair d1=Q6_W_vshuff_VVR(m[k+24],m[k+16],-32);
+    HVX_VectorPair e0=Q6_W_vshuff_VVR(Q6_V_lo_W(d1),Q6_V_lo_W(d0),-64);
+    HVX_VectorPair e1=Q6_W_vshuff_VVR(Q6_V_hi_W(d1),Q6_V_hi_W(d0),-64);
+    // Pair spatial rows into the HMX halfword-interleaved layout.
+    out[2*k]=Q6_V_vor_VV(Q6_V_lo_W(e0),Q6_Vw_vasl_VwR(Q6_V_hi_W(e0),16));
+    out[2*k+1]=Q6_V_vor_VV(Q6_V_lo_W(e1),Q6_Vw_vasl_VwR(Q6_V_hi_W(e1),16));
+  }
+}
+
 static void conv_gather_worker(void *data,int worker_index) {
-  (void)worker_index;
   conv_gather_job *s=(conv_gather_job *)data; const struct NativeConvParams *p=s->p;
-  int32_t offsets[32] __attribute__((aligned(128)));
+  HVX_Vector *m=s->scratch+worker_index*32;
   float tail[32] __attribute__((aligned(128)));
-  for(int i=0;i<32;++i) offsets[i]=i*s->stride*4;
-  HVX_Vector index=vmem(offsets);
+  const HVX_Vector zero=Q6_V_vzero();
+  int ktiles=p->kp/32;
   for(;;) {
     unsigned block=__atomic_fetch_add(&s->next,1,__ATOMIC_RELAXED);
-    if(block*32>=(unsigned)p->kp) break;
-    for(unsigned col=block*32;col<(block+1)*32;++col) {
-    int kx=col%p->kw,ky=(col/p->kw)%p->kh,ci=col/(p->kw*p->kh);
+    if(block>=(unsigned)ktiles) break;
+    int kxs[32],kys[32],cis[32];
+    for(int j=0;j<32;++j) {
+      int col=block*32+j;
+      kxs[j]=(col%p->kw)*p->dx;kys[j]=((col/p->kw)%p->kh)*p->dy;
+      cis[j]=col/(p->kw*p->kh);
+    }
     for(int r=0;r<s->padded_rows;r+=32) {
       int pos=s->mr+r, ox=pos%p->ow,oy=pos/p->ow;
-      int ix=ox*p->sx-p->px+kx*p->dx,iy=oy*p->sy-p->py+ky*p->dy;
-      HVX_Vector val=Q6_V_vzero();
-      if(ci<p->ic && r+32<=s->rows && ox+32<=p->ow && p->sx==1 && p->upscale==1 &&
-         ix>=0 && ix+32<=p->iw && iy>=0 && iy<p->ih) {
-        val=vmemu(s->input+((size_t)ci*p->ih+iy)*p->iw+ix);
-      } else if(ci<p->ic && r+32<=s->rows && ox+32<=p->ow) {
-        // Border vectors share the same source row. Avoid 32 dynamic integer
-        // divisions per K column, including the common nearest-upsample case.
-        memset(tail,0,sizeof(tail));
-        if(iy>=0 && iy<p->ih*p->upscale) {
-          const float *plane=s->input+((size_t)ci*p->ih+(p->upscale==2?iy>>1:iy))*p->iw;
-          if(p->sx==1 && p->upscale==1) {
-            int first=ix<0?-ix:0, last=p->iw-ix<32?p->iw-ix:32;
-            if(last>first) memcpy(tail+first,plane+ix+first,(last-first)*4);
-          } else for(int j=0;j<32;++j) {
-            int x=ix+j*p->sx;
-            if(x>=0 && x<p->iw*p->upscale) tail[j]=plane[p->upscale==2?x>>1:x];
+      for(int j=0;j<32;++j) {
+        int kx=kxs[j],ky=kys[j],ci=cis[j];
+        int ix=ox*p->sx-p->px+kx,iy=oy*p->sy-p->py+ky;
+        HVX_Vector val=Q6_V_vzero();
+        if(ci<p->ic && r+32<=s->rows && ox+32<=p->ow && p->sx==1 && p->upscale==1 &&
+           ix>=0 && ix+32<=p->iw && iy>=0 && iy<p->ih) {
+          val=vmemu(s->input+((size_t)ci*p->ih+iy)*p->iw+ix);
+        } else if(ci<p->ic && r+32<=s->rows && ox+32<=p->ow && p->sx==1 && p->upscale==2 &&
+                  ix>=0 && ix+32<=2*p->iw && iy>=0 && iy<2*p->ih) {
+          const float *plane=s->input+((size_t)ci*p->ih+(iy>>1))*p->iw;
+          int first=ix>>1;
+          HVX_Vector src;
+          if(first+32<=p->iw) src=vmemu(plane+first);
+          else {
+            memset(tail,0,sizeof(tail));
+            memcpy(tail,plane+first,(16+(ix&1))*sizeof(float));
+            src=vmem(tail);
           }
+          HVX_VectorPair dup=Q6_W_vshuff_VVR(src,src,-4);
+          val=(ix&1)?Q6_V_valign_VVR(Q6_V_hi_W(dup),Q6_V_lo_W(dup),4):Q6_V_lo_W(dup);
+        } else if(ci<p->ic && r+32<=s->rows && ox+32<=p->ow) {
+          // Border vectors share the same source row. Avoid 32 dynamic integer
+          // divisions per K column, including the common nearest-upsample case.
+          memset(tail,0,sizeof(tail));
+          if(iy>=0 && iy<p->ih*p->upscale) {
+            const float *plane=s->input+((size_t)ci*p->ih+(p->upscale==2?iy>>1:iy))*p->iw;
+            if(p->sx==1 && p->upscale==1) {
+              int first=ix<0?-ix:0, last=p->iw-ix<32?p->iw-ix:32;
+              if(last>first) memcpy(tail+first,plane+ix+first,(last-first)*4);
+            } else for(int j=0;j<32;++j) {
+              int x=ix+j*p->sx;
+              if(x>=0 && x<p->iw*p->upscale) tail[j]=plane[p->upscale==2?x>>1:x];
+            }
+          }
+          val=vmem(tail);
+        } else if(ci<p->ic) {
+          for(int j=0;j<32;++j) {
+            int t=s->mr+r+j,x=(t%p->ow)*p->sx-p->px+kx,y=(t/p->ow)*p->sy-p->py+ky;
+            tail[j]=(r+j<s->rows && x>=0 && x<p->iw*p->upscale && y>=0 && y<p->ih*p->upscale) ?
+              s->input[((size_t)ci*p->ih+y/p->upscale)*p->iw+x/p->upscale] : 0.f;
+          }
+          val=vmem(tail);
         }
-        val=vmem(tail);
-      } else if(ci<p->ic) {
-        for(int j=0;j<32;++j) {
-          int t=s->mr+r+j,x=(t%p->ow)*p->sx-p->px+kx*p->dx,y=(t/p->ow)*p->sy-p->py+ky*p->dy;
-          tail[j]=(r+j<s->rows && x>=0 && x<p->iw*p->upscale && y>=0 && y<p->ih*p->upscale) ?
-            s->input[((size_t)ci*p->ih+y/p->upscale)*p->iw+x/p->upscale] : 0.f;
-        }
-        val=vmem(tail);
+        m[j]=hvx_my_wsf_to_vhf(zero,val);
       }
-      float *base=s->tile+(size_t)r*s->stride+col;
-      Q6_vscatter_RMVwV((size_t)base,(32*s->stride-col)*4-1,index,val);
-    }
+      conv_pack_transpose(m,(HVX_Vector *)(s->activation+((size_t)(r/32)*ktiles+block)*1024));
     }
   }
-  asm volatile("vmem(%0 + #0):scatter_release" :: "r"(s->tile) : "memory");
   worker_pool_synctoken_jobdone(&s->sync);
 }
 int hmx_conv2d_nchw_f16(float *dst,const float *input,const __fp16 *weight,const float *bias,struct NativeConvParams *p) {
@@ -2231,10 +2281,8 @@ int hmx_conv2d_nchw_f16(float *dst,const float *input,const __fp16 *weight,const
   size_t total=vtcm_manager_get_vtcm_size();
   size_t reserved=WEIGHT_AREA_SIZE+OUTPUT_AREA_SIZE+256+4096*smax(1,num_workers);
   if(total<=reserved) return -20;
-  // Skew rows by one float so a 32-lane gather visits distinct VTCM
-  // banks, rather than serializing every lane at a K-multiple-of-32 stride.
-  int stride=p->kp+1;
-  int mrmax=align_down((total-reserved-2048)/(6*p->kp+4),32);
+  // Only the final FP16 activation occupies the spatial chunk allocation.
+  int mrmax=align_down((total-reserved)/(2*p->kp),32);
   mrmax=smin(mrmax,1024);
   int ncmax=align_down(WEIGHT_AREA_SIZE/(2*p->kp),32);
   if(mrmax<32 || ncmax<32) return -21;
@@ -2245,7 +2293,6 @@ int hmx_conv2d_nchw_f16(float *dst,const float *input,const __fp16 *weight,const
   __fp16 *o=(__fp16 *)vtcm_seq_alloc(&vp,OUTPUT_AREA_SIZE);
   // HMX tile addresses must be 2 KiB aligned; allocate all tile matrices
   // before the 256-byte scales area (HMX otherwise drops low address bits).
-  float *tile=(float *)vtcm_seq_alloc(&vp,align_up((size_t)mrmax*stride*4,2048));
   __fp16 *a=(__fp16 *)vtcm_seq_alloc(&vp,(size_t)mrmax*p->kp*2);
   __fp16 *scales=(__fp16 *)vtcm_seq_alloc(&vp,256);
   float *scratch=(float *)vtcm_seq_alloc(&vp,4096*smax(1,num_workers));
@@ -2255,17 +2302,12 @@ int hmx_conv2d_nchw_f16(float *dst,const float *input,const __fp16 *weight,const
   for(int batch=0;batch<p->batch;++batch) for(int mr=0;mr<spatial;mr+=mrmax) {
     int rows=smin(mrmax,spatial-mr),padded=align_up(rows,32);
     uint64_t tick=HAP_perf_get_qtimer_count();
-    conv_gather_job state={.next=0,.tile=tile,.input=input+(size_t)batch*p->iw*p->ih*p->ic,.p=p,.mr=mr,.rows=rows,.padded_rows=padded,.stride=stride};
+    conv_gather_job state={.next=0,.activation=a,.scratch=(HVX_Vector *)scratch,.input=input+(size_t)batch*p->iw*p->ih*p->ic,.p=p,.mr=mr,.rows=rows,.padded_rows=padded};
     worker_pool_synctoken_init(&state.sync,workers);
     worker_pool_job_t job={.fptr=conv_gather_worker,.dptr=&state};
     int fail=0;
     for(int i=0;i<workers;++i) if(worker_pool_submit(NULL,job)!=AEE_SUCCESS) {worker_pool_synctoken_jobdone(&state.sync);fail=1;}
     worker_pool_synctoken_wait(&state.sync);if(fail) return -23;
-    for(int r=0;r<padded;r+=2) for(int c=0;c<p->kp;c+=32) {
-      HVX_Vector v0=vmemu(tile+(size_t)r*stride+c),v1=vmemu(tile+(size_t)(r+1)*stride+c);
-      HVX_Vector *out=(HVX_Vector *)(a+((r/32)*(p->kp/32)+c/32)*1024);
-      out[(r%32)/2]=hvx_my_wsf_to_vhf(v1,v0);
-    }
     gather_t+=HAP_perf_get_qtimer_count()-tick;
     for(int nc=0;nc<p->np;nc+=ncmax) {
       int cols=smin(ncmax,p->np-nc);

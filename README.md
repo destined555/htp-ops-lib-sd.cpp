@@ -42,6 +42,13 @@ These two dynamic link libraries will be used later; please refer to the instruc
 
 ## Fused FP16 GEMM epilogues
 
+Packed FP16 GEMM chooses its activation, weight and output chunks from the
+session's actual VTCM allocation. It retains the full K extent, favors fewer
+weight scans, and reserves column scales and per-worker epilogue scratch before
+planning tiles. This applies to ordinary GEMM and fused epilogues without a
+weight-format or message-ABI change. If even one full-K 32x32 block does not fit,
+the operator returns an error instead of using an empty chunk or overrunning VTCM.
+
 Shared-message opcode 16 adds an optional native epilogue to the existing
 W16A32 HMX core: bias, GELU, QuickGELU, or cropped channel-major convolution
 output. The 56-byte `F16EpilogueParams` wire contract is shared with sd.cpp.
