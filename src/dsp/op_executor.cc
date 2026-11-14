@@ -310,6 +310,46 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
        (unsigned) payload_size);
 #endif
   switch (req->op) {
+    case HTP_OPS_MAT_MUL_NATIVE_W8A8:
+      {
+        if (payload_size != sizeof(NativeW8A8Params) && payload_size != sizeof(NativeW8A8ProfileParams) &&
+            payload_size != sizeof(NativeW8A8CpuParams)) return -1;
+        auto *params = reinterpret_cast<NativeW8A8Params *>(req->payload);
+        const int m = params->m, k = params->k, n = params->n;
+        if (m < 1 || m > 4096 || k < 32 || k > 6144 || k%32 || n < 64 || n > 16384 || n%64) return -1;
+        const size_t constants_size = 128u+(size_t)k*n+(size_t)n*8+(size_t)k*4;
+        add_buffer(out_bufs, params->output, (size_t)m*n*4);
+        add_buffer(in_bufs, params->activation, (size_t)m*k*4);
+        add_buffer(in_bufs, params->constants, constants_size);
+        const bool cpu_output = payload_size == sizeof(NativeW8A8CpuParams);
+        if (cpu_output) add_buffer(in_bufs, reinterpret_cast<NativeW8A8CpuParams *>(req->payload)->control,
+                                  sizeof(W8A8CpuControl), false);
+        if (!OUT_PTR(0) || !IN_PTR(0) || !IN_PTR(1)) return -2;
+        if (cpu_output && !IN_PTR(2)) return -2;
+        validate_in_bufs();
+        const auto *header = reinterpret_cast<const W8A8Header *>(IN_PTR(1));
+        if (header->magic != 0x38574d48 || header->version != 1 || header->k != (unsigned)k ||
+            header->n != (unsigned)n || header->weight_offset != 128 ||
+            header->scale_offset != 128u+(size_t)k*n || header->sum_offset != header->scale_offset+(size_t)n*4 ||
+            header->inverse_offset != header->sum_offset+(size_t)n*4 || header->bytes != constants_size) return -3;
+        NativeW8A8Profile profile{};
+        const bool profiled = payload_size == sizeof(NativeW8A8ProfileParams);
+        if (profiled) {
+          std::memcpy(&profile, req->payload+sizeof(NativeW8A8Params), sizeof(profile));
+          if (profile.mode != 1 && profile.mode != 2 && profile.mode != 3) return -1;
+        }
+        uint64_t start = HAP_perf_get_qtimer_count();
+        ret = cpu_output
+            ? hmx_mat_mul_native_w8a8_cpu((float *)OUT_PTR(0), (const float *)IN_PTR(0), (const uint8_t *)IN_PTR(1),
+                                        m, k, n, (W8A8CpuControl *)IN_PTR(2))
+            : profiled
+            ? hmx_mat_mul_native_w8a8_profiled((float *)OUT_PTR(0), (const float *)IN_PTR(0), (const uint8_t *)IN_PTR(1), m, k, n, &profile)
+            : hmx_mat_mul_native_w8a8((float *)OUT_PTR(0), (const float *)IN_PTR(0), (const uint8_t *)IN_PTR(1), m, k, n);
+        params->elapsed_us = (int32_t)((HAP_perf_get_qtimer_count()-start)/19.2);
+        if (profiled) std::memcpy(req->payload+sizeof(NativeW8A8Params), &profile, sizeof(profile));
+        if (!cpu_output) validate_out_bufs();
+      }
+      break;
     case HTP_OPS_RMS_NORM_F32:
       {
         if (payload_size < sizeof(RmsNormF32Params)) {
@@ -376,7 +416,13 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
 #ifdef HTP_OPS_OP_TRACE
         params->debug_dsp_activation_hash = debug_hash_bytes(IN_PTR(0), activation_size);
 #endif
+        const bool profile_linear = payload_size >= sizeof(MatMulProfileParams);
+        const uint64_t linear_start = profile_linear ? HAP_perf_get_qtimer_count() : 0;
         ret = hmx_mat_mul_permuted_w16a32((float *) OUT_PTR(0), (float *) IN_PTR(0), (__fp16 *) IN_PTR(1), m, k, n);
+        if (profile_linear) {
+          reinterpret_cast<MatMulProfileParams *>(req->payload)->elapsed_us =
+              (int32_t)((HAP_perf_get_qtimer_count()-linear_start)/19.2);
+        }
         validate_out_bufs();
 #ifdef HTP_OPS_OP_TRACE
         params->debug_dsp_output_hash = debug_hash_bytes(OUT_PTR(0), output_size);

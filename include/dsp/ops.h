@@ -17,6 +17,14 @@ extern "C" {
 
 int hvx_rms_norm_f32(float *restrict dst, const float *restrict src, int ne0, int ne1);
 
+int hmx_mat_mul_native_w8a8(float *dst, const float *activation, const uint8_t *constants, int m, int k, int n);
+struct NativeW8A8Profile;
+struct W8A8CpuControl;
+int hmx_mat_mul_native_w8a8_cpu(float *dst, const float *activation, const uint8_t *constants,
+                               int m, int k, int n, struct W8A8CpuControl *control);
+int hmx_mat_mul_native_w8a8_profiled(float *dst, const float *activation, const uint8_t *constants,
+                                   int m, int k, int n, struct NativeW8A8Profile *profile);
+
 int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *activation, const __fp16 *permuted_weight, int m,
                                 int k, int n);
 int hmx_qkv_mul_rms_packed_w16a32(

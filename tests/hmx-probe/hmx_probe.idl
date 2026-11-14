@@ -1,0 +1,15 @@
+#include "AEEStdDef.idl"
+#include "remote.idl"
+interface hmx_probe : remote_handle64 {
+    AEEResult run(in int32 mode, in int32 activation_fill, in int32 weight_fill,
+                 in uint32 bias_fill, in uint32 bias_high, rout sequence<uint8> output);
+    AEEResult tile(in sequence<uint8> activation, in sequence<uint8> weight,
+                  in int32 kind, in int32 activation_limit, in int32 weight_limit,
+                  in int32 convert, in int32 store, in int32 repeats,
+                  in uint32 bias_low, in uint32 bias_high, rout sequence<uint8> output);
+    AEEResult bench(in int32 kind, in int32 k_tiles, in int32 iterations,
+                   rout sequence<uint8> output);
+    AEEResult study(in int32 kind, in int32 columns, in int32 k_tiles,
+                   in int32 epilogue, in int32 seed, in int32 iterations,
+                   rout sequence<uint8> output);
+};

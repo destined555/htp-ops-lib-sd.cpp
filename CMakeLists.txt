@@ -8,6 +8,7 @@ option(HTP_ATTN_METRICS "Collect DDR->VTCM read accounting in sparse attention c
 option(HTP_OPS_MMAP_TRACE "Trace DSP-side RPCMEM mapping lifecycle" OFF)
 option(HTP_OPS_OP_TRACE "Trace DSP-side op input/output mappings" OFF)
 option(HTP_OPS_FORCE_REMAP "Release DSP fd mappings after every op (diagnostic)" OFF)
+option(HTP_BUILD_HMX_PROBE "Build the isolated SDK HMX instruction probe" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -17,6 +18,7 @@ if(HEXAGON_SDK_ROOT)
 else()
     include(${HEXAGON_CMAKE_ROOT}/hexagon_fun.cmake)
 endif()
+
 set(ignoreVar ${DEPENDENCIES}${V})
 
 # NOTE(hzx): QAIC generated code are located in ${CMAKE_CURRENT_BINARY_DIR}
@@ -84,12 +86,16 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/flash_attn_sp_hdim.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/flash_attn.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/mat_mul.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/linear_w8a8.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/rms_norm.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/mm_benchmark.c
     )
     if(HTP_OPS_QUIET_BENCH)
         target_compile_definitions(htp_ops_skel PRIVATE HTP_OPS_QUIET_BENCH)
     endif()
+    # QFloat arithmetic works on v75 and later; inherit the selected DSP ISA.
+    set_source_files_properties(src/dsp/ops/linear_w8a8.c PROPERTIES
+        COMPILE_OPTIONS "-mhvx-qfloat;-ffp-contract=off")
     if(HTP_FUSED_ANCHOR_PROFILE)
         target_compile_definitions(htp_ops_skel PRIVATE HTP_FUSED_ANCHOR_PROFILE)
     endif()
@@ -111,6 +117,13 @@ else()
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mhmx")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mhmx")
 
+    # LLVM 21 can leave hint-directed loops rolled; keep the diagnostic without
+    # treating an optimization limitation as a compilation failure.
+    if(CMAKE_C_COMPILER_ID STREQUAL "Clang" AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 21)
+        set_source_files_properties(src/dsp/ops/flash_attn.c PROPERTIES
+            COMPILE_OPTIONS "-Wno-error=pass-failed")
+    endif()
+
     # Link C++ libraries
     target_link_libraries(htp_ops_skel ${HEXAGON_LIB_DIR}/${HEXAGON_ARCH}/G0/pic/libc++abi.so.1)
     target_link_libraries(htp_ops_skel ${HEXAGON_LIB_DIR}/${HEXAGON_ARCH}/G0/pic/libc++.so.1)
@@ -118,4 +131,8 @@ else()
     # Copy binaries from ship to CMAKE_CURRENT_BINARY_DIR folder
     copy_binaries(htp_ops_skel)
 
+endif()
+
+if(HTP_BUILD_HMX_PROBE)
+    add_subdirectory(tests/hmx-probe)
 endif()

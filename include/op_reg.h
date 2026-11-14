@@ -57,6 +57,7 @@ enum HtpOpsIndex {
      own, with the source either VTCM-resident, cache-hot or DDR-cold, so the
      rearrange floor can be separated from the exposed fetch time. */
   HTP_OPS_ATTN_REARRANGE_BENCH,
+  HTP_OPS_MAT_MUL_NATIVE_W8A8,
   HTP_OPS_COUNT,
 };
 
@@ -71,6 +72,77 @@ struct RmsNormF32Params {
   int32_t       ne0;
   int32_t       ne1;
 } __attribute__((packed));
+
+struct W8A8Header {
+  uint32_t magic, version, k, n;
+  uint32_t weight_offset, scale_offset, sum_offset, inverse_offset, bytes, reserved;
+  uint64_t original_f16_signature;
+  uint8_t padding[80];
+};
+
+struct NativeW8A8Params {
+  struct RpcmemBufAddr output, activation, constants;
+  int32_t m, k, n, elapsed_us;
+} __attribute__((packed));
+
+// Optional diagnostic trailer; the original 40-byte request remains valid.
+// Mode 1 times complete phases. Mode 2 adds per-tile barriers to separate
+// HMX accumulation and accumulator readout, and perturbs normal scheduling.
+// Mode 3 reports A64/W_N64 capacities and a table-hit bit in reserved,
+// weight load count/bytes in mac_ticks/readout_ticks; phase timings remain valid.
+struct NativeW8A8Profile {
+  uint32_t mode, reserved;
+  uint64_t setup_ticks, activation_ticks, weight_ticks, hmx_ticks, output_ticks;
+  uint64_t mac_ticks, readout_ticks;
+};
+struct NativeW8A8ProfileParams {
+  struct NativeW8A8Params base;
+  struct NativeW8A8Profile profile;
+} __attribute__((packed));
+
+// Opt-in CPU epilogue experiment. Raw planes occupy the normal output tensor;
+// only progress descriptors and activation scales need an auxiliary buffer.
+#define W8A8_CPU_MAX_BATCHES 64
+#define W8A8_CONTROL_WEIGHT_FIRST 1u
+struct W8A8CpuBatch {
+  int32_t m0, rows, n0, columns;
+};
+struct W8A8CpuControl {
+  uint32_t produced;
+  uint32_t flags;
+  uint32_t vtcm_bytes, activation_rows, weight_columns, weight_loads;
+  uint64_t weight_loaded_bytes;
+  uint32_t resident_batch_rows; // Requested M batch size, clamped to VTCM capacity.
+  uint8_t padding[92];
+  float scales[4096];
+  struct W8A8CpuBatch batches[W8A8_CPU_MAX_BATCHES];
+};
+struct NativeW8A8CpuParams {
+  struct NativeW8A8Params base;
+  struct RpcmemBufAddr control;
+} __attribute__((packed));
+
+#ifdef __cplusplus
+static_assert(sizeof(W8A8Header) == 128);
+static_assert(sizeof(NativeW8A8Params) == 40);
+static_assert(sizeof(NativeW8A8CpuParams) == 48);
+static_assert(sizeof(W8A8CpuControl) == 17536);
+static_assert(offsetof(W8A8CpuControl, scales) == 128);
+static_assert(offsetof(W8A8CpuControl, batches) == 16512);
+static_assert(sizeof(NativeW8A8Profile) == 64);
+static_assert(sizeof(NativeW8A8ProfileParams) == 104);
+static_assert(HTP_OPS_MAT_MUL_NATIVE_W8A8 == 15);
+#else
+_Static_assert(sizeof(struct W8A8Header) == 128, "W8A8 constants ABI changed");
+_Static_assert(sizeof(struct NativeW8A8Params) == 40, "W8A8 message ABI changed");
+_Static_assert(sizeof(struct NativeW8A8CpuParams) == 48, "W8A8 CPU message ABI changed");
+_Static_assert(sizeof(struct W8A8CpuControl) == 17536, "W8A8 CPU control ABI changed");
+_Static_assert(offsetof(struct W8A8CpuControl, scales) == 128, "W8A8 scale offset changed");
+_Static_assert(offsetof(struct W8A8CpuControl, batches) == 16512, "W8A8 batch offset changed");
+_Static_assert(sizeof(struct NativeW8A8Profile) == 64, "W8A8 profile ABI changed");
+_Static_assert(sizeof(struct NativeW8A8ProfileParams) == 104, "W8A8 profile request ABI changed");
+_Static_assert(HTP_OPS_MAT_MUL_NATIVE_W8A8 == 15, "W8A8 opcode changed");
+#endif
 
 struct MatMulParams {
   struct RpcmemBufAddr output;
@@ -94,6 +166,12 @@ struct MatMulParams {
 
 #ifdef __cplusplus
 static_assert(sizeof(MatMulParams) == 92);
+// Optional profiling trailer. The original 92-byte request remains supported.
+struct MatMulProfileParams {
+    MatMulParams matmul;
+    int32_t elapsed_us;
+} __attribute__((packed));
+static_assert(sizeof(MatMulProfileParams) == 96);
 #else
 _Static_assert(sizeof(struct MatMulParams) == 92, "MatMulParams size changed");
 #endif
