@@ -25,6 +25,8 @@ int hmx_mat_mul_native_w8a8_cpu(float *dst, const float *activation, const uint8
 int hmx_mat_mul_native_w8a8_profiled(float *dst, const float *activation, const uint8_t *constants,
                                    int m, int k, int n, struct NativeW8A8Profile *profile);
 
+int hmx_mat_mul_f16_epilogue(float *dst, const float *activation, const __fp16 *weight,
+                              const float *bias, int m, int k, int n, int channels, int mode);
 int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *activation, const __fp16 *permuted_weight, int m,
                                 int k, int n);
 int hmx_qkv_mul_rms_packed_w16a32(
@@ -559,6 +561,12 @@ int attn_rearrange_bench(const __fp16 *restrict src, int row_stride_bytes, int h
                          int iters, int rows_total, int variant_mask, int32_t *sum_us, int32_t *blocks,
                          int *workers);
 
+struct NativeAuxParams;
+int hvx_model_aux_f32(float *dst,const float *x,const float *w,const float *b,const struct NativeAuxParams *p);
+struct NativeConvParams;
+struct NativeAttentionParams;
+int hmx_conv2d_nchw_f16(float *dst,const float *input,const __fp16 *weight,const float *bias,struct NativeConvParams *p);
+int hmx_attention_f32(float *out,const float *q,const float *k,const float *v,const float *mask,const struct NativeAttentionParams *p);
 #ifdef __cplusplus
 }
 

@@ -36,3 +36,8 @@ int htp_ops_rpc_mat_mul_permuted_w16a32_trace_session(htp_ops_session *session, 
                                                m, k, n, (uint64 *) activation_hash, (uint64 *) output_hash,
                                                (uint64 *) output_hash_after_remap);
 }
+
+// Capability marker for the matched shared-message epilogue implementation.
+int htp_ops_f16_epilogue_version(void) { return 1; }
+
+int htp_ops_native_model_version(void) { return 1; }

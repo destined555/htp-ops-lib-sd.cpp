@@ -367,6 +367,93 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
       }
       break;
 
+    case HTP_OPS_MODEL_AUX_F32:
+      {
+        if(payload_size!=sizeof(NativeAuxParams)) return -1;
+        auto *p=reinterpret_cast<NativeAuxParams *>(req->payload);
+        if(p->count<=0||p->mode<0||p->mode>8||p->width<=0||p->channels<=0||p->spatial<=0||p->batch<=0) return -1;
+        if(p->mode==8 && (int64_t)p->width*p->spatial*p->batch!=p->count) return -1;
+        if(p->mode==2 && (p->groups<=0||p->channels%p->groups)) return -1;
+        int n=p->mode==2?p->channels:p->width;
+        if(p->mode<=2 && p->weight.fd>=0 && p->other_count!=n) return -1;
+        if((p->mode==3||p->mode==4) && (p->other_count<=0||p->count%p->other_count||p->weight.fd<0)) return -1;
+        add_buffer(out_bufs,p->output,(size_t)p->count*4);add_buffer(in_bufs,p->input,(size_t)p->count*4);
+        if(p->weight.fd>=0) add_buffer(in_bufs,p->weight,(size_t)p->other_count*4);
+        if(p->bias.fd>=0) add_buffer(in_bufs,p->bias,(size_t)n*4);
+        if(!OUT_PTR(0)||!IN_PTR(0)||(p->weight.fd>=0&&!IN_PTR(1))) return -1;
+        validate_in_bufs();uint64_t t0=HAP_perf_get_qtimer_count();
+        ret=hvx_model_aux_f32((float *)OUT_PTR(0),(const float *)IN_PTR(0),p->weight.fd>=0?(const float *)IN_PTR(1):nullptr,
+          p->bias.fd>=0?(const float *)IN_PTR(p->weight.fd>=0?2:1):nullptr,p);
+        p->elapsed_us=(HAP_perf_get_qtimer_count()-t0)/19.2;validate_out_bufs();
+      } break;
+    case HTP_OPS_CONV2D_NCHW_F16:
+      {
+        if(payload_size!=sizeof(NativeConvParams)) return -1;
+        auto *p=reinterpret_cast<NativeConvParams *>(req->payload);
+        if(p->iw<=0 || p->ih<=0 || p->ic<=0 || p->oc<=0 || p->batch<=0 || p->ow<=0 || p->oh<=0 ||
+           p->kw<=0 || p->kh<=0 || p->sx<=0 || p->sy<=0 || p->dx<=0 || p->dy<=0 ||
+           p->kp%32 || p->np%32 || p->np<p->oc || p->kp< (int64_t)p->kw*p->kh*p->ic ||
+           (p->upscale!=1&&p->upscale!=2) || p->ow!=(p->upscale*p->iw+2*p->px-p->dx*(p->kw-1)-1)/p->sx+1 ||
+           p->oh!=(p->upscale*p->ih+2*p->py-p->dy*(p->kh-1)-1)/p->sy+1) return -1;
+        size_t in_size=(size_t)p->iw*p->ih*p->ic*p->batch*4;
+        size_t out_size=(size_t)p->ow*p->oh*p->oc*p->batch*4;
+        if(in_size>INT32_MAX || out_size>INT32_MAX || (size_t)p->kp*p->np*2>INT32_MAX) return -1;
+        add_buffer(out_bufs,p->output,out_size);add_buffer(in_bufs,p->activation,in_size);
+        add_buffer(in_bufs,p->weight,(size_t)p->kp*p->np*2);
+        if(p->bias.fd>=0) add_buffer(in_bufs,p->bias,p->oc*4);
+        if(!OUT_PTR(0)||!IN_PTR(0)||!IN_PTR(1)||(p->bias.fd>=0&&!IN_PTR(2))) return -1;
+        validate_in_bufs();uint64_t t0=HAP_perf_get_qtimer_count();
+        ret=hmx_conv2d_nchw_f16((float *)OUT_PTR(0),(const float *)IN_PTR(0),(const __fp16 *)IN_PTR(1),
+            p->bias.fd>=0?(const float *)IN_PTR(2):nullptr,p);
+        p->elapsed_us=(HAP_perf_get_qtimer_count()-t0)/19.2;validate_out_bufs();
+      } break;
+    case HTP_OPS_ATTENTION_F32:
+      {
+        if(payload_size!=sizeof(NativeAttentionParams)) return -1;
+        auto *p=reinterpret_cast<NativeAttentionParams *>(req->payload);
+        if(p->queries<=0||p->keys<=0||p->heads<=0||p->dim<=0||p->dim%64||p->batch<=0) return -1;
+        size_t qs=(size_t)p->queries*p->heads*p->dim*p->batch*4,ks=(size_t)p->keys*p->heads*p->dim*p->batch*4;
+        if(qs>INT32_MAX||ks>INT32_MAX) return -1;
+        add_buffer(out_bufs,p->output,qs);add_buffer(in_bufs,p->q,qs);add_buffer(in_bufs,p->k,ks);add_buffer(in_bufs,p->v,ks);
+        if(p->mask.fd>=0) {
+          if((p->mask_heads!=1&&p->mask_heads!=p->heads)||(p->mask_batch!=1&&p->mask_batch!=p->batch)||p->mask_queries<p->queries) return -1;
+          size_t ms=(size_t)p->keys*p->mask_queries*p->mask_heads*p->mask_batch*4;if(ms>INT32_MAX) return -1;
+          add_buffer(in_bufs,p->mask,ms);
+        }
+        if(!OUT_PTR(0)||!IN_PTR(0)||!IN_PTR(1)||!IN_PTR(2)||(p->mask.fd>=0&&!IN_PTR(3))) return -1;
+        validate_in_bufs();uint64_t t0=HAP_perf_get_qtimer_count();
+        ret=hmx_attention_f32((float *)OUT_PTR(0),(const float *)IN_PTR(0),(const float *)IN_PTR(1),(const float *)IN_PTR(2),
+            p->mask.fd>=0?(const float *)IN_PTR(3):nullptr,p);
+        p->elapsed_us=(HAP_perf_get_qtimer_count()-t0)/19.2;validate_out_bufs();
+      } break;
+
+    case HTP_OPS_MAT_MUL_F16_EPILOGUE:
+      {
+        if (payload_size != sizeof(F16EpilogueParams)) return -1;
+        auto *p = reinterpret_cast<F16EpilogueParams *>(req->payload);
+        if (p->m<=0 || p->k<=0 || p->n<=0 || p->k%32 || p->n%32 ||
+            p->channels<=0 || p->channels>p->n || p->mode<0 || p->mode>3 ||
+            (p->mode!=3 && p->channels!=p->n)) return -1;
+        size_t out_size, act_size, weight_size;
+        if (!checked_size_mul((size_t)p->m,p->channels*sizeof(float),&out_size) ||
+            !checked_size_mul((size_t)p->m,p->k*sizeof(float),&act_size) ||
+            !checked_size_mul((size_t)p->k,p->n*sizeof(__fp16),&weight_size)) return -1;
+        add_buffer(out_bufs,p->output,out_size);
+        add_buffer(in_bufs,p->activation,act_size);
+        add_buffer(in_bufs,p->weight,weight_size);
+        if (p->bias.fd>=0) add_buffer(in_bufs,p->bias,p->channels*sizeof(float));
+        if (!OUT_PTR(0) || !IN_PTR(0) || !IN_PTR(1) ||
+            (p->bias.fd>=0 && !IN_PTR(2))) return -1;
+        validate_in_bufs();
+        uint64_t t0=HAP_perf_get_qtimer_count();
+        ret=hmx_mat_mul_f16_epilogue((float *)OUT_PTR(0),(const float *)IN_PTR(0),
+            (const __fp16 *)IN_PTR(1),p->bias.fd>=0 ? (const float *)IN_PTR(2) : nullptr,
+            p->m,p->k,p->n,p->channels,p->mode);
+        p->elapsed_us=(int32_t)((HAP_perf_get_qtimer_count()-t0)/19.2);
+        validate_out_bufs();
+      }
+      break;
+
     case HTP_OPS_MAT_MUL_PERMUTED_W16A32:
       {
         if (payload_size < sizeof(MatMulParams)) {

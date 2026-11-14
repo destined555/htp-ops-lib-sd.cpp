@@ -69,6 +69,7 @@ typedef struct {
   const __fp16      *Q, *K, *V, *mask;
   int                qo_len, kv_len, n_heads, n_kv_heads, head_dim;
   bool               with_lse;
+  bool additive; float scale; size_t mask_head_stride;
 } simple_fa_task_state_t;
 
 typedef struct {
@@ -2478,7 +2479,7 @@ void fa_f16_find_chunk_size(size_t *blk_r, size_t *blk_c, int gqa_factor, int he
 void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, __fp16 *restrict O,
                                 const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
                                 const __fp16 *restrict qk_mask, int qo_len, int kv_len, int n_heads, int n_kv_heads,
-                                int head_dim, bool with_lse, int worker_index) {
+                                int head_dim, bool with_lse, int worker_index, bool additive, float scale) {
   (void) worker_index;
 
   // "compile-time" configs
@@ -2553,7 +2554,7 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   // end VTCM allocation
   assert(vtcm_cur <= vtcm_limit);
 
-  float  qk_scale    = 1.0f / sqrtf(head_dim) * 1.44269504f;  // log2(e) = 1.44269504
+  float  qk_scale    = (additive ? scale : 1.0f / sqrtf(head_dim)) * 1.44269504f;  // log2(e) = 1.44269504
   __fp16 qk_scale_hf = (__fp16) qk_scale;                     // NOTE: this conversion can be very slow
 
   // NOTE: there are 32 effective elements in scales, use 4 bytes splat (not Q6_Vh_vsplat_R)
@@ -2787,7 +2788,11 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
                 HVX_Vector v_mask0 = vmemu(qk_mask + q_idx0 * kv_pad_len + k_idx);
                 HVX_Vector v_mask1 = vmemu(qk_mask + q_idx1 * kv_pad_len + k_idx);
 
-                const HVX_Vector v_fp16_mask_threshold = Q6_Vh_vsplat_R(0xcc00);  // fp16: -16.0
+                if (additive) {
+                  row_buffer0[c/64]=Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(row_buffer0[c/64],v_mask0));
+                  row_buffer1[c/64]=Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(row_buffer1[c/64],v_mask1));
+                }
+                const HVX_Vector v_fp16_mask_threshold = Q6_Vh_vsplat_R(additive ? 0xfc00 : 0xcc00);
 
                 q_mask_keep0 = Q6_Q_vcmp_gt_VhfVhf(v_mask0, v_fp16_mask_threshold);
                 q_mask_keep1 = Q6_Q_vcmp_gt_VhfVhf(v_mask1, v_fp16_mask_threshold);
@@ -3696,8 +3701,8 @@ void simple_flash_attn_worker(void *data, int worker_index) {
     }
 
     int kv_head_idx = task_id;
-    simple_flash_attn_f16_core(kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->mask, s->qo_len, s->kv_len,
-                               s->n_heads, s->n_kv_heads, s->head_dim, s->with_lse, worker_index);
+    simple_flash_attn_f16_core(kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->mask+kv_head_idx*s->mask_head_stride, s->qo_len, s->kv_len,
+                               s->n_heads, s->n_kv_heads, s->head_dim, s->with_lse, worker_index, s->additive, s->scale);
   }
 
   hmx_manager_disable_execution();
@@ -3750,6 +3755,7 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
   }
 
   simple_fa_task_state_t state;
+  state.additive=false;state.scale=0;state.mask_head_stride=0;
   state.O          = O;
   state.Q          = Q;
   state.K          = K;
@@ -10358,4 +10364,60 @@ int block_sparse_score(__fp16 *restrict score, const __fp16 *restrict q_mean, co
   }
 
   return 0;
+}
+
+// Convert contiguous FP32 vectors into conventional (not HMX tiled) FP16.
+static void native_f32_f16(__fp16 *dst,const float *src,size_t count) {
+  for(size_t i=0;i<count;i+=64) {
+    HVX_VectorPair v=Q6_W_vdeal_VVR(vmemu(src+i+32),vmemu(src+i),-4);
+    vmem(dst+i)=hvx_my_wsf_to_vhf(Q6_V_hi_W(v),Q6_V_lo_W(v));
+  }
+}
+int hmx_attention_f32(float *out,const float *q,const float *k,const float *v,const float *mask,const struct NativeAttentionParams *p) {
+  size_t kvcount=(size_t)p->keys*p->heads*p->dim;
+  size_t kpad=align_up(p->keys,64),qpad=align_up(p->queries,64);
+  int mh=mask?p->mask_heads:1;
+  size_t maskcount=kpad*qpad*mh;
+  if(kvcount>SIZE_MAX/4 || maskcount>SIZE_MAX/2) return -30;
+  __fp16 *kh=memalign(128,kvcount*2),*vh=memalign(128,kvcount*2),*maskh=memalign(128,maskcount*2);
+  if(!kh||!vh||!maskh) {free(kh);free(vh);free(maskh);return -31;}
+  int jobs=smin(num_workers,num_hvx128_contexts);
+  size_t slice=1024*1024;
+  if(jobs<1 || vtcm_manager_get_vtcm_size()<(size_t)num_workers*slice) {free(kh);free(vh);free(maskh);return -32;}
+  for(int batch=0;batch<p->batch;++batch) {
+    native_f32_f16(kh,k+batch*kvcount,kvcount);native_f32_f16(vh,v+batch*kvcount,kvcount);
+    // Additive mask is pre-scaled into log2 space, matching the native softmax.
+    // Finite T5 head bias must remain a score contribution, regardless of sign.
+    float buf[64] __attribute__((aligned(128)));
+    for(int h=0;h<mh;++h) for(size_t row=0;row<qpad;++row) for(size_t c=0;c<kpad;c+=64) {
+      for(int j=0;j<64;++j) {
+        buf[j]=(row<(size_t)p->queries && c+j<(size_t)p->keys) ?
+          (mask ? mask[(((size_t)(p->mask_batch==1?0:batch)*mh+h)*p->mask_queries+row)*p->keys+c+j]*1.44269504089f : 0.f) : -INFINITY;
+      }
+      native_f32_f16(maskh+((size_t)h*qpad+row)*kpad+c,buf,64);
+    }
+    // Define fully masked rows as zero without allowing -inf - -inf to
+    // contaminate the streaming softmax. Restore zero after the core.
+    unsigned char *empty=calloc((size_t)mh*p->queries,1);
+    if(!empty) {free(kh);free(vh);free(maskh);return -34;}
+    for(int h=0;h<mh;++h) for(int row=0;row<p->queries;++row) {
+      __fp16 *m=maskh+((size_t)h*qpad+row)*kpad;int keep=0;
+      for(int c=0;c<p->keys;++c) if(m[c]>(__fp16)-INFINITY) {keep=1;break;}
+      if(!keep) {empty[h*p->queries+row]=1;m[0]=0;}
+    }
+    simple_fa_task_state_t state={0};state.O=(__fp16 *)(out+(size_t)batch*p->queries*p->heads*p->dim);
+    state.Q=(const __fp16 *)(q+(size_t)batch*p->queries*p->heads*p->dim);state.K=kh;state.V=vh;state.mask=maskh;
+    state.qo_len=p->queries;state.kv_len=p->keys;state.n_heads=p->heads;state.n_kv_heads=p->heads;state.head_dim=p->dim;
+    state.additive=true;state.scale=p->scale;state.mask_head_stride=mh==1?0:qpad*kpad;
+    state.n_tasks=p->heads;state.vtcm_base=vtcm_manager_get_vtcm_base();state.vtcm_size_per_thread=slice;
+    worker_pool_synctoken_init(&state.sync_ctx,jobs);worker_pool_job_t job={.fptr=simple_flash_attn_worker,.dptr=&state};
+    int failed=0;
+    for(int i=0;i<jobs;++i) if(worker_pool_submit(NULL,job)!=AEE_SUCCESS) {worker_pool_synctoken_jobdone(&state.sync_ctx);failed=1;}
+    worker_pool_synctoken_wait(&state.sync_ctx);
+    if(!failed) for(int h=0;h<p->heads;++h) for(int row=0;row<p->queries;++row)
+      if(empty[(mh==1?0:h)*p->queries+row]) memset(out+((size_t)batch*p->queries+row)*p->heads*p->dim+h*p->dim,0,p->dim*4);
+    free(empty);
+    if(failed) {free(kh);free(vh);free(maskh);return -33;}
+  }
+  free(kh);free(vh);free(maskh);return 0;
 }

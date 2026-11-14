@@ -58,6 +58,10 @@ enum HtpOpsIndex {
      rearrange floor can be separated from the exposed fetch time. */
   HTP_OPS_ATTN_REARRANGE_BENCH,
   HTP_OPS_MAT_MUL_NATIVE_W8A8,
+  HTP_OPS_MAT_MUL_F16_EPILOGUE,
+  HTP_OPS_CONV2D_NCHW_F16,
+  HTP_OPS_ATTENTION_F32,
+  HTP_OPS_MODEL_AUX_F32,
   HTP_OPS_COUNT,
 };
 
@@ -469,3 +473,46 @@ struct AttnRearrangeBenchParams {
   int32_t              sum_us[4];    /* filled by the DSP: summed over workers */
   int32_t              blocks[4];    /* filled by the DSP: blocks timed, summed over workers */
 } __attribute__((packed));
+
+// Separate opcode: old skeletons reject the request instead of misreading it.
+struct F16EpilogueParams {
+    struct RpcmemBufAddr output, activation, weight, bias;
+    int32_t m, k, n, channels, mode, elapsed_us;
+} __attribute__((packed));
+// mode: 0=bias, 1=bias+GELU, 2=bias+QuickGELU, 3=bias+NCHW store.
+#ifdef __cplusplus
+static_assert(sizeof(F16EpilogueParams) == 56);
+static_assert(HTP_OPS_MAT_MUL_F16_EPILOGUE == 16);
+#else
+_Static_assert(sizeof(struct F16EpilogueParams) == 56, "F16 epilogue ABI changed");
+_Static_assert(HTP_OPS_MAT_MUL_F16_EPILOGUE == 16, "F16 epilogue opcode changed");
+#endif
+
+struct NativeConvParams {
+    struct RpcmemBufAddr output, activation, weight, bias;
+    int32_t iw, ih, ic, oc, batch, ow, oh, kw, kh, sx, sy, px, py, dx, dy, kp, np, upscale;
+    int32_t elapsed_us, gather_us, weight_us, hmx_us, store_us;
+} __attribute__((packed));
+struct NativeAttentionParams {
+    struct RpcmemBufAddr output, q, k, v, mask;
+    int32_t queries, keys, heads, dim, batch, mask_heads, mask_batch, mask_queries;
+    float scale;
+    int32_t elapsed_us;
+} __attribute__((packed));
+
+struct NativeAuxParams {
+ struct RpcmemBufAddr output, input, weight, bias;
+ int32_t mode, count, width, channels, spatial, groups, batch, other_count, activation;
+ float eps;
+ int32_t elapsed_us;
+} __attribute__((packed));
+
+#ifdef __cplusplus
+static_assert(sizeof(NativeConvParams)==124 && HTP_OPS_CONV2D_NCHW_F16==17);
+static_assert(sizeof(NativeAttentionParams)==80 && HTP_OPS_ATTENTION_F32==18);
+static_assert(sizeof(NativeAuxParams)==76 && HTP_OPS_MODEL_AUX_F32==19);
+#else
+_Static_assert(sizeof(struct NativeConvParams)==124 && HTP_OPS_CONV2D_NCHW_F16==17,"native convolution ABI");
+_Static_assert(sizeof(struct NativeAttentionParams)==80 && HTP_OPS_ATTENTION_F32==18,"native attention ABI");
+_Static_assert(sizeof(struct NativeAuxParams)==76 && HTP_OPS_MODEL_AUX_F32==19,"native auxiliary ABI");
+#endif

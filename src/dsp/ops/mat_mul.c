@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -9,6 +10,7 @@
 #include "dsp/hmx_utils.h"
 #include "dsp/hvx_convert.h"
 #include "dsp/hvx_internal.h"
+#include "dsp/hvx_math.h"
 #include "dsp/quants.h"
 #include "dsp/utils.h"
 #include "dsp/vtcm_mgr.h"
@@ -774,12 +776,160 @@ static void transfer_output_chunk_fp16_to_fp32(float *restrict dst, const __fp16
   }
 }
 
-int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activation,
-                                const __fp16 *restrict permuted_weight, int m, int k, int n) {
+// Apply the epilogue while the HMX tile is still in VTCM; no DDR intermediate.
+static inline HVX_Vector epilogue_mul(HVX_Vector a, HVX_Vector b) {
+  return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(a,b));
+}
+static inline HVX_Vector epilogue_const(float x) {
+  union { float f; int i; } u = { .f=x };
+  return Q6_V_vsplat_R(u.i);
+}
+static HVX_INLINE_ALWAYS HVX_Vector epilogue_activation(HVX_Vector x, int mode) {
+  if (mode != 1 && mode != 2 && mode != 4) return x;
+  // GELU(x)=x*sigmoid(2*sqrt(2/pi)*(x+0.044715*x^3)).
+  HVX_Vector z = x;
+  if (mode == 1) {
+    HVX_Vector cubic = epilogue_mul(epilogue_mul(x,x),x);
+    z = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(x,epilogue_mul(cubic,epilogue_const(.044715f))));
+  }
+  z = epilogue_mul(z,epilogue_const(mode == 1 ? 1.5957691216057308f : mode==4 ? 1.f : 1.702f));
+  // exp2 helper requires non-positive arguments. Stable sigmoid avoids overflow.
+  HVX_Vector absz = Q6_V_vand_VV(z,Q6_V_vsplat_R(0x7fffffff));
+  HVX_Vector neg = epilogue_mul(absz,epilogue_const(-1.4426950408889634f));
+  neg = Q6_Vsf_vmax_VsfVsf(neg,epilogue_const(-126.f));
+  HVX_Vector e = hvx_my_exp2_vsf(neg);
+  HVX_Vector denom = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(e,epilogue_const(1.f)));
+  // denom is in [1,2]. Three Newton steps from (1.5 - .5*denom)
+  // give float precision without a general-purpose reciprocal LUT/gather.
+  HVX_Vector inv_q = Q6_Vqf32_vsub_VsfVsf(epilogue_const(1.5f),epilogue_mul(denom,epilogue_const(.5f)));
+  HVX_Vector denom_q=Q6_Vqf32_vadd_VsfVsf(denom,Q6_V_vzero());
+  HVX_Vector two_q=Q6_Vqf32_vadd_VsfVsf(epilogue_const(2.f),Q6_V_vzero());
+  for (int step=0;step<3;++step) {
+    HVX_Vector product=Q6_Vqf32_vmpy_Vqf32Vqf32(inv_q,denom_q);
+    HVX_Vector correction=Q6_Vqf32_vsub_Vqf32Vqf32(two_q,product);
+    inv_q=Q6_Vqf32_vmpy_Vqf32Vqf32(inv_q,correction);
+  }
+  HVX_Vector inv = Q6_Vsf_equals_Vqf32(inv_q);
+  HVX_Vector sig = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(Q6_V_vzero(),z),epilogue_mul(e,inv),inv);
+  return epilogue_mul(x,sig);
+}
+
+// Scatter only within VTCM, then write contiguous spatial vectors to DDR.
+// This avoids one DDR cache-line write for every output channel/position pair.
+static void transfer_vae_output(float *dst, const __fp16 *src, const float *bias,
+    int rows, int cols, int m, int mr, int nc, int channels, float *scratch) {
+  static const int32_t offsets[32] __attribute__((aligned(128))) = {
+    0,128,256,384,512,640,768,896,1024,1152,1280,1408,1536,1664,1792,1920,
+    2048,2176,2304,2432,2560,2688,2816,2944,3072,3200,3328,3456,3584,3712,3840,3968
+  };
+  const HVX_Vector index=vmem(offsets);
+  for (int r=0;r<rows;r+=32) {
+    int valid=smin(32,rows-r);
+    for (int c=0;c<cols && nc+c<channels;c+=32) {
+      const __fp16 *tile=src+((r/32)*(cols/32)+c/32)*1024;
+      for (int rr=0;rr<valid;rr+=2) {
+        HVX_VectorPair v=hvx_my_vhf_to_wsf(((const HVX_Vector *)tile)[rr/2]);
+        Q6_vscatter_RMVwV((size_t)(scratch+rr),4095-rr*4,index,Q6_V_lo_W(v));
+        if (rr+1<valid) Q6_vscatter_RMVwV((size_t)(scratch+rr+1),4095-(rr+1)*4,index,Q6_V_hi_W(v));
+      }
+      asm volatile("vmem(%0 + #0):scatter_release" :: "r"(scratch) : "memory");
+      for (int ch=0;ch<32 && nc+c+ch<channels;++ch) {
+        HVX_Vector v=vmem(scratch+ch*32);
+        if (bias) v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v,epilogue_const(bias[nc+c+ch])));
+        // memcpy also handles non-vector-aligned chunk and channel strides.
+        float *out=dst+(size_t)(nc+c+ch)*m+mr+r;
+        if (valid==32) {
+          vmemu(out)=v;
+        } else {
+          float values[32] __attribute__((aligned(128)));
+          vmem(values)=v;
+          memcpy(out,values,valid*sizeof(float));
+        }
+      }
+    }
+  }
+}
+
+static void transfer_fused_output(float *dst, const __fp16 *src, const float *bias,
+    int rows, int cols, int m, int n, int mr, int nc, int channels, int mode, float *scratch) {
+  if (mode==3) { transfer_vae_output(dst,src,bias,rows,cols,m,mr,nc,channels,scratch); return; }
+  int tiles = cols/32;
+  for (int r=0;r<rows;r+=2) {
+    for (int c=0;c<cols;c+=32) {
+      const __fp16 *tile=src+((r/32)*tiles+c/32)*1024;
+      HVX_VectorPair pair=hvx_my_vhf_to_wsf(((const HVX_Vector *)tile)[(r%32)/2]);
+      for (int rr=0;rr<2 && r+rr<rows;++rr) {
+        HVX_Vector v=rr ? Q6_V_hi_W(pair) : Q6_V_lo_W(pair);
+        // Text channels are multiples of 32; the cropped VAE path above
+        // handles its own tails. Avoid a per-vector stack copy here.
+        if (bias) v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v,vmemu(bias+nc+c)));
+        v=epilogue_activation(v,mode);
+        vmem(dst+(size_t)(mr+r+rr)*n+nc+c)=v;
+      }
+    }
+  }
+}
+
+typedef struct {
+  worker_synctoken_t sync;
+  unsigned int next;
+  float *dst, *scratch;
+  const __fp16 *src;
+  const float *bias;
+  int rows, cols, m, n, mr, nc, channels, mode, tasks;
+} epilogue_job_t;
+
+static void epilogue_worker(void *data, int worker_index) {
+  epilogue_job_t *s=(epilogue_job_t *)data;
+  if (worker_index<0 || (unsigned int)worker_index>=num_workers) {
+    worker_pool_synctoken_jobdone(&s->sync);
+    return;
+  }
+  for (;;) {
+    unsigned int task=worker_pool_atomic_inc_return(&s->next)-1;
+    if (task>=(unsigned int)s->tasks) break;
+    int rt=task/(s->cols/32), ct=task%(s->cols/32);
+    int rows=smin(32,s->rows-rt*32);
+    const __fp16 *tile=s->src+(rt*(s->cols/32)+ct)*1024;
+    transfer_fused_output(s->dst,tile,s->bias,rows,32,s->m,s->n,
+        s->mr+rt*32,s->nc+ct*32,s->channels,s->mode,
+        s->scratch ? s->scratch+(size_t)worker_index*1024 : NULL);
+  }
+  worker_pool_synctoken_jobdone(&s->sync);
+}
+
+static int transfer_parallel_epilogue(float *dst, const __fp16 *src, const float *bias,
+    int rows, int cols, int m, int n, int mr, int nc, int channels, int mode, float *scratch) {
+  int tasks=ceil_div(rows,32)*(cols/32);
+  int workers=smin(num_workers,num_hvx128_contexts);
+  // Short text projections lose more to worker wakeups than they gain from
+  // parallel epilogues. Reserve the worker pool for spatial VAE output.
+  if (mode!=3 || tasks<16 || workers<2) {
+    transfer_fused_output(dst,src,bias,rows,cols,m,n,mr,nc,channels,mode,scratch);
+    return 0;
+  }
+  epilogue_job_t state={.next=0,.dst=dst,.scratch=scratch,.src=src,.bias=bias,
+    .rows=rows,.cols=cols,.m=m,.n=n,.mr=mr,.nc=nc,.channels=channels,.mode=mode,.tasks=tasks};
+  worker_pool_synctoken_init(&state.sync,workers);
+  worker_pool_job_t job={.fptr=epilogue_worker,.dptr=&state};
+  int failed=0;
+  for (int i=0;i<workers;++i) {
+    if (worker_pool_submit(NULL,job)!=AEE_SUCCESS) {
+      worker_pool_synctoken_jobdone(&state.sync);
+      failed=1;
+    }
+  }
+  worker_pool_synctoken_wait(&state.sync);
+  return failed ? -1 : 0;
+}
+
+int hmx_mat_mul_f16_epilogue(float *restrict dst, const float *restrict activation,
+                                const __fp16 *restrict permuted_weight, const float *bias, int m, int k, int n, int channels, int mode) {
   if (!dst || !activation || !permuted_weight || !m || !n || !k) {
     return -10;
   }
-  if (k % 32 != 0 || n % 32 != 0) {
+  if (m < 1 || k < 1 || n < 1 || channels < 1 || channels > n || mode < 0 || mode > 3 ||
+      (mode != 3 && channels != n) || k % 32 != 0 || n % 32 != 0) {
     // TODO(hzx): can we remove this restriction?
     return -11;
   }
@@ -797,6 +947,8 @@ int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activ
   __fp16  *vtcm_activation = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, activation_area_size);
   __fp16  *vtcm_output     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size);
   __fp16  *vtcm_scales     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
+
+  float *transpose_scratch = mode==3 ? (float *)vtcm_seq_alloc(&vtcm_ptr,4096*smax(1,num_workers)) : NULL;
 
   hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));  // fp16: 1.0
 
@@ -851,8 +1003,12 @@ int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activ
 
       // int64_t out_t0 = HAP_perf_get_qtimer_count();
       {
-        float *output = dst + (mr * n + nc);
-        transfer_output_chunk_fp16_to_fp32(output, vtcm_output, n_rows, n_cols, n);
+        if (!bias && mode == 0) {
+          transfer_output_chunk_fp16_to_fp32(dst + mr*n + nc, vtcm_output, n_rows, n_cols, n);
+        } else {
+          if (transfer_parallel_epilogue(dst, vtcm_output, bias, n_rows, n_cols,
+              m, n, mr, nc, channels, mode, transpose_scratch)!=0) return -13;
+        }
       }
       // output_store_time += HAP_perf_get_qtimer_count() - out_t0;
 
@@ -878,6 +1034,11 @@ int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activ
   // FARF(ALWAYS, "    weight load bandwidth: %.2f GB/s", bandwidth);
 
   return 0;
+}
+
+int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activation,
+                                const __fp16 *restrict weight, int m, int k, int n) {
+  return hmx_mat_mul_f16_epilogue(dst,activation,weight,NULL,m,k,n,n,0);
 }
 
 static void qkv_pack_q_tile(__fp16 *dst, const float *src, int n_rows, int head_dim) {
@@ -2008,4 +2169,216 @@ int mat_mul_qk_0_d16a32_out_stationary(float *restrict out, const float *restric
 
   worker_pool_deinit(&fetch_task_worker_pool_ctx);
   return 0;
+}
+// Native convolution: gather directly from NCHW DDR into bounded VTCM tiles.
+typedef struct {
+  worker_synctoken_t sync; unsigned next;
+  float *tile; const float *input; const struct NativeConvParams *p;
+  int mr, rows, padded_rows, stride;
+} conv_gather_job;
+static void conv_gather_worker(void *data,int worker_index) {
+  (void)worker_index;
+  conv_gather_job *s=(conv_gather_job *)data; const struct NativeConvParams *p=s->p;
+  int32_t offsets[32] __attribute__((aligned(128)));
+  float tail[32] __attribute__((aligned(128)));
+  for(int i=0;i<32;++i) offsets[i]=i*s->stride*4;
+  HVX_Vector index=vmem(offsets);
+  for(;;) {
+    unsigned block=__atomic_fetch_add(&s->next,1,__ATOMIC_RELAXED);
+    if(block*32>=(unsigned)p->kp) break;
+    for(unsigned col=block*32;col<(block+1)*32;++col) {
+    int kx=col%p->kw,ky=(col/p->kw)%p->kh,ci=col/(p->kw*p->kh);
+    for(int r=0;r<s->padded_rows;r+=32) {
+      int pos=s->mr+r, ox=pos%p->ow,oy=pos/p->ow;
+      int ix=ox*p->sx-p->px+kx*p->dx,iy=oy*p->sy-p->py+ky*p->dy;
+      HVX_Vector val=Q6_V_vzero();
+      if(ci<p->ic && r+32<=s->rows && ox+32<=p->ow && p->sx==1 && p->upscale==1 &&
+         ix>=0 && ix+32<=p->iw && iy>=0 && iy<p->ih) {
+        val=vmemu(s->input+((size_t)ci*p->ih+iy)*p->iw+ix);
+      } else if(ci<p->ic && r+32<=s->rows && ox+32<=p->ow) {
+        // Border vectors share the same source row. Avoid 32 dynamic integer
+        // divisions per K column, including the common nearest-upsample case.
+        memset(tail,0,sizeof(tail));
+        if(iy>=0 && iy<p->ih*p->upscale) {
+          const float *plane=s->input+((size_t)ci*p->ih+(p->upscale==2?iy>>1:iy))*p->iw;
+          if(p->sx==1 && p->upscale==1) {
+            int first=ix<0?-ix:0, last=p->iw-ix<32?p->iw-ix:32;
+            if(last>first) memcpy(tail+first,plane+ix+first,(last-first)*4);
+          } else for(int j=0;j<32;++j) {
+            int x=ix+j*p->sx;
+            if(x>=0 && x<p->iw*p->upscale) tail[j]=plane[p->upscale==2?x>>1:x];
+          }
+        }
+        val=vmem(tail);
+      } else if(ci<p->ic) {
+        for(int j=0;j<32;++j) {
+          int t=s->mr+r+j,x=(t%p->ow)*p->sx-p->px+kx*p->dx,y=(t/p->ow)*p->sy-p->py+ky*p->dy;
+          tail[j]=(r+j<s->rows && x>=0 && x<p->iw*p->upscale && y>=0 && y<p->ih*p->upscale) ?
+            s->input[((size_t)ci*p->ih+y/p->upscale)*p->iw+x/p->upscale] : 0.f;
+        }
+        val=vmem(tail);
+      }
+      float *base=s->tile+(size_t)r*s->stride+col;
+      Q6_vscatter_RMVwV((size_t)base,(32*s->stride-col)*4-1,index,val);
+    }
+    }
+  }
+  asm volatile("vmem(%0 + #0):scatter_release" :: "r"(s->tile) : "memory");
+  worker_pool_synctoken_jobdone(&s->sync);
+}
+int hmx_conv2d_nchw_f16(float *dst,const float *input,const __fp16 *weight,const float *bias,struct NativeConvParams *p) {
+  int64_t gather_t=0,weight_t=0,hmx_t=0,store_t=0;
+  size_t total=vtcm_manager_get_vtcm_size();
+  size_t reserved=WEIGHT_AREA_SIZE+OUTPUT_AREA_SIZE+256+4096*smax(1,num_workers);
+  if(total<=reserved) return -20;
+  // Skew rows by one float so a 32-lane gather visits distinct VTCM
+  // banks, rather than serializing every lane at a K-multiple-of-32 stride.
+  int stride=p->kp+1;
+  int mrmax=align_down((total-reserved-2048)/(6*p->kp+4),32);
+  mrmax=smin(mrmax,1024);
+  int ncmax=align_down(WEIGHT_AREA_SIZE/(2*p->kp),32);
+  if(mrmax<32 || ncmax<32) return -21;
+  ncmax=smin(ncmax,p->np);
+  while((size_t)mrmax*ncmax*2>OUTPUT_AREA_SIZE) ncmax-=32;
+  uint8_t *vp=(uint8_t *)vtcm_manager_get_vtcm_base();
+  __fp16 *w=(__fp16 *)vtcm_seq_alloc(&vp,WEIGHT_AREA_SIZE);
+  __fp16 *o=(__fp16 *)vtcm_seq_alloc(&vp,OUTPUT_AREA_SIZE);
+  // HMX tile addresses must be 2 KiB aligned; allocate all tile matrices
+  // before the 256-byte scales area (HMX otherwise drops low address bits).
+  float *tile=(float *)vtcm_seq_alloc(&vp,align_up((size_t)mrmax*stride*4,2048));
+  __fp16 *a=(__fp16 *)vtcm_seq_alloc(&vp,(size_t)mrmax*p->kp*2);
+  __fp16 *scales=(__fp16 *)vtcm_seq_alloc(&vp,256);
+  float *scratch=(float *)vtcm_seq_alloc(&vp,4096*smax(1,num_workers));
+  hmx_init_column_scales(scales,Q6_V_vsplat_R(0x3c00));
+  int spatial=p->ow*p->oh,workers=smin(num_workers,num_hvx128_contexts);
+  if(workers<1) return -22;
+  for(int batch=0;batch<p->batch;++batch) for(int mr=0;mr<spatial;mr+=mrmax) {
+    int rows=smin(mrmax,spatial-mr),padded=align_up(rows,32);
+    uint64_t tick=HAP_perf_get_qtimer_count();
+    conv_gather_job state={.next=0,.tile=tile,.input=input+(size_t)batch*p->iw*p->ih*p->ic,.p=p,.mr=mr,.rows=rows,.padded_rows=padded,.stride=stride};
+    worker_pool_synctoken_init(&state.sync,workers);
+    worker_pool_job_t job={.fptr=conv_gather_worker,.dptr=&state};
+    int fail=0;
+    for(int i=0;i<workers;++i) if(worker_pool_submit(NULL,job)!=AEE_SUCCESS) {worker_pool_synctoken_jobdone(&state.sync);fail=1;}
+    worker_pool_synctoken_wait(&state.sync);if(fail) return -23;
+    for(int r=0;r<padded;r+=2) for(int c=0;c<p->kp;c+=32) {
+      HVX_Vector v0=vmemu(tile+(size_t)r*stride+c),v1=vmemu(tile+(size_t)(r+1)*stride+c);
+      HVX_Vector *out=(HVX_Vector *)(a+((r/32)*(p->kp/32)+c/32)*1024);
+      out[(r%32)/2]=hvx_my_wsf_to_vhf(v1,v0);
+    }
+    gather_t+=HAP_perf_get_qtimer_count()-tick;
+    for(int nc=0;nc<p->np;nc+=ncmax) {
+      int cols=smin(ncmax,p->np-nc);
+      tick=HAP_perf_get_qtimer_count();
+      transfer_permuted_weight_chunk_fp16(w,weight+(size_t)nc*p->kp,cols,p->kp);
+      weight_t+=HAP_perf_get_qtimer_count()-tick;tick=HAP_perf_get_qtimer_count();
+      core_dot_chunk_fp16(o,a,w,scales,padded/32,cols/32,p->kp/32);
+      hmx_t+=HAP_perf_get_qtimer_count()-tick;tick=HAP_perf_get_qtimer_count();
+      if(transfer_parallel_epilogue(dst+(size_t)batch*spatial*p->oc,o,bias,rows,cols,
+          spatial,p->np,mr,nc,p->oc,3,scratch)) return -24;
+      store_t+=HAP_perf_get_qtimer_count()-tick;
+    }
+  }
+  p->gather_us=gather_t/19.2;p->weight_us=weight_t/19.2;p->hmx_us=hmx_t/19.2;p->store_us=store_t/19.2;
+  return 0;
+}
+
+// F32 model auxiliaries. Explicit epsilon and masked tails avoid the legacy
+// RMS kernel's fixed epsilon and full-vector tail stores.
+typedef struct {
+ worker_synctoken_t sync; unsigned next; float *dst;
+ const float *x,*w,*b;const struct NativeAuxParams *p;int tasks;
+} model_aux_job;
+static HVX_Vector aux_load(const float *p,int n) {
+ if(n==32) return vmemu(p);
+ float tail[32] __attribute__((aligned(128)))={0};memcpy(tail,p,n*4);return vmem(tail);
+}
+static void aux_store(float *p,HVX_Vector v,int n) {
+ if(n==32) {vmemu(p)=v;return;}
+ float tail[32] __attribute__((aligned(128)));vmem(tail)=v;memcpy(p,tail,n*4);
+}
+static double aux_sum(HVX_Vector v) {
+ float values[32] __attribute__((aligned(128)));vmem(values)=Q6_Vsf_equals_Vqf32(v);
+ double sum=0;for(int i=0;i<32;++i) sum+=values[i];return sum;
+}
+static void model_aux_worker(void *data,int worker_index) {
+ (void)worker_index;model_aux_job *s=data;const struct NativeAuxParams *p=s->p;
+ for(;;) {
+  int task=__atomic_fetch_add(&s->next,1,__ATOMIC_RELAXED);if(task>=s->tasks) break;
+  if(p->mode==8) {
+   int nt=ceil_div(p->spatial,32),mt=ceil_div(p->width,32);
+   int batch=task/(mt*nt),rt=(task/nt)%mt,ct=task%nt;
+   int nr=smin(32,p->width-rt*32),nc=smin(32,p->spatial-ct*32);
+   float *scratch=(float *)vtcm_manager_get_vtcm_base()+worker_index*1024;
+   int32_t offsets[32] __attribute__((aligned(128)));
+   for(int j=0;j<32;++j) offsets[j]=j*128;HVX_Vector index=vmem(offsets);
+   for(int row=0;row<nr;++row) {
+    const float *src=s->x+((size_t)batch*p->width+rt*32+row)*p->spatial+ct*32;
+    Q6_vscatter_RMVwV((size_t)(scratch+row),4095-row*4,index,aux_load(src,nc));
+   }
+   asm volatile("vmem(%0 + #0):scatter_release" :: "r"(scratch) : "memory");
+   for(int col=0;col<nc;++col) aux_store(s->dst+((size_t)batch*p->spatial+ct*32+col)*p->width+rt*32,vmem(scratch+col*32),nr);
+  } else if(p->mode<=2) {
+   int count=p->mode==2?p->spatial*(p->channels/p->groups):p->width;
+   size_t offset=(size_t)task*count;const float *x=s->x+offset;
+   float mean=0;HVX_Vector sum=Q6_V_vzero();
+   if(p->mode!=1) {
+    for(int i=0;i<count;i+=32) sum=Q6_Vqf32_vadd_Vqf32Vsf(sum,aux_load(x+i,smin(32,count-i)));
+    mean=aux_sum(sum)/count;
+   }
+   HVX_Vector vmean=epilogue_const(mean);sum=Q6_V_vzero();
+   for(int i=0;i<count;i+=32) {
+    int valid=smin(32,count-i);HVX_Vector v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(aux_load(x+i,valid),vmean));
+    if(valid<32) v=Q6_V_vmux_QVV(Q6_Q_vsetq_R(valid*4),v,Q6_V_vzero());
+    sum=Q6_Vqf32_vadd_Vqf32Vqf32(sum,Q6_Vqf32_vmpy_VsfVsf(v,v));
+   }
+   float inv=1.f/sqrtf(aux_sum(sum)/count+p->eps);HVX_Vector scale=epilogue_const(inv);
+   for(int i=0;i<count;i+=32) {
+    int valid=smin(32,count-i);HVX_Vector v=epilogue_mul(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(aux_load(x+i,valid),vmean)),scale);
+    if(p->mode==2) {
+     float weights[32] __attribute__((aligned(128))),biases[32] __attribute__((aligned(128)));
+     int ch=((offset+i)/p->spatial)%p->channels;
+     if((offset+i)%p->spatial+valid<=p->spatial) {
+      if(s->w) v=epilogue_mul(v,epilogue_const(s->w[ch]));
+      if(s->b) v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v,epilogue_const(s->b[ch])));
+     } else {
+      for(int j=0;j<32;++j) {ch=((offset+i+j)/p->spatial)%p->channels;weights[j]=s->w?s->w[ch]:1.f;biases[j]=s->b?s->b[ch]:0.f;}
+      v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(epilogue_mul(v,vmem(weights)),vmem(biases)));
+     }
+    } else {
+     if(s->w) v=epilogue_mul(v,aux_load(s->w+i,valid));
+     if(s->b) v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v,aux_load(s->b+i,valid)));
+    }
+    if(p->activation) v=epilogue_activation(v,4);
+    aux_store(s->dst+offset+i,v,valid);
+   }
+  } else {
+   int first=task*4096,last=smin(p->count,first+4096);
+   for(int i=first;i<last;i+=32) {
+    int valid=smin(32,last-i);HVX_Vector v=aux_load(s->x+i,valid);
+    if(p->mode==3||p->mode==4) {
+     int index=i%p->other_count;HVX_Vector w;
+     if(index+valid<=p->other_count) w=aux_load(s->w+index,valid);
+     else {float tail[32] __attribute__((aligned(128)));for(int j=0;j<32;++j) tail[j]=s->w[(index+j)%p->other_count];w=vmem(tail);}
+     v=p->mode==3?Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v,w)):epilogue_mul(v,w);
+    } else v=epilogue_activation(v,p->mode==5?4:p->mode==6?1:2);
+    aux_store(s->dst+i,v,valid);
+   }
+  }
+ }
+ worker_pool_synctoken_jobdone(&s->sync);
+}
+int hvx_model_aux_f32(float *dst,const float *x,const float *w,const float *b,const struct NativeAuxParams *p) {
+ model_aux_job state={.next=0,.dst=dst,.x=x,.w=w,.b=b,.p=p};
+ state.tasks=p->mode==8?ceil_div(p->width,32)*ceil_div(p->spatial,32)*p->batch:p->mode==2?p->groups*p->batch:p->mode<=1?p->count/p->width:ceil_div(p->count,4096);
+ int jobs=smin(smin(num_workers,num_hvx128_contexts),state.tasks);if(jobs<1) return -40;
+ if(p->mode==8 && vtcm_manager_get_vtcm_size()<(size_t)num_workers*4096) return -42;
+ // Short encoder rows are cheaper on the dispatch thread than waking the
+ // worker pool. Spatial VAE tensors retain parallel execution.
+ if(p->mode!=8 && p->count<=512*1024) {
+  worker_pool_synctoken_init(&state.sync,1);model_aux_worker(&state,0);return 0;
+ }
+ worker_pool_synctoken_init(&state.sync,jobs);worker_pool_job_t job={.fptr=model_aux_worker,.dptr=&state};
+ int failed=0;for(int i=0;i<jobs;++i) if(worker_pool_submit(NULL,job)!=AEE_SUCCESS) {worker_pool_synctoken_jobdone(&state.sync);failed=1;}
+ worker_pool_synctoken_wait(&state.sync);return failed?-41:0;
 }

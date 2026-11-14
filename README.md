@@ -40,6 +40,43 @@ After compilation, you should see two directories: `android_ReleaseG_aarch64` an
 
 These two dynamic link libraries will be used later; please refer to the instructions in the main repository. In FastRPC terminology, they are the Stub (`libhtp_ops.so`) and Skeleton (`libhtp_ops_skel.so`) respectively. You can use `ldd` to distinguish between the two shared objects: `libhtp_ops.so` targets the AArch64 architecture and runs on the CPU; `libhtp_ops_skel.so` targets the Q6DSP architecture and runs on the Hexagon NPU (cDSP).
 
+## Fused FP16 GEMM epilogues
+
+Shared-message opcode 16 adds an optional native epilogue to the existing
+W16A32 HMX core: bias, GELU, QuickGELU, or cropped channel-major convolution
+output. The 56-byte `F16EpilogueParams` wire contract is shared with sd.cpp.
+The GEMM accumulator is unchanged; HVX processes the VTCM output before its
+first DDR store. Larger output chunks use the existing worker pool and private
+VTCM transpose scratch for each worker. The original opcode 1 keeps its normal
+output path and wire layout.
+
+Build and deploy both host and DSP libraries together with the updated sd.cpp
+HTP backend. The host exports `htp_ops_f16_epilogue_version()` as a capability
+marker. sd.cpp enables the production text MLP and VAE paths independently with
+`SD_HTP_TEXT_FUSION=1` and `SD_HTP_VAE_FUSION=1`; both default to off. Existing
+packed GGUF weights remain compatible. Device validation and reproducible
+commands are in `../sd.cpp/docs/htp_fusion.md`.
+
+## Native model operators
+
+Matching sd.cpp native-model mode uses three additional shared-message opcodes:
+
+| Opcode | Operator | Payload |
+|---|---|---|
+| 17 | Packed-F16 convolution from F32 NCHW input | 124 bytes |
+| 18 | F32-input streaming HMX attention with additive masks | 80 bytes |
+| 19 | Norm, elementwise, activation and transpose auxiliaries | 76 bytes |
+
+Convolution samples bounded VTCM tiles directly with HVX, fuses optional nearest
+2x upsampling and bias/output layout, and avoids CPU/full-DDR im2col. Attention
+handles CLIP causal masks, T5 per-head relative bias, batch/tail tokens and fully
+masked rows; legacy attention keeps its original mask behavior. GroupNorm and
+SiLU can share one DSP node. The host exports `htp_ops_native_model_version()`.
+Deploy matching HLOS, DSP skeleton and sd.cpp libraries. Details, limitations,
+correctness tests and actual device timings are in
+`../sd.cpp/docs/htp_native_models.md`; full migration does not guarantee lower
+latency for every shape. The tested target is SM8650/v75.
+
 ## Known Issues
 
 Compiling for DSP Arch v79 targets with higher versions of the Hexagon SDK may cause errors in some floating-point calculations. When the target hardware is DSP Arch v79, we recommend compiling for v73/v75 and disabling `vgather`-based exp calculations (set `const bool enable_vgather_exp` to `false` in `simple_flash_attn_f16_core` in `src/dsp/ops/flash_attn.c`).
