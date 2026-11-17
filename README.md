@@ -84,6 +84,22 @@ correctness tests and actual device timings are in
 `../sd.cpp/docs/htp_native_models.md`; full migration does not guarantee lower
 latency for every shape. The tested target is SM8650/v75.
 
+## Native DiT auxiliaries
+
+Opcode 19 also supports compact DiT operations without changing the payload
+layout: LayerNorm plus adaptive modulation (mode 9), gated residual addition
+(mode 10), matrix RoPE with attention-layout output (mode 11), strided SwiGLU
+(mode 12), and SwiGLU written directly beside attention output (mode 13).
+The host capability exports are `htp_ops_dit_aux_version()` and
+`htp_ops_dit_concat_version()`; deploy the host and DSP libraries as a pair.
+
+The updated sd.cpp uses these kernels for its optional native SD3.5 path and
+its dense FLUX.2 Klein 4B native/concat path. Existing text/VAE kernels and
+packed weight formats are unchanged. The tested v75 configuration enables
+Klein native/concat, but keeps SD3.5 native auxiliaries off because they were
+slower in the device comparison; SD3.5 instead enables DiT weight prefetch.
+See `../sd.cpp/docs/htp_dit.md` for correctness checks and timing boundaries.
+
 ## Known Issues
 
 Compiling for DSP Arch v79 targets with higher versions of the Hexagon SDK may cause errors in some floating-point calculations. When the target hardware is DSP Arch v79, we recommend compiling for v73/v75 and disabling `vgather`-based exp calculations (set `const bool enable_vgather_exp` to `false` in `simple_flash_attn_f16_core` in `src/dsp/ops/flash_attn.c`).

@@ -41,3 +41,8 @@ int htp_ops_rpc_mat_mul_permuted_w16a32_trace_session(htp_ops_session *session, 
 int htp_ops_f16_epilogue_version(void) { return 1; }
 
 int htp_ops_native_model_version(void) { return 1; }
+
+// Compact DiT norm/modulation, gated residual and matrix RoPE modes.
+int htp_ops_dit_aux_version(void) { return 1; }
+
+int htp_ops_dit_concat_version(void) { return 1; }

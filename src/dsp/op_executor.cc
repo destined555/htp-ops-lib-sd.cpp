@@ -1,3 +1,4 @@
+#include <cmath>
 #include "dsp/op_executor.h"
 
 #include <qurt_memory.h>
@@ -371,13 +372,28 @@ int execute_op_simple(struct OpComputeRequest *req, size_t req_size) {
       {
         if(payload_size!=sizeof(NativeAuxParams)) return -1;
         auto *p=reinterpret_cast<NativeAuxParams *>(req->payload);
-        if(p->count<=0||p->mode<0||p->mode>8||p->width<=0||p->channels<=0||p->spatial<=0||p->batch<=0) return -1;
+        if(p->count<=0||p->mode<0||p->mode>13||p->width<=0||p->channels<=0||p->spatial<=0||p->batch<=0) return -1;
         if(p->mode==8 && (int64_t)p->width*p->spatial*p->batch!=p->count) return -1;
         if(p->mode==2 && (p->groups<=0||p->channels%p->groups)) return -1;
-        int n=p->mode==2?p->channels:p->width;
+        if(p->mode==12 && ((int64_t)p->width*p->spatial*p->batch!=p->count ||
+           p->weight.fd>=0 || p->bias.fd>=0 || p->channels<(int64_t)2*p->width || (p->activation!=0 && p->activation!=1))) return -1;
+        if(p->mode==13 && (p->groups<=0 || p->weight.fd<0 || p->bias.fd>=0 ||
+           ((int64_t)p->width+p->groups)*p->spatial*p->batch!=p->count ||
+           (int64_t)p->groups*p->spatial*p->batch!=p->other_count ||
+           p->channels<(int64_t)2*p->width || (p->activation!=0 && p->activation!=1))) return -1;
+        if((p->mode==9 || p->mode==10) &&
+           ((int64_t)p->width*p->spatial*p->batch!=p->count || p->weight.fd<0 || p->bias.fd<0 ||
+            (p->other_count!=p->width && p->other_count!=(int64_t)p->width*p->batch) ||
+            (p->mode==9 && (!std::isfinite(p->eps) || p->eps<0)))) return -1;
+        if(p->mode==11 && (p->width%2 || (int64_t)p->width*p->channels*p->spatial*p->batch!=p->count ||
+           p->weight.fd<0 || p->bias.fd>=0 || (p->groups!=1 && p->groups!=p->batch) ||
+           p->other_count!=(int64_t)2*p->width*p->spatial*p->groups)) return -1;
+        int n=p->mode==2?p->channels:p->mode==9?p->other_count:p->mode==10?p->count:p->width;
         if(p->mode<=2 && p->weight.fd>=0 && p->other_count!=n) return -1;
         if((p->mode==3||p->mode==4) && (p->other_count<=0||p->count%p->other_count||p->weight.fd<0)) return -1;
-        add_buffer(out_bufs,p->output,(size_t)p->count*4);add_buffer(in_bufs,p->input,(size_t)p->count*4);
+        size_t input_bytes=(size_t)p->count*4;
+        if(p->mode==12 || p->mode==13) input_bytes=((size_t)(p->spatial)*p->batch-1)*p->channels*4+(size_t)2*p->width*4;
+        add_buffer(out_bufs,p->output,(size_t)p->count*4);add_buffer(in_bufs,p->input,input_bytes);
         if(p->weight.fd>=0) add_buffer(in_bufs,p->weight,(size_t)p->other_count*4);
         if(p->bias.fd>=0) add_buffer(in_bufs,p->bias,(size_t)n*4);
         if(!OUT_PTR(0)||!IN_PTR(0)||(p->weight.fd>=0&&!IN_PTR(1))) return -1;

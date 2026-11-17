@@ -786,14 +786,14 @@ static inline HVX_Vector epilogue_const(float x) {
   return Q6_V_vsplat_R(u.i);
 }
 static HVX_INLINE_ALWAYS HVX_Vector epilogue_activation(HVX_Vector x, int mode) {
-  if (mode != 1 && mode != 2 && mode != 4) return x;
+  if (mode != 1 && mode != 2 && mode != 4 && mode != 5) return x;
   // GELU(x)=x*sigmoid(2*sqrt(2/pi)*(x+0.044715*x^3)).
   HVX_Vector z = x;
   if (mode == 1) {
     HVX_Vector cubic = epilogue_mul(epilogue_mul(x,x),x);
     z = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(x,epilogue_mul(cubic,epilogue_const(.044715f))));
   }
-  z = epilogue_mul(z,epilogue_const(mode == 1 ? 1.5957691216057308f : mode==4 ? 1.f : 1.702f));
+  z = epilogue_mul(z,epilogue_const(mode == 1 ? 1.5957691216057308f : (mode==4 || mode==5) ? 1.f : 1.702f));
   // exp2 helper requires non-positive arguments. Stable sigmoid avoids overflow.
   HVX_Vector absz = Q6_V_vand_VV(z,Q6_V_vsplat_R(0x7fffffff));
   HVX_Vector neg = epilogue_mul(absz,epilogue_const(-1.4426950408889634f));
@@ -811,6 +811,16 @@ static HVX_INLINE_ALWAYS HVX_Vector epilogue_activation(HVX_Vector x, int mode) 
     inv_q=Q6_Vqf32_vmpy_Vqf32Vqf32(inv_q,correction);
   }
   HVX_Vector inv = Q6_Vsf_equals_Vqf32(inv_q);
+  if(mode==5) {
+    // Bound the sigmoid to F32 precision between reciprocal iterations.
+    // Keeping all iterations in qfloat loses accuracy near denominator=1
+    // for wide-range DiT gates; leave legacy epilogues unchanged.
+    inv=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(epilogue_const(1.5f),epilogue_mul(denom,epilogue_const(.5f))));
+    for(int step=0;step<4;++step) {
+      HVX_Vector correction=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(epilogue_const(2.f),epilogue_mul(denom,inv)));
+      inv=epilogue_mul(inv,correction);
+    }
+  }
   HVX_Vector sig = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(Q6_V_vzero(),z),epilogue_mul(e,inv),inv);
   return epilogue_mul(x,sig);
 }
@@ -2360,7 +2370,30 @@ static void model_aux_worker(void *data,int worker_index) {
    }
    asm volatile("vmem(%0 + #0):scatter_release" :: "r"(scratch) : "memory");
    for(int col=0;col<nc;++col) aux_store(s->dst+((size_t)batch*p->spatial+ct*32+col)*p->width+rt*32,vmem(scratch+col*32),nr);
-  } else if(p->mode<=2) {
+  } else if(p->mode==11) {
+   // Read the compact 2x2 position matrices directly. Each task writes one
+   // head/token row in attention's output layout, without REPEAT or transpose.
+   // Reuse each position matrix across all heads. Preparing its lane
+   // vectors once avoids heads-fold scalar unpacking and atomic job claims.
+   int token=task%p->spatial,batch=task/p->spatial,dim=p->width;
+   const float *pe=s->w+((size_t)(p->groups==1?0:batch)*p->spatial+token)*dim*2;
+   for(int i=0;i<dim;i+=32) {
+    int valid=smin(32,dim-i);
+    float diagonal[32] __attribute__((aligned(128)))={0},off[32] __attribute__((aligned(128)))={0};
+    for(int j=0;j<valid;j+=2) {
+     const float *m=pe+2*(i+j);
+     diagonal[j]=m[0];diagonal[j+1]=m[3];off[j]=m[1];off[j+1]=m[2];
+    }
+    HVX_Vector diagonal_v=vmem(diagonal),off_v=vmem(off);
+    for(int head=0;head<p->channels;++head) {
+     const float *x=s->x+((size_t)batch*p->spatial*p->channels+token*p->channels+head)*dim;
+     float *dst=s->dst+((size_t)(batch*p->channels+head)*p->spatial+token)*dim;
+     HVX_Vector v=aux_load(x+i,valid),swapped=Q6_V_vdelta_VV(v,Q6_V_vsplat_R(0x04040404));
+     HVX_Vector a=epilogue_mul(v,diagonal_v),b=epilogue_mul(swapped,off_v);
+     aux_store(dst+i,Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(a,b)),valid);
+    }
+   }
+  } else if(p->mode<=2 || p->mode==9) {
    int count=p->mode==2?p->spatial*(p->channels/p->groups):p->width;
    size_t offset=(size_t)task*count;const float *x=s->x+offset;
    float mean=0;HVX_Vector sum=Q6_V_vzero();
@@ -2387,12 +2420,54 @@ static void model_aux_worker(void *data,int worker_index) {
       for(int j=0;j<32;++j) {ch=((offset+i+j)/p->spatial)%p->channels;weights[j]=s->w?s->w[ch]:1.f;biases[j]=s->b?s->b[ch]:0.f;}
       v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(epilogue_mul(v,vmem(weights)),vmem(biases)));
      }
+    } else if(p->mode==9) {
+     int batch=task/p->spatial,param_batch=p->other_count==p->width?0:batch;
+     const float *w=s->w+(size_t)param_batch*p->width+i,*b=s->b+(size_t)param_batch*p->width+i;
+     HVX_Vector product=epilogue_mul(v,aux_load(w,valid));
+     v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v,product));
+     v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v,aux_load(b,valid)));
     } else {
      if(s->w) v=epilogue_mul(v,aux_load(s->w+i,valid));
      if(s->b) v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v,aux_load(s->b+i,valid)));
     }
     if(p->activation) v=epilogue_activation(v,4);
     aux_store(s->dst+offset+i,v,valid);
+   }
+  } else if(p->mode==13) {
+   // One task owns a token row, preserving attention bits and writing SwiGLU
+   // into its final concatenated location without a separate MLP tensor.
+   int width=p->width,attention=p->groups,out_width=width+attention;
+   float *dst=s->dst+(size_t)task*out_width;
+   const float *a=s->w+(size_t)task*attention;
+   for(int i=0;i<attention;i+=32) {
+    int valid=smin(32,attention-i);
+    aux_store(dst+i,aux_load(a+i,valid),valid);
+   }
+   const float *x=s->x+(size_t)task*p->channels;
+   for(int i=0;i<width;i+=32) {
+    int valid=smin(32,width-i);
+    const float *gate=x+i+(p->activation?0:width),*up=x+i+(p->activation?width:0);
+    aux_store(dst+attention+i,epilogue_mul(epilogue_activation(aux_load(gate,valid),5),aux_load(up,valid)),valid);
+   }
+  } else if(p->mode==12) {
+   int first=task*4096,last=smin(p->count,first+4096);
+   for(int i=first;i<last;) {
+    int column=i%p->width,row=i/p->width,valid=smin(32,smin(last-i,p->width-column));
+    const float *a=s->x+(size_t)row*p->channels+column;
+    const float *gate=a+(p->activation?0:p->width),*up=a+(p->activation?p->width:0);
+    HVX_Vector v=epilogue_mul(epilogue_activation(aux_load(gate,valid),5),aux_load(up,valid));
+    aux_store(s->dst+i,v,valid);i+=valid;
+   }
+  } else if(p->mode==10) {
+   // Compact gates vary by channel/batch and broadcast only across tokens.
+   int first=task*4096,last=smin(p->count,first+4096);
+   for(int i=first;i<last;) {
+    int channel=i%p->width,batch=i/(p->width*p->spatial);
+    int valid=smin(32,smin(last-i,p->width-channel));
+    int param_batch=p->other_count==p->width?0:batch;
+    HVX_Vector v=epilogue_mul(aux_load(s->x+i,valid),aux_load(s->w+(size_t)param_batch*p->width+channel,valid));
+    v=Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v,aux_load(s->b+i,valid)));
+    aux_store(s->dst+i,v,valid);i+=valid;
    }
   } else {
    int first=task*4096,last=smin(p->count,first+4096);
@@ -2412,7 +2487,7 @@ static void model_aux_worker(void *data,int worker_index) {
 }
 int hvx_model_aux_f32(float *dst,const float *x,const float *w,const float *b,const struct NativeAuxParams *p) {
  model_aux_job state={.next=0,.dst=dst,.x=x,.w=w,.b=b,.p=p};
- state.tasks=p->mode==8?ceil_div(p->width,32)*ceil_div(p->spatial,32)*p->batch:p->mode==2?p->groups*p->batch:p->mode<=1?p->count/p->width:ceil_div(p->count,4096);
+ state.tasks=p->mode==13?p->spatial*p->batch:p->mode==11?p->spatial*p->batch:p->mode==8?ceil_div(p->width,32)*ceil_div(p->spatial,32)*p->batch:p->mode==2?p->groups*p->batch:(p->mode<=1 || p->mode==9)?p->count/p->width:ceil_div(p->count,4096);
  int jobs=smin(smin(num_workers,num_hvx128_contexts),state.tasks);if(jobs<1) return -40;
  if(p->mode==8 && vtcm_manager_get_vtcm_size()<(size_t)num_workers*4096) return -42;
  // Short encoder rows are cheaper on the dispatch thread than waking the
